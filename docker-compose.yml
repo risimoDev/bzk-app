@@ -91,6 +91,11 @@ services:
     restart: unless-stopped
     depends_on:
       - app
+    environment:
+      # Без домена Caddyfile берёт запасной `localhost`, выдаёт локальный
+      # сертификат, и на боевом адресе браузер получает ERR_SSL_PROTOCOL_ERROR.
+      # С доменом Caddy сам берёт сертификат Let's Encrypt
+      SITE_DOMAIN: ${SITE_DOMAIN:?задайте SITE_DOMAIN в .env}
     ports:
       - "80:80"
       - "443:443"
