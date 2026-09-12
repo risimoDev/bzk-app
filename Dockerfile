@@ -21,6 +21,12 @@ ENV SITE_DOMAIN=$SITE_DOMAIN
 # он нужен здесь, а не только в окружении запуска. Пусто - капчи не будет
 ARG NEXT_PUBLIC_TURNSTILE_SITE_KEY=""
 ENV NEXT_PUBLIC_TURNSTILE_SITE_KEY=$NEXT_PUBLIC_TURNSTILE_SITE_KEY
+# В контейнере Node сам ставит себе низкий предел кучи (~0.5 ГБ), и проверка
+# типов в next build падает с "heap out of memory" на VPS с 2 ГБ. Поднимаем
+# предел явно: со swap, который создаёт setup-server.sh, сборка проходит.
+# Значение можно переопределить build-аргументом на совсем маленькой машине.
+ARG NODE_BUILD_MEMORY=2048
+ENV NODE_OPTIONS="--max-old-space-size=$NODE_BUILD_MEMORY"
 RUN npm run build
 
 # ---------- Прод ----------
