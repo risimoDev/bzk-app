@@ -1,0 +1,16 @@
+# Временная MySQL для одноразового переноса данных из дампа старого сайта.
+# Поднимается, отдаёт данные скрипту migrate-data.mjs и гасится.
+services:
+  legacy:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: legacy
+      MYSQL_DATABASE: bzkprint
+    ports:
+      - "13306:3306"
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-plegacy"]
+      interval: 5s
+      timeout: 5s
+      retries: 30

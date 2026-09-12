@@ -1,0 +1,341 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { z } from "zod";
+import { eq, sql } from "drizzle-orm";
+import { redirect } from "next/navigation";
+import { db } from "@/db";
+import {
+  externalOrders,
+  materials,
+  materialsStock,
+  orderExpenses,
+  ordersAccounting,
+} from "@/db/schema";
+import { can } from "@/lib/permissions";
+import { audit } from "@/lib/audit";
+import { applyMovement } from "@/lib/stock";
+
+export type MovementState = {
+  ok?: string;
+  error?: string;
+};
+
+const schema = z.object({
+  materialId: z.coerce.number().int().positive(),
+  type: z.enum(["in", "out"]),
+  // Количество строкой: numeric в Postgres точный, и лишний проход
+  // через число теряет дробную часть на длинных значениях
+  quantity: z
+    .string()
+    .trim()
+    .regex(/^\d{1,8}([.,]\d{1,2})?$/, "Количество вида 12.5")
+    .transform((v) => v.replace(",", ".")),
+  comment: z.string().trim().max(500).optional(),
+});
+
+/**
+ * Ручной приход или расход материала.
+ *
+ * Вся работа с остатком - в applyMovement: там же живут запрет ухода
+ * в минус и оповещения о нехватке, общие с приёмкой закупок.
+ */
+export async function recordMovement(
+  _prev: MovementState,
+  formData: FormData,
+): Promise<MovementState> {
+  if (!(await can("materials", "edit"))) {
+    return { error: "У вашей роли нет права менять склад" };
+  }
+
+  const parsed = schema.safeParse({
+    materialId: formData.get("materialId"),
+    type: formData.get("type"),
+    quantity: formData.get("quantity"),
+    comment: formData.get("comment"),
+  });
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Проверьте поля" };
+  }
+
+  const { materialId, type, quantity, comment } = parsed.data;
+
+  try {
+    await db.transaction(async (tx) => {
+      await applyMovement(tx, {
+        materialId,
+        type,
+        quantity,
+        referenceType: "manual",
+        comment,
+      });
+    });
+  } catch (e) {
+    return {
+      error: e instanceof Error ? e.message : "Не удалось записать движение",
+    };
+  }
+
+  revalidatePath(`/admin/materials/${materialId}`);
+  revalidatePath("/admin/materials");
+
+  return { ok: type === "in" ? "Приход записан" : "Расход записан" };
+}
+
+// ------------------------------------------------- карточка материала
+
+export type MaterialState = {
+  ok?: boolean;
+  message?: string;
+  error?: string;
+  fieldErrors?: Record<string, string>;
+};
+
+/**
+ * Числа склада хранятся в numeric и проверяются строкой: превращать их
+ * в число ради проверки - верный способ потерять дробную часть.
+ */
+const decimal = (label: string) =>
+  z
+    .union([
+      z.literal(""),
+      z
+        .string()
+        .trim()
+        .regex(/^\d{1,8}([.,]\d{1,4})?$/, `${label} вида 12.5`)
+        .transform((v) => v.replace(",", ".")),
+    ])
+    .optional();
+
+const materialSchema = z.object({
+  name: z.string().trim().min(2, "Слишком короткое название").max(255),
+  unit: z.string().trim().min(1, "Укажите единицу измерения").max(50),
+  costPerUnit: decimal("Цена"),
+  minStock: decimal("Минимум"),
+  description: z.string().trim().max(2000).optional(),
+  category: z.enum(["paper", "vinyl", "banner", "film", "ink", "lamination", "other"]),
+  materialType: z.enum(["sheet", "roll", "piece", "liquid"]),
+  supplier: z.string().trim().max(255).optional(),
+  widthMm: decimal("Ширина"),
+  heightMm: decimal("Высота"),
+  isActive: z.coerce.boolean(),
+});
+
+/**
+ * Заводит материал или правит существующий.
+ *
+ * Вместе с новым материалом создаётся строка остатка: без неё склад
+ * показывал бы прочерк вместо нуля, а движения падали бы на попытке
+ * обновить несуществующую запись.
+ */
+export async function saveMaterial(
+  _prev: MaterialState,
+  formData: FormData,
+): Promise<MaterialState> {
+  const rawId = String(formData.get("id") ?? "").trim();
+  const id = rawId === "" ? null : Number(rawId);
+  const isNew = id === null;
+
+  if (!(await can("materials", isNew ? "create" : "edit"))) {
+    return { error: "У вашей роли нет права менять склад" };
+  }
+  if (!isNew && (!Number.isInteger(id) || id <= 0)) return { error: "Материал не найден" };
+
+  const parsed = materialSchema.safeParse({
+    name: formData.get("name"),
+    unit: formData.get("unit"),
+    costPerUnit: formData.get("costPerUnit"),
+    minStock: formData.get("minStock"),
+    description: formData.get("description"),
+    category: formData.get("category") || "other",
+    materialType: formData.get("materialType") || "sheet",
+    supplier: formData.get("supplier"),
+    widthMm: formData.get("widthMm"),
+    heightMm: formData.get("heightMm"),
+    isActive: formData.get("isActive") === "on",
+  });
+
+  if (!parsed.success) {
+    const fieldErrors: Record<string, string> = {};
+    for (const issue of parsed.error.issues) {
+      const key = String(issue.path[0] ?? "");
+      if (key && !fieldErrors[key]) fieldErrors[key] = issue.message;
+    }
+    return { fieldErrors };
+  }
+
+  const v = parsed.data;
+  const values = {
+    name: v.name,
+    unit: v.unit,
+    costPerUnit: v.costPerUnit || null,
+    minStock: v.minStock || "0.00",
+    description: v.description || null,
+    category: v.category,
+    materialType: v.materialType,
+    supplier: v.supplier || null,
+    widthMm: v.widthMm || null,
+    heightMm: v.heightMm || null,
+    isActive: v.isActive,
+  };
+
+  if (isNew) {
+    const materialId = await db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(materials)
+        .values(values)
+        .returning({ id: materials.id });
+
+      await tx.insert(materialsStock).values({ materialId: created.id, quantity: "0.00" });
+      return created.id;
+    });
+
+    await audit("material.create", { type: "material", id: materialId }, { name: v.name });
+    revalidatePath("/admin/materials");
+    redirect(`/admin/materials/${materialId}`);
+  }
+
+  const updated = await db
+    .update(materials)
+    .set(values)
+    .where(eq(materials.id, id))
+    .returning({ id: materials.id });
+  if (updated.length === 0) return { error: "Материал не найден" };
+
+  await audit("material.update", { type: "material", id }, { name: v.name });
+  revalidatePath("/admin/materials");
+  revalidatePath(`/admin/materials/${id}`);
+  return { ok: true, message: "Сохранено" };
+}
+
+// ------------------------------------------- списание материалов на заказ
+
+export type WriteOffState = {
+  ok?: boolean;
+  error?: string;
+  message?: string;
+};
+
+/**
+ * Списать материал со склада на заказ.
+ *
+ * До этого расход материалов ни к какому заказу не привязывался, и
+ * себестоимость по факту собрать было нельзя: в карточке заказа стоял
+ * только расчёт по рецептуре товара. Здесь движение уходит на склад, а
+ * его стоимость - отдельной строкой расхода в бухгалтерию заказа.
+ */
+export async function writeOffMaterial(
+  _prev: WriteOffState,
+  formData: FormData,
+): Promise<WriteOffState> {
+  if (!(await can("materials", "edit"))) {
+    return { ok: false, error: "У вашей роли нет права менять склад" };
+  }
+
+  const externalOrderId = Number(formData.get("externalOrderId"));
+  const materialId = Number(formData.get("materialId"));
+  if (!Number.isInteger(externalOrderId) || externalOrderId <= 0) {
+    return { ok: false, error: "Заказ не найден" };
+  }
+  if (!Number.isInteger(materialId) || materialId <= 0) {
+    return { ok: false, error: "Выберите материал" };
+  }
+
+  const raw = String(formData.get("quantity") ?? "").trim().replace(",", ".");
+  if (!/^\d{1,8}(\.\d{1,2})?$/.test(raw) || Number(raw) <= 0) {
+    return { ok: false, error: "Количество вида 12.5, больше нуля" };
+  }
+
+  const [order] = await db
+    .select({ id: externalOrders.id })
+    .from(externalOrders)
+    .where(eq(externalOrders.id, externalOrderId))
+    .limit(1);
+  if (!order) return { ok: false, error: "Заказ не найден" };
+
+  const [material] = await db
+    .select({
+      id: materials.id,
+      name: materials.name,
+      unit: materials.unit,
+      cost: materials.costPerUnit,
+    })
+    .from(materials)
+    .where(eq(materials.id, materialId))
+    .limit(1);
+  if (!material) return { ok: false, error: "Материал не найден" };
+
+  const amount = Number(raw);
+  const cost = Math.round(amount * Number(material.cost ?? 0) * 100) / 100;
+
+  try {
+    await db.transaction(async (tx) => {
+      await applyMovement(tx, {
+        materialId,
+        type: "out",
+        quantity: raw,
+        referenceType: "order",
+        referenceId: externalOrderId,
+        // Номера сайтовых и менеджерских заказов лежат в разных
+        // таблицах, поэтому тип заказа пишем словами: по одному
+        // referenceId его не отличить
+        comment: `Заказ менеджера № ${externalOrderId}`,
+      });
+
+      // Фактический расход попадает в бухгалтерию заказа отдельной
+      // строкой - рядом с расчётной себестоимостью, а не вместо неё
+      if (cost > 0) {
+        const [card] = await tx
+          .select({ id: ordersAccounting.id })
+          .from(ordersAccounting)
+          .where(eq(ordersAccounting.externalOrderId, externalOrderId))
+          .limit(1);
+
+        if (card) {
+          await tx.insert(orderExpenses).values({
+            orderAccountingId: card.id,
+            materialName: material.name,
+            quantity: raw,
+            unit: material.unit,
+            costPerUnit: material.cost,
+            totalCost: cost.toFixed(2),
+            amount: cost.toFixed(2),
+            description: `Списано со склада: ${material.name}`,
+          });
+
+          const [{ sum }] = await tx
+            .select({ sum: sql<string>`coalesce(sum(${orderExpenses.amount}), 0)` })
+            .from(orderExpenses)
+            .where(eq(orderExpenses.orderAccountingId, card.id));
+
+          await tx
+            .update(ordersAccounting)
+            .set({ totalExpense: Number(sum).toFixed(2) })
+            .where(eq(ordersAccounting.id, card.id));
+        }
+      }
+    });
+  } catch (e) {
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : "Не удалось списать материал",
+    };
+  }
+
+  await audit("material.write_off", { type: "external_order", id: externalOrderId }, {
+    materialId,
+    quantity: raw,
+    cost: cost.toFixed(2),
+  });
+
+  revalidatePath(`/admin/external-orders/${externalOrderId}`);
+  revalidatePath(`/admin/materials/${materialId}`);
+  revalidatePath("/admin/materials");
+  revalidatePath("/admin/finance");
+
+  return {
+    ok: true,
+    message: `Списано ${amount} ${material.unit} - ${cost.toFixed(2)} ₽ в расходы заказа`,
+  };
+}

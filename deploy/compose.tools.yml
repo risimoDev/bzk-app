@@ -1,0 +1,32 @@
+# Служебный контейнер для миграций схемы и наполнения базы.
+#
+# Боевой образ приложения (стадия runner) - standalone: в нём только
+# сервер, без исходников, без drizzle-kit и без scripts/. Поэтому
+# `drizzle-kit push` и seed-скрипты запускаем из стадии builder - там
+# есть и весь код, и devDependencies.
+#
+# Использование (всегда вместе с основным файлом):
+#   docker compose -f docker-compose.yml -f deploy/compose.tools.yml \
+#     run --rm tools npx drizzle-kit push
+#
+# Контейнер одноразовый (--rm), сам не поднимается и в обычный
+# `docker compose up` не попадает - он в отдельном профиле.
+services:
+  tools:
+    build:
+      context: .
+      target: builder
+    profiles: ["tools"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bzk}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-bzk}
+      # Часовой пояс компании - от него зависят календарные даты в переносе
+      TZ: Asia/Yekaterinburg
+      APP_TIMEZONE: Asia/Yekaterinburg
+      # Для однократного переноса данных со старого сайта (migrate-data.mjs)
+      LEGACY_MYSQL_URL: ${LEGACY_MYSQL_URL:-}
+    # Файлы переносятся отдельно (том uploads монтируется приложению),
+    # здесь сеть compose нужна только чтобы дотянуться до db
+    restart: "no"

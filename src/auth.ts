@@ -1,0 +1,227 @@
+import NextAuth, { CredentialsSignin } from "next-auth";
+import Credentials from "next-auth/providers/credentials";
+import { eq } from "drizzle-orm";
+import bcrypt from "bcryptjs";
+import { db } from "@/db";
+import { users } from "@/db/schema";
+import { credentialsSchema } from "@/lib/validation";
+import { verifyTotp } from "@/lib/totp";
+import { clientIp } from "@/lib/client-ip";
+import {
+  checkRateLimit,
+  recordAttempt,
+  clearAttempts,
+  retryAfterText,
+} from "@/lib/rate-limit";
+
+export type UserRole = "user" | "admin" | "manager";
+
+/**
+ * Слишком много попыток входа.
+ *
+ * Наследуемся от CredentialsSignin, иначе Auth.js завернёт исключение в
+ * CallbackRouteError и до формы дойдёт «что-то пошло не так». Время
+ * ожидания кладём отдельным полем: `code` уходит в адресную строку, и
+ * подробностям там не место.
+ */
+export class TooManyAttemptsError extends CredentialsSignin {
+  code = "too_many_attempts";
+  constructor(readonly wait: string) {
+    super();
+  }
+}
+
+/**
+ * Пароль верный, но нужен одноразовый код.
+ *
+ * Отдельная ошибка, чтобы форма могла показать поле кода и не говорить
+ * «неверная почта или пароль» тому, кто ввёл их правильно.
+ */
+export class TotpRequiredError extends CredentialsSignin {
+  code = "totp_required";
+}
+
+/** Код введён, но не подошёл. */
+export class TotpInvalidError extends CredentialsSignin {
+  code = "totp_invalid";
+}
+
+declare module "next-auth" {
+  interface Session {
+    user: {
+      id: string;
+      name: string;
+      email: string;
+      role: UserRole;
+      canUseEditor: boolean;
+      miniWarehouseEnabled: boolean;
+    };
+  }
+
+  /** То, что возвращает authorize и что попадает в jwt-колбэк. */
+  interface User {
+    role?: UserRole;
+    canUseEditor?: boolean;
+    miniWarehouseEnabled?: boolean;
+    /** Момент последней смены пароля (мс) - для отзыва старых сессий. */
+    passwordChangedAt?: number;
+  }
+}
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  // Сессия в JWT: провайдер Credentials не умеет работать с адаптером
+  // базы, а держать таблицу сессий ради этого незачем.
+  session: { strategy: "jwt", maxAge: 30 * 24 * 60 * 60 },
+
+  pages: { signIn: "/login" },
+
+  providers: [
+    Credentials({
+      credentials: { email: {}, password: {}, totp: {} },
+
+      async authorize(raw) {
+        const parsed = credentialsSchema.safeParse(raw);
+        if (!parsed.success) return null;
+
+        const { email, password } = parsed.data;
+
+        /**
+         * Ограничение попыток стоит здесь, а не в действии формы: только
+         * тут известно, чем кончилась проверка. Считаем по двум ключам -
+         * по почте (подбор пароля к одному аккаунту) и по адресу
+         * (перебор аккаунтов подряд с одной машины).
+         */
+        const ip = await clientIp();
+        const byEmail = await checkRateLimit(email, "login");
+        const byIp = await checkRateLimit(ip, "loginIp");
+
+        if (!byEmail.ok || !byIp.ok) {
+          const wait = Math.max(byEmail.retryAfter, byIp.retryAfter);
+          throw new TooManyAttemptsError(retryAfterText(wait));
+        }
+
+        const [user] = await db
+          .select()
+          .from(users)
+          .where(eq(users.email, email.toLowerCase()))
+          .limit(1);
+
+        // Сравнение выполняем даже когда пользователя нет: иначе по
+        // времени ответа можно перебрать, какие адреса зарегистрированы.
+        const hash =
+          user?.password ??
+          "$2b$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin";
+        const ok = await bcrypt.compare(password, hash);
+
+        if (!user || !ok || user.isBlocked) {
+          // Заблокированный аккаунт тоже считаем неудачей: иначе по нему
+          // можно было бы дёргать проверку пароля без ограничений
+          await recordAttempt(email, "login");
+          await recordAttempt(ip, "loginIp");
+          return null;
+        }
+
+        // Второй фактор: пароль подошёл, но у сотрудника может быть
+        // включён одноразовый код. Проверяем до снятия счётчика попыток -
+        // перебор кода тоже должен упираться в ограничение
+        if (user.totpEnabledAt && user.totpSecret) {
+          const given = String((raw as Record<string, unknown>).totp ?? "").trim();
+
+          if (given === "") {
+            await recordAttempt(email, "login");
+            await recordAttempt(ip, "loginIp");
+            throw new TotpRequiredError();
+          }
+
+          if (!verifyTotp(user.totpSecret, given)) {
+            await recordAttempt(email, "login");
+            await recordAttempt(ip, "loginIp");
+            throw new TotpInvalidError();
+          }
+        }
+
+        // Вошёл - счётчик снимаем, иначе человек, который часто заходит
+        // с разных устройств, запер бы сам себя
+        await clearAttempts(email, "login");
+        await clearAttempts(ip, "loginIp");
+
+        return {
+          id: String(user.id),
+          name: user.name,
+          email: user.email,
+          role: user.role ?? "user",
+          canUseEditor: user.canUseEditor,
+          miniWarehouseEnabled: user.miniWarehouseEnabled ?? false,
+          // В токен кладём момент последней смены пароля; сессия сверяет
+          // его с базой и отзывается, если пароль сменили позже
+          passwordChangedAt: user.passwordChangedAt?.getTime() ?? 0,
+        };
+      },
+    }),
+  ],
+
+  callbacks: {
+    jwt({ token, user }) {
+      if (user) {
+        token.id = user.id;
+        token.role = user.role;
+        token.canUseEditor = user.canUseEditor;
+        token.miniWarehouseEnabled = user.miniWarehouseEnabled;
+        token.pwdAt = user.passwordChangedAt ?? 0;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      const id = Number(token.id);
+
+      // Сессия лежит в JWT и живёт 30 дней, поэтому блокировка или
+      // удаление пользователя сами по себе доступ не отбирают: токен
+      // остаётся валидным. Сверяемся с базой на каждом чтении сессии -
+      // это один запрос по первичному ключу.
+      const [fresh] = await db
+        .select({
+          name: users.name,
+          email: users.email,
+          role: users.role,
+          isBlocked: users.isBlocked,
+          canUseEditor: users.canUseEditor,
+          miniWarehouseEnabled: users.miniWarehouseEnabled,
+          passwordChangedAt: users.passwordChangedAt,
+        })
+        .from(users)
+        .where(eq(users.id, id))
+        .limit(1);
+
+      // Пароль сменили после того, как выдан этот токен - сессия недействительна
+      const changedAt = fresh?.passwordChangedAt?.getTime() ?? 0;
+      const issuedFor = Number(token.pwdAt ?? 0);
+      if (!fresh || fresh.isBlocked || changedAt > issuedFor) {
+        // Пустой id - признак недействительной сессии для вызывающего кода
+        session.user = { ...session.user, id: "" };
+        return session;
+      }
+
+      session.user.id = String(id);
+      session.user.name = fresh.name;
+      session.user.email = fresh.email;
+      session.user.role = fresh.role ?? "user";
+      // Флаги читаются из базы вместе с остальным: администратор может
+      // включить раздел прямо сейчас, и клиенту не придётся перевходить
+      session.user.canUseEditor = fresh.canUseEditor;
+      session.user.miniWarehouseEnabled = fresh.miniWarehouseEnabled ?? false;
+      return session;
+    },
+  },
+});
+
+/**
+ * Текущий пользователь или null.
+ *
+ * Пользуйтесь этим вместо auth() везде, где нужно решить «пустить или нет»:
+ * колбэк session помечает отозванную сессию пустым id, и голая проверка
+ * `if (session)` такую сессию пропустила бы.
+ */
+export async function currentUser() {
+  const session = await auth();
+  return session?.user?.id ? session.user : null;
+}

@@ -1,0 +1,106 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bzk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}
+      POSTGRES_DB: ${POSTGRES_DB:-bzk}
+      # Русская сортировка и регистронезависимый поиск по каталогу
+      LANG: ru_RU.utf8
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bzk} -d ${POSTGRES_DB:-bzk}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Наружу не публикуем: доступ только из сети compose.
+    # Для ручного подключения - ssh-туннель на VPS.
+    expose:
+      - "5432"
+
+  app:
+    build:
+      context: .
+      args:
+        # Домен запекается в сборку для проверки Origin серверных действий
+        SITE_DOMAIN: ${SITE_DOMAIN:-}
+        # Публичный ключ капчи вшивается в браузерный код на сборке
+        NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bzk}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-bzk}
+      AUTH_SECRET: ${AUTH_SECRET:?задайте AUTH_SECRET в .env}
+      AUTH_URL: ${AUTH_URL}
+      # Публичный адрес: из него собираются канонические ссылки,
+      # карта сайта и адреса в уведомлениях
+      SITE_URL: ${SITE_URL}
+      SITE_DOMAIN: ${SITE_DOMAIN:-}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+      TOCHKA_API_URL: ${TOCHKA_API_URL}
+      TOCHKA_TOKEN: ${TOCHKA_TOKEN}
+      TOCHKA_CUSTOMER_CODE: ${TOCHKA_CUSTOMER_CODE}
+      UPLOAD_DIR: /app/storage/uploads
+      # Пояс компании: от него зависят календарные даты поставки и готовности
+      TZ: Asia/Yekaterinburg
+      APP_TIMEZONE: Asia/Yekaterinburg
+    volumes:
+      - uploads:/app/storage/uploads
+    expose:
+      - "3000"
+
+  # Ночные дампы базы и архивы файлов в ./backups. Отдельным контейнером, а не задачей
+  # внутри приложения: приложение может лежать как раз тогда, когда
+  # копия особенно нужна
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bzk}
+      POSTGRES_DB: ${POSTGRES_DB:-bzk}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-14}
+      UPLOADS_RETAIN_DAYS: ${BACKUP_UPLOADS_RETAIN_DAYS:-7}
+      BACKUP_HOUR: ${BACKUP_HOUR:-3}
+      TZ: Asia/Yekaterinburg
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+      # Только чтение: бэкапу незачем уметь портить файлы клиентов
+      - uploads:/uploads:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  uploads:
+  caddy_data:
+  caddy_config:

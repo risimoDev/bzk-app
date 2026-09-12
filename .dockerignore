@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+drizzle
+legacy-schema
+backups
+storage
+npm-debug.log*
+README.md

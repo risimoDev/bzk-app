@@ -1,0 +1,17 @@
+# Только база для локальной разработки: приложение крутится через `npm run dev`.
+#   docker compose -f compose.dev.yml up -d
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bzk
+      POSTGRES_PASSWORD: bzk
+      POSTGRES_DB: bzk
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+
+volumes:
+  pgdata_dev:
