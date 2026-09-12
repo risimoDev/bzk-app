@@ -13,6 +13,13 @@ import { absoluteUrl } from "@/lib/site";
  * товаров там не было вовсе, хотя ради них каталог и существует.
  */
 
+/**
+ * Карта строится по запросу, а не на сборке: она ходит в базу, а во время
+ * `docker build` базы ещё нет. Со сборки её убираем, а поисковику отдаём
+ * при обращении, когда база уже поднята.
+ */
+export const dynamic = "force-dynamic";
+
 /** Статические страницы витрины. */
 const PAGES: { path: string; priority: number; changeFrequency: "daily" | "weekly" | "monthly" }[] = [
   { path: "/", priority: 1, changeFrequency: "weekly" },
@@ -30,12 +37,19 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const now = new Date();
 
   // У товара нет отметки времени изменения - только дата создания.
-  // Скрытые в каталог не попадают, значит и в карту сайта тоже
-  const catalog = await db
-    .select({ id: products.id, createdAt: products.createdAt })
-    .from(products)
-    .where(eq(products.isHidden, false))
-    .orderBy(desc(products.createdAt));
+  // Скрытые в каталог не попадают, значит и в карту сайта тоже.
+  // Если база вдруг недоступна, отдаём хотя бы статические страницы,
+  // а не пятисотим всю карту
+  let catalog: { id: number; createdAt: Date | null }[] = [];
+  try {
+    catalog = await db
+      .select({ id: products.id, createdAt: products.createdAt })
+      .from(products)
+      .where(eq(products.isHidden, false))
+      .orderBy(desc(products.createdAt));
+  } catch {
+    catalog = [];
+  }
 
   return [
     ...PAGES.map((p) => ({
