@@ -72,14 +72,41 @@ fi
 mkdir -p backups
 if docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -q '^db$'; then
   log "Создание предварительного бэкапа базы данных перед деплоем..."
-  PRE_BACKUP="backups/pre-deploy-$(date '+%Y-%m-%d-%H%M%S').sql.gz"
-  if docker compose exec -T db pg_dump -U "${POSTGRES_USER:-bzk}" -d "${POSTGRES_DB:-bzk}" | gzip > "${PRE_BACKUP}.part"; then
-    mv "${PRE_BACKUP}.part" "${PRE_BACKUP}"
-    success "Страховочный дамп сохранён: ${PRE_BACKUP} ($(du -h "${PRE_BACKUP}" | cut -f1))"
+  PRE_NAME="pre-deploy-$(date '+%Y-%m-%d-%H%M%S').dump"
+  # Тот же формат и те же проверки, что у ночного scripts/backup.sh:
+  # pg_dump -Fc пишет файл сам, без конвейера `| gzip`, у которого статус -
+  # это статус gzip, и упавший дамп сохранялся бы как целый. Затем
+  # оглавление (pg_restore --list) и полное чтение в /dev/null - оно
+  # замечает обрезанный конец. Имя файл получает, только пройдя всё.
+  # Работаем внутри контейнера базы: ./backups примонтирована туда как
+  # /backups, а формат custom через `exec -T` надёжнее не гонять
+  if docker compose exec -T db sh -c '
+      pg_dump -U "$1" -d "$2" -Fc -f "$3.part" &&
+      pg_restore --list "$3.part" >/dev/null &&
+      pg_restore -f /dev/null "$3.part" &&
+      mv "$3.part" "$3"' \
+      sh "${POSTGRES_USER:-bzk}" "${POSTGRES_DB:-bzk}" "/backups/${PRE_NAME}" </dev/null; then
+    success "Страховочный дамп сохранён: backups/${PRE_NAME} ($(du -h "backups/${PRE_NAME}" | cut -f1))"
   else
-    rm -f "${PRE_BACKUP}.part"
+    # Недоделанный дамп по имени не отличить от целого - убираем
+    docker compose exec -T db rm -f "/backups/${PRE_NAME}.part" </dev/null >/dev/null 2>&1 ||
+      rm -f "backups/${PRE_NAME}.part" || true
     warn "Не удалось снять предварительный дамп базы данных. Продолжаем с осторожностью."
   fi
+
+  # Страховочные копии нужны на случай отката последней выкладки, а
+  # ночные дампы и так хранятся две недели. Оставляем 10 свежих (и старые
+  # .sql.gz считаем вместе с ними), иначе частые деплои забьют диск
+  find backups -maxdepth 1 -type f \( -name 'pre-deploy-*.dump' -o -name 'pre-deploy-*.sql.gz' \) \
+    -printf '%T@ %p\n' | sort -rn | tail -n +11 | cut -d' ' -f2- |
+    while IFS= read -r OLD; do
+      # Сбой удаления (права) не повод срывать выкладку
+      if rm -f -- "${OLD}"; then
+        log "Удалён старый страховочный дамп: ${OLD}"
+      else
+        warn "Не удалось удалить ${OLD}"
+      fi
+    done
 else
   log "Контейнер базы db ещё не запущен - пропускаем предварительный дамп."
 fi
@@ -120,35 +147,40 @@ success "Схема базы данных успешно синхронизир�
 
 # 7. Запуск всех сервисов (app, proxy, backup, db)
 log "Перезапуск сервисов в фоновом режиме..."
-docker compose up -d --remove-orphans
+# proxy ждёт здоровья app (depends_on: service_healthy), и если app не
+# поднялся, `up` завершится ошибкой. Не обрываем скрипт здесь: ниже
+# проверка здоровья покажет статус и логи приложения - по ним и разбираться
+if ! docker compose up -d --remove-orphans; then
+  warn "docker compose up завершился с ошибкой - смотрим состояние приложения."
+fi
 
 # 8. Проверка здоровья (Healthcheck)
-log "Проверка работоспособности сервиса (/api/health)..."
-HEALTH_OK=false
-for i in $(seq 1 30); do
-  # Проверяем напрямую контейнер приложения на порту 3000
-  HTTP_CODE=$(docker compose exec -T app wget -q -O - --server-response http://127.0.0.1:3000/api/health 2>&1 | awk '/^  HTTP/{print $2}' | tail -n 1 || echo "000")
-  
-  if [ "$HTTP_CODE" = "200" ]; then
-    HEALTH_OK=true
-    break
-  fi
-  
-  # Запасная проверка через curl с хоста, если wget внутри не отработал
-  if curl -s -f http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
-    HEALTH_OK=true
-    break
-  fi
-  
+# Опираемся на healthcheck контейнера из docker-compose.yml: Docker сам
+# опрашивает /api/health изнутри контейнера. С хоста порт 3000 не
+# достучаться - он не опубликован, наружу смотрит только Caddy
+log "Ожидание здоровья приложения (healthcheck контейнера, /api/health)..."
+APP_ID="$(docker compose ps -q app)"
+[ -n "${APP_ID}" ] || error "Контейнер app не создан. Смотрите вывод docker compose выше."
+
+HEALTH=""
+# start_period 40 с + до трёх неудачных проверок по 10 с - двух минут хватает
+for _ in $(seq 1 60); do
+  HEALTH="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${APP_ID}" 2>/dev/null || echo "missing")"
+  case "${HEALTH}" in
+    healthy | unhealthy | none | missing) break ;;
+  esac
   sleep 2
   echo -n "."
 done
 echo ""
 
-if [ "$HEALTH_OK" = true ]; then
-  success "Приложение успешно отвечает 200 OK на /api/health!"
+if [ "${HEALTH}" = "healthy" ]; then
+  success "Приложение здорово: /api/health отвечает 200."
 else
-  warn "Приложение не ответило 200 OK за 60 секунд. Вывод последних логов контейнера:"
+  warn "Приложение не стало здоровым (статус: ${HEALTH:-неизвестен})."
+  warn "Последние проверки healthcheck:"
+  docker inspect --format '{{if .State.Health}}{{range .State.Health.Log}}{{.End}} код {{.ExitCode}}: {{.Output}}{{println}}{{end}}{{end}}' "${APP_ID}" 2>/dev/null || true
+  warn "Последние строки лога приложения:"
   docker compose logs --tail=40 app
   error "Деплой завершился с ошибкой проверки здоровья!"
 fi

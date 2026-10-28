@@ -13,8 +13,33 @@
 	}
 
 	log {
-		output file /data/access.log
-		format json
+		# Явная ротация: без неё лог в томе caddy_data растёт до
+		# встроенного предела Caddy, и сколько его копится - неочевидно
+		output file /data/access.log {
+			roll_size 50MiB
+			roll_keep 10
+		}
+		# Ссылка из письма сброса пароля несёт одноразовый токен в query
+		# (?token=…). В логе он пролежал бы до ротации, и любой, кто
+		# прочитает лог, успел бы сменить пароль. Токен вырезаем из адреса
+		# запроса и из Referer: страница сброса шлёт свой полный адрес
+		# заголовком Referer со всех последующих запросов (политика
+		# strict-origin-when-cross-origin режет его только для чужих
+		# сайтов). Куки и Authorization - сессии и ключи - не пишем вовсе
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete token
+				}
+				request>headers>Referer query {
+					delete token
+				}
+				request>headers>Cookie delete
+				request>headers>Authorization delete
+				resp_headers>Set-Cookie delete
+			}
+		}
 	}
 }
 

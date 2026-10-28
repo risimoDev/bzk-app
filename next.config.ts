@@ -60,7 +60,11 @@ const nextConfig: NextConfig = {
         source: "/:path*",
         headers: [
           { key: "X-Content-Type-Options", value: "nosniff" },
-          { key: "X-Frame-Options", value: "SAMEORIGIN" },
+          // DENY, а не SAMEORIGIN - вровень с CSP `frame-ancestors 'none'`
+          // из src/proxy.ts. Свои страницы мы во фреймы не вставляем, а
+          // заголовок нужен старым браузерам, которые CSP не понимают.
+          // HSTS ставит Caddy - здесь его не дублируем
+          { key: "X-Frame-Options", value: "DENY" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           {
             key: "Permissions-Policy",

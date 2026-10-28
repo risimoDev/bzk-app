@@ -8,6 +8,14 @@ services:
       POSTGRES_USER: bzk
       POSTGRES_PASSWORD: bzk
       POSTGRES_DB: bzk
+      # Как в боевом docker-compose.yml (там подробное объяснение): пояс
+      # компании для логов и psql внутри контейнера, а пояс сервера
+      # закреплён в UTC - от него зависят `DEFAULT now()` в колонках
+      # timestamp без пояса. Применяется при пересоздании контейнера
+      # (`docker compose -f compose.dev.yml up -d`), данные в томе не трогает
+      TZ: Asia/Yekaterinburg
+      PGTZ: Asia/Yekaterinburg
+    command: ["postgres", "-c", "timezone=UTC", "-c", "log_timezone=Asia/Yekaterinburg"]
     ports:
       - "5434:5432"
     volumes:
