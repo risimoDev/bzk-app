@@ -1,6 +1,6 @@
 "use server";
 
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { db } from "@/db";
 import {
@@ -16,51 +16,90 @@ import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { notifyOrderMessage, notifyOrderStatus, notifyUser } from "@/lib/notify";
-import { ORDER_STATUS, type OrderStatus } from "@/lib/order-status";
-import { syncAccountingForSiteOrder } from "@/lib/accounting-db";
-import { parseContact } from "@/lib/order-contact";
+import { ORDER_STATUS, isOrderStatus } from "@/lib/order-status";
+import {
+  MoneyRuleError,
+  changeOrderStatus,
+  recalcOrderMoney,
+  setSiteOrderUrgent,
+} from "@/lib/order-money-db";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
-import { urgentFee } from "@/lib/promocodes";
 
-export async function changeStatus(formData: FormData) {
-  // Права проверяем здесь, а не только в разметке: серверное действие
-  // вызывается по сети, и спрятанная кнопка ничего не защищает.
-  if (!(await can("orders", "edit"))) return;
+export type StatusState = { ok?: boolean; error?: string; message?: string };
 
-  const id = Number(formData.get("orderId"));
-  const status = String(formData.get("status"));
-
-  if (!Number.isInteger(id) || id <= 0) return;
-  if (!(status in ORDER_STATUS)) return;
-
-  const [updated] = await db
-    .update(orders)
-    .set({
-      status: status as OrderStatus,
-      // Заказ увидели - метка «новый» больше не нужна
-      isNew: false,
-    })
-    .where(eq(orders.id, id))
-    .returning({ id: orders.id, userId: orders.userId });
-
-  if (!updated) return;
-
-  await audit("order.status", { type: "order", id }, { status });
-
-  // Клиент узнаёт о стадии сам - за этим он и заводил кабинет
-  await notifyOrderStatus({
-    userId: updated.userId,
-    orderId: id,
-    statusLabel: ORDER_STATUS[status as OrderStatus].label,
-  });
-
+/** Страницы, где видны статус и деньги заказа с сайта. */
+function revalidateSiteOrder(id: number) {
   revalidatePath(`/admin/orders/${id}`);
   revalidatePath("/admin/orders");
   revalidatePath("/admin");
   revalidatePath(`/client/orders/${id}`);
+  revalidatePath("/client/orders");
+  revalidatePath("/admin/finance");
+  revalidatePath("/admin/analytics");
 }
 
+/**
+ * Смена статуса заказа с сайта.
+ *
+ * Переходы - по таблице из lib/order-status.ts. Отмена гасит производство
+ * и выводит заказ из выручки, снятие отмены возвращает его обратно - это
+ * делает changeOrderStatus той же транзакцией. Письмо клиенту - только
+ * если статус действительно сменился.
+ */
+export async function changeStatus(
+  _prev: StatusState,
+  formData: FormData,
+): Promise<StatusState> {
+  // Права проверяем здесь, а не только в разметке: серверное действие
+  // вызывается по сети, и спрятанная кнопка ничего не защищает.
+  if (!(await can("orders", "edit"))) return { error: "Нет прав менять заказы" };
+
+  const id = Number(formData.get("orderId"));
+  const status = String(formData.get("status") ?? "");
+
+  if (!Number.isInteger(id) || id <= 0) return { error: "Заказ не найден" };
+  if (!isOrderStatus(status)) return { error: "Неизвестный статус" };
+
+  let result: Awaited<ReturnType<typeof changeOrderStatus>>;
+  try {
+    result = await db.transaction((tx) =>
+      changeOrderStatus(tx, { source: "site", id }, status),
+    );
+  } catch (e) {
+    if (e instanceof MoneyRuleError) return { error: e.message };
+    throw e;
+  }
+
+  if (!result.changed) return { ok: true, message: "Статус не изменился" };
+
+  await audit("order.status", { type: "order", id }, { from: result.from, status });
+
+  const [order] = await db
+    .select({ userId: orders.userId })
+    .from(orders)
+    .where(eq(orders.id, id))
+    .limit(1);
+
+  // Клиент узнаёт о стадии сам - за этим он и заводил кабинет
+  if (order) {
+    await notifyOrderStatus({
+      userId: order.userId,
+      orderId: id,
+      statusLabel: ORDER_STATUS[status].label,
+    });
+  }
+
+  revalidateSiteOrder(id);
+  revalidatePath("/admin/production");
+  return { ok: true, message: `Статус: ${ORDER_STATUS[status].label.toLowerCase()}` };
+}
+
+/**
+ * Срочность заказа с сайта. Надбавка входит в итог, поэтому итог, доход,
+ * налог и статус оплаты пересчитываются той же транзакцией - раньше
+ * менялся только флажок, а клиент платил старую сумму.
+ */
 export async function toggleUrgent(formData: FormData) {
   if (!(await can("orders", "edit"))) return;
 
@@ -68,11 +107,16 @@ export async function toggleUrgent(formData: FormData) {
   const urgent = formData.get("urgent") === "1";
   if (!Number.isInteger(id) || id <= 0) return;
 
-  await db.update(orders).set({ isUrgent: urgent }).where(eq(orders.id, id));
-  await audit("order.urgent", { type: "order", id }, { urgent });
+  const summary = await db.transaction((tx) => setSiteOrderUrgent(tx, id, urgent));
+  if (!summary) return;
 
-  revalidatePath(`/admin/orders/${id}`);
-  revalidatePath("/admin/orders");
+  await audit("order.urgent", { type: "order", id }, {
+    urgent,
+    total: summary.income.toFixed(2),
+    paymentStatus: summary.status,
+  });
+
+  revalidateSiteOrder(id);
 }
 
 /** Снимает метку «новый», когда менеджер открыл заказ. */
@@ -168,65 +212,6 @@ function parseMoney(raw: FormDataEntryValue | null) {
 }
 
 /**
- * Пересчёт итога заказа после правки состава.
- *
- * Итог - это не просто сумма позиций: сверху лежит надбавка за срочность
- * и снизу скидка по промокоду. Обе живут в contact_info с момента
- * оформления, поэтому берём их оттуда, а не выдумываем заново.
- */
-async function recalcOrderTotal(tx: Parameters<Parameters<typeof db.transaction>[0]>[0], orderId: number) {
-  const [order] = await tx
-    .select({
-      contactInfo: orders.contactInfo,
-      isUrgent: orders.isUrgent,
-    })
-    .from(orders)
-    .where(eq(orders.id, orderId))
-    .limit(1);
-  if (!order) return;
-
-  const [{ sum }] = await tx
-    .select({ sum: sql<string>`coalesce(sum(${orderItems.price}), 0)` })
-    .from(orderItems)
-    .where(eq(orderItems.orderId, orderId));
-
-  const subtotal = round2(Number(sum));
-  const contact = parseContact(order.contactInfo);
-  const fee = urgentFee(subtotal, Boolean(order.isUrgent));
-
-  // Скидка зафиксирована в момент оформления: пересчитывать процент от
-  // новой суммы значило бы менять условия задним числом
-  const promo = (contact?.promo ?? null) as { discount?: unknown } | null;
-  const discount =
-    typeof promo?.discount === "number" && Number.isFinite(promo.discount)
-      ? promo.discount
-      : 0;
-
-  const total = round2(Math.max(0, subtotal + fee - discount));
-
-  // В contact_info держим те же числа, что показываем: иначе карточка
-  // заказа рассказывает про старую сумму до скидки
-  let nextContact = order.contactInfo;
-  if (order.contactInfo?.trim().startsWith("{")) {
-    try {
-      const parsedJson = JSON.parse(order.contactInfo) as Record<string, unknown>;
-      parsedJson.original_total_price = subtotal;
-      parsedJson.urgent_fee = fee;
-      nextContact = JSON.stringify(parsedJson);
-    } catch {
-      // не JSON - оставляем как есть, это тоже допустимый случай
-    }
-  }
-
-  await tx
-    .update(orders)
-    .set({ totalPrice: total.toFixed(2), contactInfo: nextContact })
-    .where(eq(orders.id, orderId));
-
-  await syncAccountingForSiteOrder(tx, orderId);
-}
-
-/**
  * Добавить или поправить позицию заказа с сайта.
  *
  * Нужно там, где клиент заказал одно, а по телефону договорились о
@@ -297,7 +282,7 @@ export async function saveOrderItem(
       .from(orders)
       .where(eq(orders.id, orderId))
       .limit(1);
-    if (!order) return false;
+    if (!order) return null;
 
     if (itemId === null) {
       await tx.insert(orderItems).values({ ...values, orderId });
@@ -314,11 +299,16 @@ export async function saveOrderItem(
           ),
         )
         .returning({ id: orderItems.id });
-      if (rows.length === 0) return false;
+      if (rows.length === 0) return null;
     }
 
-    await recalcOrderTotal(tx, orderId);
-    return true;
+    // Итог (с надбавкой и скидкой), себестоимость и статус оплаты -
+    // заново: оплаченный заказ после новой позиции оплачен частично
+    return recalcOrderMoney(
+      tx,
+      { source: "site", id: orderId },
+      { rebuildTotal: true, refreshEstimate: true },
+    );
   });
 
   if (!done) return { ok: false, error: "Заказ или позиция не найдены" };
@@ -326,12 +316,10 @@ export async function saveOrderItem(
   await audit(
     itemId === null ? "order.item_add" : "order.item_update",
     { type: "order", id: orderId },
-    { itemId, price: values.price },
+    { itemId, price: values.price, total: done.income.toFixed(2), paymentStatus: done.status },
   );
 
-  revalidatePath(`/admin/orders/${orderId}`);
-  revalidatePath(`/client/orders/${orderId}`);
-  revalidatePath("/admin/finance");
+  revalidateSiteOrder(orderId);
   return { ok: true, message: itemId === null ? "Позиция добавлена" : "Позиция сохранена" };
 }
 
@@ -355,16 +343,22 @@ export async function deleteOrderItem(
       .where(and(eq(orderItems.id, itemId), eq(orderItems.orderId, orderId)))
       .returning({ id: orderItems.id });
 
-    if (rows.length > 0) await recalcOrderTotal(tx, orderId);
-    return rows.length;
+    if (rows.length === 0) return null;
+    return recalcOrderMoney(
+      tx,
+      { source: "site", id: orderId },
+      { rebuildTotal: true, refreshEstimate: true },
+    );
   });
 
-  if (removed === 0) return { ok: false, error: "Позиция не найдена" };
+  if (!removed) return { ok: false, error: "Позиция не найдена" };
 
-  await audit("order.item_delete", { type: "order", id: orderId }, { itemId });
-  revalidatePath(`/admin/orders/${orderId}`);
-  revalidatePath(`/client/orders/${orderId}`);
-  revalidatePath("/admin/finance");
+  await audit("order.item_delete", { type: "order", id: orderId }, {
+    itemId,
+    total: removed.income.toFixed(2),
+    paymentStatus: removed.status,
+  });
+  revalidateSiteOrder(orderId);
   return { ok: true, message: "Позиция удалена" };
 }
 

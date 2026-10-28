@@ -14,7 +14,7 @@ import {
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
-import { createAccountingForExternalOrder } from "@/lib/accounting-db";
+import { recalcOrderMoney } from "@/lib/order-money-db";
 
 export type OfferState = {
   ok?: boolean;
@@ -225,8 +225,9 @@ export async function setOfferStatus(
  * Завести заказ по принятому предложению.
  *
  * До этого путь «КП принято → заказ» приходилось проходить руками,
- * переписывая позиции заново. Скидка КП уже учтена в итоге, поэтому в
- * заказ уходит именно он, а не сумма позиций.
+ * переписывая позиции заново. Скидка КП переносится в заказ явной
+ * корректировкой: итог тот же, что в КП, но видно, откуда разница с
+ * суммой позиций, и она переживает правку позиций.
  */
 export async function createOrderFromOffer(
   _prev: OfferState,
@@ -294,6 +295,8 @@ export async function createOrderFromOffer(
         description: `По коммерческому предложению ${offer.number}`,
         status: "unpaid",
         totalPrice: total.toFixed(2),
+        adjustment: round2(total - subtotal).toFixed(2),
+        adjustmentNote: discount !== 0 ? `Скидка ${discount} % по КП ${offer.number}` : null,
       })
       .returning({ id: externalOrders.id });
 
@@ -314,12 +317,11 @@ export async function createOrderFromOffer(
       .set({ status: "accepted" })
       .where(eq(commercialOffers.id, offerId));
 
-    await createAccountingForExternalOrder(tx, {
-      id: order.id,
-      clientName: offer.clientName,
-      income: total.toFixed(2),
-      status: "unpaid",
-    });
+    await recalcOrderMoney(
+      tx,
+      { source: "external", id: order.id },
+      { rebuildTotal: true, refreshEstimate: true },
+    );
 
     return order.id;
   });

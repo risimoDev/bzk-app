@@ -2,15 +2,24 @@ import type { Metadata } from "next";
 import { Fragment } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { eq, asc, desc } from "drizzle-orm";
+import { eq, asc, desc, sql } from "drizzle-orm";
 import { ArrowLeft, Mail, Phone, MapPin, Flame, Receipt, FileSignature } from "lucide-react";
 import { db } from "@/db";
-import { orders, orderItems, users, products, clientUploads } from "@/db/schema";
+import {
+  orders,
+  orderItems,
+  users,
+  products,
+  clientUploads,
+  ordersAccounting,
+  orderPayments,
+} from "@/db/schema";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
-import { ORDER_STATUS, statusOf, type OrderStatus } from "@/lib/order-status";
+import { statusOf } from "@/lib/order-status";
 import { can } from "@/lib/permissions";
 import { parseContact } from "@/lib/order-contact";
-import { changeStatus, toggleUrgent } from "../actions";
+import { toggleUrgent } from "../actions";
+import { StatusForm } from "./StatusForm";
 import { readOrderMessages } from "@/lib/order-chat";
 import { OrderChat } from "./OrderChat";
 import { DeleteOrderItemButton, OrderItemForm } from "./OrderItemForm";
@@ -18,6 +27,8 @@ import { DocumentsToggle } from "../DocumentsToggle";
 import { ProofReview } from "./ProofReview";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
+import { paymentStateOf } from "@/lib/finance";
+import { debtOf } from "@/lib/order-money";
 
 export const metadata: Metadata = {
   title: "Заказ · Админка",
@@ -125,6 +136,30 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
         .orderBy(asc(products.name))
     : [];
   const contact = parseContact(order.contactInfo);
+
+  // Оплата - из бухгалтерской карточки: платежи вносит бухгалтерия, а
+  // оплаченный счёт Точки попадает туда сам при сверке
+  const canFinance = await can("finance", "view");
+  const [card] = canFinance
+    ? await db
+        .select({
+          id: ordersAccounting.id,
+          status: ordersAccounting.status,
+          income: ordersAccounting.income,
+        })
+        .from(ordersAccounting)
+        .where(eq(ordersAccounting.orderId, order.id))
+        .orderBy(asc(ordersAccounting.id))
+        .limit(1)
+    : [];
+  const [paidRow] = card
+    ? await db
+        .select({ paid: sql<string>`coalesce(sum(${orderPayments.amount}), 0)` })
+        .from(orderPayments)
+        .where(eq(orderPayments.orderAccountingId, card.id))
+    : [];
+  const paidSum = Number(paidRow?.paid ?? 0);
+  const pay = card ? paymentStateOf(card.status) : null;
 
   return (
     <AdminPage
@@ -374,36 +409,46 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
             </p>
 
             {editable ? (
-              <form action={changeStatus} className="mt-4 flex flex-col gap-2">
-                <input type="hidden" name="orderId" value={order.id} />
-                <label htmlFor="status" className="sr-only">
-                  Новый статус заказа
-                </label>
-                <select
-                  id="status"
-                  name="status"
-                  defaultValue={order.status ?? "pending"}
-                  className="rounded-lg border border-ink/15 bg-paper px-3 py-2 text-sm text-ink focus:outline-2 focus:outline-offset-1 focus:outline-brand-bright"
-                >
-                  {(Object.keys(ORDER_STATUS) as OrderStatus[]).map((key) => (
-                    <option key={key} value={key}>
-                      {ORDER_STATUS[key].label}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="submit"
-                  className="rounded-lg bg-brand px-4 py-2 text-sm text-bone transition-colors hover:bg-brand-bright"
-                >
-                  Сохранить статус
-                </button>
-              </form>
+              <StatusForm orderId={order.id} status={order.status} />
             ) : (
               <p className="mt-3 text-xs text-ink/45">
                 У вашей роли нет права менять статус.
               </p>
             )}
           </div>
+
+          {card && pay && (
+            <div className="rounded-xl border border-ink/10 bg-bone p-5">
+              <p className="font-display text-[0.62rem] tracking-[0.18em] text-ink/40">
+                Оплата
+              </p>
+              <p className="mt-2 flex flex-wrap items-center gap-2">
+                <span
+                  className={cn(
+                    "rounded px-2.5 py-1 font-display text-xs tracking-wider",
+                    pay.className,
+                  )}
+                >
+                  {pay.label}
+                </span>
+                <span className="font-mono text-sm text-ink/60">
+                  {paidSum.toLocaleString("ru-RU")} из{" "}
+                  {Number(card.income).toLocaleString("ru-RU")} ₽
+                </span>
+              </p>
+              {debtOf(Number(card.income), paidSum) > 0 && order.status !== "cancelled" && (
+                <p className="mt-2 text-xs text-warn">
+                  Остаток {debtOf(Number(card.income), paidSum).toLocaleString("ru-RU")} ₽
+                </p>
+              )}
+              <Link
+                href={`/admin/finance/${card.id}`}
+                className="mt-2 inline-block text-xs text-brand hover:text-brand-bright"
+              >
+                Платежи и расходы заказа
+              </Link>
+            </div>
+          )}
 
           {editable && (
             <div className="rounded-xl border border-ink/10 bg-bone p-5">

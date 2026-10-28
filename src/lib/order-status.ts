@@ -32,3 +32,44 @@ export const ORDER_STATUS: Record<
 export function statusOf(value: string | null) {
   return ORDER_STATUS[(value ?? "pending") as OrderStatus] ?? ORDER_STATUS.pending;
 }
+
+/**
+ * Куда заказ может перейти из каждого статуса.
+ *
+ * Раньше статус выбирался из полного списка: завершённый заказ можно было
+ * вернуть в «Новый», а отменённый - в «Отправлен», и клиенту уходило
+ * письмо о стадии, которой не было. Таблица та же для заказов менеджера:
+ * производственные статусы у них совпадают с сайтовыми.
+ *
+ * Из «Отменён» - только обратно в начало (pending/processing): отмену
+ * снимают, когда клиент передумал, и заказ проходит путь заново.
+ * «Завершён» можно вернуть в «Доставлен» или «В работе» - чтобы исправить
+ * ошибочное нажатие или принять заказ на доработку.
+ */
+export const ORDER_TRANSITIONS: Record<OrderStatus, readonly OrderStatus[]> = {
+  pending: ["processing", "in_work", "delayed", "cancelled"],
+  processing: ["pending", "in_work", "delayed", "shipped", "delivered", "completed", "cancelled"],
+  in_work: ["processing", "delayed", "shipped", "delivered", "completed", "cancelled"],
+  delayed: ["processing", "in_work", "shipped", "cancelled"],
+  shipped: ["in_work", "delivered", "completed", "cancelled"],
+  delivered: ["shipped", "completed"],
+  completed: ["delivered", "in_work"],
+  cancelled: ["pending", "processing"],
+};
+
+export function isOrderStatus(value: unknown): value is OrderStatus {
+  // Object.hasOwn, а не `in`: "constructor" и "toString" - не статусы
+  return typeof value === "string" && Object.hasOwn(ORDER_STATUS, value);
+}
+
+/** Можно ли перевести заказ из `from` в `to`. Тот же статус - можно (ничего не меняется). */
+export function canChangeStatus(from: string | null, to: OrderStatus) {
+  const current: OrderStatus = isOrderStatus(from) ? from : "pending";
+  return current === to || ORDER_TRANSITIONS[current].includes(to);
+}
+
+/** Статусы, которые стоит предложить в списке: текущий и допустимые из него. */
+export function nextStatuses(from: string | null): OrderStatus[] {
+  const current: OrderStatus = isOrderStatus(from) ? from : "pending";
+  return [current, ...ORDER_TRANSITIONS[current]];
+}

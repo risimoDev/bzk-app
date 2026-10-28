@@ -10,6 +10,7 @@ import { can } from "@/lib/permissions";
 import { DeleteRow, GeneralExpenseForm } from "./FinanceForms";
 import { paymentStateOf, profitOf, periodRange, PERIODS, SOURCE } from "@/lib/finance";
 import { cn } from "@/lib/cn";
+import { openDebt } from "@/lib/order-money-db";
 
 export const metadata: Metadata = {
   title: "Бухгалтерия · Админка",
@@ -60,7 +61,7 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
   const generalPage = pageFrom(sp.gpage);
   const generalFilter = range ? gte(generalExpenses.expenseDate, range.from) : undefined;
 
-  const [rows, [totals], general, categories, [generalTotals]] = await Promise.all([
+  const [rows, [totals], general, categories, [generalTotals], debt] = await Promise.all([
     db
       .select({
         id: ordersAccounting.id,
@@ -71,6 +72,7 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
         expense: ordersAccounting.totalExpense,
         tax: ordersAccounting.taxAmount,
         status: ordersAccounting.status,
+        isCancelled: ordersAccounting.isCancelled,
         createdAt: ordersAccounting.createdAt,
       })
       .from(ordersAccounting)
@@ -82,9 +84,11 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
     db
       .select({
         n: count(),
-        income: sql<string>`coalesce(sum(${ordersAccounting.income}), 0)`,
-        expense: sql<string>`coalesce(sum(${ordersAccounting.totalExpense}), 0)`,
-        tax: sql<string>`coalesce(sum(${ordersAccounting.taxAmount}), 0)`,
+        // Отменённые заказы в списке видны (с пометкой), но в итоги не
+        // входят: денег по ним не будет, а раньше они раздували выручку
+        income: sql<string>`coalesce(sum(${ordersAccounting.income}) filter (where ${ordersAccounting.isCancelled} = false), 0)`,
+        expense: sql<string>`coalesce(sum(${ordersAccounting.totalExpense}) filter (where ${ordersAccounting.isCancelled} = false), 0)`,
+        tax: sql<string>`coalesce(sum(${ordersAccounting.taxAmount}) filter (where ${ordersAccounting.isCancelled} = false), 0)`,
       })
       .from(ordersAccounting)
       .where(periodFilter),
@@ -119,6 +123,8 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
       })
       .from(generalExpenses)
       .where(generalFilter),
+
+    openDebt(periodFilter),
   ]);
 
   const orderTotals = profitOf({
@@ -166,6 +172,11 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
           label="Выручка"
           value={money.format(orderTotals.income)}
           tone="brand"
+          hint={
+            debt.debt > 0
+              ? `ждём оплаты ${money.format(debt.debt)} по ${debt.n} заказам`
+              : "всё оплачено"
+          }
         />
         <AdminStat
           label="Расходы по заказам"
@@ -221,7 +232,10 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
                 return (
                   <tr
                     key={r.id}
-                    className="border-b border-ink/6 last:border-0 hover:bg-paper"
+                    className={cn(
+                      "border-b border-ink/6 last:border-0 hover:bg-paper",
+                      r.isCancelled && "opacity-55",
+                    )}
                   >
                     <td className="px-4 py-3">
                       <Link
@@ -241,6 +255,11 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
                     </td>
                     <td className="px-4 py-3 text-xs text-ink/55">
                       {SOURCE[r.source] ?? r.source}
+                      {r.isCancelled && (
+                        <span className="ml-2 rounded bg-danger/12 px-1.5 py-0.5 text-[0.6rem] text-danger">
+                          отменён
+                        </span>
+                      )}
                     </td>
                     <td className="whitespace-nowrap px-4 py-3">
                       <span

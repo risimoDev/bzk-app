@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   clients,
@@ -7,6 +7,7 @@ import {
   externalOrders,
   orderItems,
   orders,
+  ordersAccounting,
   products,
 } from "@/db/schema";
 
@@ -27,7 +28,11 @@ export type ClientOrder = {
   href: string;
   /** Что показывать чипом состояния. */
   status: string | null;
-  /** Оплата - только у менеджерских заказов, у сайтовых её нет отдельно. */
+  /**
+   * Оплата. У заказа менеджера - его статус оплаты, у сайтового - статус
+   * бухгалтерской карточки: оба считаются из платежей (в том числе по
+   * оплаченному счёту Точки). Отменённому заказу оплату не показываем.
+   */
   paymentStatus: string | null;
   total: string;
   isUrgent: boolean;
@@ -37,17 +42,31 @@ export type ClientOrder = {
 };
 
 export async function clientOrders(userId: number): Promise<ClientOrder[]> {
+  // Одна карточка на заказ: схема не запрещает две, и прямое соединение
+  // размножило бы заказ в списке
+  const siteCard = db
+    .selectDistinctOn([ordersAccounting.orderId], {
+      orderId: ordersAccounting.orderId,
+      status: ordersAccounting.status,
+    })
+    .from(ordersAccounting)
+    .where(isNotNull(ordersAccounting.orderId))
+    .orderBy(ordersAccounting.orderId, ordersAccounting.id)
+    .as("site_card");
+
   const [site, counterparties] = await Promise.all([
     db
       .select({
         id: orders.id,
         status: orders.status,
+        paymentStatus: siteCard.status,
         totalPrice: orders.totalPrice,
         isUrgent: orders.isUrgent,
         createdAt: orders.createdAt,
         readyDate: orders.readyDate,
       })
       .from(orders)
+      .leftJoin(siteCard, eq(siteCard.orderId, orders.id))
       .where(eq(orders.userId, userId))
       .orderBy(desc(orders.createdAt)),
     db
@@ -134,7 +153,7 @@ export async function clientOrders(userId: number): Promise<ClientOrder[]> {
       id: o.id,
       href: `/client/orders/${o.id}`,
       status: o.status,
-      paymentStatus: null,
+      paymentStatus: o.status === "cancelled" ? null : o.paymentStatus,
       total: o.totalPrice,
       isUrgent: o.isUrgent,
       createdAt: o.createdAt,

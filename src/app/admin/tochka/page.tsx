@@ -69,6 +69,8 @@ export default async function AdminTochka() {
   const configured = isTochkaConfigured();
   const customerCode = await getCustomerCode();
   const canEdit = await can("settings", "edit");
+  // Сверка пишет платежи в бухгалтерию - ей нужно право на изменение финансов
+  const canSync = await can("finance", "edit");
 
   const [invoices, closing] = await Promise.all([
     db.select().from(tochkaInvoices).orderBy(desc(tochkaInvoices.createdAt)),
@@ -205,7 +207,7 @@ export default async function AdminTochka() {
       <section className="mt-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="font-display text-lg text-ink">Счета на оплату</h2>
-          <SyncButton disabled={!configured || !customerCode} />
+          <SyncButton disabled={!configured || !customerCode || !canSync} />
         </div>
 
         {invoices.length === 0 ? (

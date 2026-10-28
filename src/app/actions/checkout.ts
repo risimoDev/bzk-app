@@ -14,7 +14,7 @@ import {
   type PromoCheck,
 } from "@/lib/promocodes-db";
 import { discountLabel, urgentFee } from "@/lib/promocodes";
-import { createAccountingForSiteOrder } from "@/lib/accounting-db";
+import { recalcOrderMoney } from "@/lib/order-money-db";
 import { notifyNewOrder } from "@/lib/notify";
 import { audit } from "@/lib/audit";
 import { clientIp } from "@/lib/client-ip";
@@ -257,11 +257,13 @@ export async function placeOrder(
         });
       }
 
-      await createAccountingForSiteOrder(tx, {
-        id: order.id,
-        clientName: v.name,
-        income: total.toFixed(2),
-      });
+      // Карточку бухгалтерии заводит общий пересчёт - той же транзакцией:
+      // заказ без неё не виден ни в бухгалтерии, ни в аналитике
+      await recalcOrderMoney(
+        tx,
+        { source: "site", id: order.id },
+        { rebuildTotal: true, refreshEstimate: true },
+      );
 
       return order.id;
     });

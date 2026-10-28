@@ -2,19 +2,14 @@
 
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { redirect } from "next/navigation";
 import { db } from "@/db";
-import {
-  externalOrders,
-  materials,
-  materialsStock,
-  orderExpenses,
-  ordersAccounting,
-} from "@/db/schema";
+import { externalOrders, materials, materialsStock } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { applyMovement } from "@/lib/stock";
+import { recordWriteOffExpense } from "@/lib/order-money-db";
 
 export type MovementState = {
   ok?: string;
@@ -247,13 +242,6 @@ export async function writeOffMaterial(
     return { ok: false, error: "Количество вида 12.5, больше нуля" };
   }
 
-  const [order] = await db
-    .select({ id: externalOrders.id })
-    .from(externalOrders)
-    .where(eq(externalOrders.id, externalOrderId))
-    .limit(1);
-  if (!order) return { ok: false, error: "Заказ не найден" };
-
   const [material] = await db
     .select({
       id: materials.id,
@@ -271,6 +259,16 @@ export async function writeOffMaterial(
 
   try {
     await db.transaction(async (tx) => {
+      // Заказ - под блокировкой и до движения склада: иначе параллельное
+      // удаление заказа оставило бы материал списанным «в никуда»
+      const [order] = await tx
+        .select({ id: externalOrders.id })
+        .from(externalOrders)
+        .where(eq(externalOrders.id, externalOrderId))
+        .for("no key update")
+        .limit(1);
+      if (!order) throw new Error("Заказ не найден");
+
       await applyMovement(tx, {
         materialId,
         type: "out",
@@ -283,37 +281,18 @@ export async function writeOffMaterial(
         comment: `Заказ менеджера № ${externalOrderId}`,
       });
 
-      // Фактический расход попадает в бухгалтерию заказа отдельной
-      // строкой - рядом с расчётной себестоимостью, а не вместо неё
+      // Фактический расход попадает в бухгалтерию заказа строкой с
+      // признаком списания. Пока такие строки есть, расчётная
+      // себестоимость в расход не входит: раньше их складывали, и
+      // материал считался дважды - по рецептуре и по факту
       if (cost > 0) {
-        const [card] = await tx
-          .select({ id: ordersAccounting.id })
-          .from(ordersAccounting)
-          .where(eq(ordersAccounting.externalOrderId, externalOrderId))
-          .limit(1);
-
-        if (card) {
-          await tx.insert(orderExpenses).values({
-            orderAccountingId: card.id,
-            materialName: material.name,
-            quantity: raw,
-            unit: material.unit,
-            costPerUnit: material.cost,
-            totalCost: cost.toFixed(2),
-            amount: cost.toFixed(2),
-            description: `Списано со склада: ${material.name}`,
-          });
-
-          const [{ sum }] = await tx
-            .select({ sum: sql<string>`coalesce(sum(${orderExpenses.amount}), 0)` })
-            .from(orderExpenses)
-            .where(eq(orderExpenses.orderAccountingId, card.id));
-
-          await tx
-            .update(ordersAccounting)
-            .set({ totalExpense: Number(sum).toFixed(2) })
-            .where(eq(ordersAccounting.id, card.id));
-        }
+        await recordWriteOffExpense(tx, externalOrderId, {
+          materialName: material.name,
+          quantity: raw,
+          unit: material.unit,
+          costPerUnit: material.cost,
+          cost,
+        });
       }
     });
   } catch (e) {

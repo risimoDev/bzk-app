@@ -737,7 +737,20 @@ export const externalOrders = pgTable("external_orders", {
   description: text("description"),
   status: externalOrdersStatusEnum("status").default("unpaid"),
   productionStatus: externalOrdersProductionStatusEnum("production_status").default("pending").notNull(),
+  /**
+   * Итог заказа. Руками не вписывается: его считает recalcOrderMoney как
+   * сумму позиций плюс корректировка (adjustment). Раньше итог правили
+   * отдельно от позиций, и после правки состава он молча расходился.
+   */
   totalPrice: numeric("total_price", { precision: 10, scale: 2 }).default("0.00").notNull(),
+  /**
+   * Скидка (со знаком минус) или наценка на заказ целиком. Явная строка
+   * вместо «итога, который отличается от суммы позиций»: так видно, откуда
+   * взялась разница, и она переживает правку позиций.
+   */
+  adjustment: numeric("adjustment", { precision: 10, scale: 2 }).default("0.00").notNull(),
+  /** За что корректировка - «скидка 10 % по КП», «доставка». */
+  adjustmentNote: varchar("adjustment_note", { length: 255 }),
   estimatedReadyDate: timestamp("estimated_ready_date", { mode: "date" }),
   /** Показывать ли клиенту счёт и УПД - см. orders.documentsVisible. */
   documentsVisible: boolean("documents_visible").default(false).notNull(),
@@ -1036,10 +1049,11 @@ export const ordersAccounting = pgTable("orders_accounting", {
   source: ordersAccountingSourceEnum("source").default("site").notNull(),
   orderId: integer("order_id").references(() => orders.id, { onDelete: "cascade" }),
   /**
-   * Заказ менеджера. В отличие от orderId удаление заказа карточку не
-   * уносит: деньги по нему уже прошли, и в отчёте за месяц они должны
-   * остаться. Имя заказчика лежит рядом строкой, так что карточка
-   * читается и без заказа.
+   * Заказ менеджера. Удалить можно только заказ без платежей и списаний,
+   * и тогда карточку удаляют вместе с ним (deleteExternalOrderChecked).
+   * set null остался для старых карточек, чей заказ удалили раньше: они
+   * помечены is_cancelled и в выручку не входят. Имя заказчика лежит
+   * рядом строкой, так что карточка читается и без заказа.
    */
   externalOrderId: integer("external_order_id").references(() => externalOrders.id, { onDelete: "set null" }),
   clientName: varchar("client_name", { length: 255 }),
@@ -1048,10 +1062,17 @@ export const ordersAccounting = pgTable("orders_accounting", {
   estimatedExpense: numeric("estimated_expense", { precision: 10, scale: 2 }).default("0.00").notNull(),
   taxAmount: numeric("tax_amount", { precision: 10, scale: 2 }).default("0.00").notNull(),
   status: ordersAccountingStatusEnum("status").default("unpaid").notNull(),
+  /**
+   * Заказ отменён (или удалён, а карточка осталась). Карточка остаётся
+   * для истории, но в выручку, долги и аналитику не входит. Ставит
+   * recalcOrderMoney по статусу самого заказа.
+   */
+  isCancelled: boolean("is_cancelled").default(false).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).defaultNow().$onUpdate(() => new Date()),
 }, (t) => [
   index("orders_accounting_order_id").on(t.orderId),
+  index("orders_accounting_external_order_id").on(t.externalOrderId),
 ]);
 
 export const orderItems = pgTable("order_items", {
@@ -1082,6 +1103,17 @@ export const orderExpenses = pgTable("order_expenses", {
   categoryId: integer("category_id").references(() => expensesCategories.id, { onDelete: "set null" }),
   amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
   description: text("description"),
+  /**
+   * Фактическое списание материала со склада на этот заказ.
+   *
+   * Отдельный признак, а не «material_name не пуст»: название материала
+   * может оказаться и в строке, вписанной руками, а правило «факт
+   * вытесняет оценку» должно срабатывать только на настоящее списание.
+   * Пока у карточки есть хоть одно списание, строка расчётной
+   * себестоимости в total_expense не входит - иначе материал считался бы
+   * дважды: по рецептуре и по факту.
+   */
+  isWriteOff: boolean("is_write_off").default(false).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   expenseDate: timestamp("expense_date", { mode: "date" }).defaultNow().notNull(),
 }, (t) => [
@@ -1097,8 +1129,15 @@ export const orderPayments = pgTable("order_payments", {
   paidAt: timestamp("paid_at", { mode: "date" }).defaultNow(),
   note: text("note"),
   paymentDate: timestamp("payment_date", { mode: "date" }).defaultNow().notNull(),
+  /**
+   * Счёт Точки, по которому пришли деньги. Уникален: сверку с банком
+   * запускают сколько угодно раз, а платёж по одному счёту должен
+   * завестись ровно один.
+   */
+  tochkaInvoiceId: integer("tochka_invoice_id").references(() => tochkaInvoices.id, { onDelete: "set null" }),
 }, (t) => [
   index("order_payments_order_accounting_id").on(t.orderAccountingId),
+  unique("order_payments_tochka_invoice_id").on(t.tochkaInvoiceId),
 ]);
 
 export const orderPromocodes = pgTable("order_promocodes", {

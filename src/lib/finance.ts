@@ -1,5 +1,7 @@
 /** Подписи и расчёты для бухгалтерии. */
 
+import { lastMonths, reportMonthStart } from "@/lib/analytics";
+
 export type PaymentState = "unpaid" | "partial" | "paid";
 
 export const PAYMENT_STATE: Record<
@@ -48,10 +50,14 @@ export function profitOf(input: {
   };
 }
 
-/** Границы периода: последние N месяцев, включая текущий. */
-export function periodRange(months: number) {
-  const now = new Date();
-  const from = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
+/**
+ * Границы периода: последние N месяцев, включая текущий.
+ *
+ * Месяц - по поясу мастерской, как в аналитике: сервер живёт в UTC, и
+ * «этот месяц» начинался бы на пять часов позже, чем в Екатеринбурге.
+ */
+export function periodRange(months: number, now = new Date()) {
+  const from = reportMonthStart(lastMonths(months, now)[0]);
   return { from, to: now };
 }
 

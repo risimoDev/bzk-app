@@ -6,7 +6,7 @@ import {
   createExternalOrder,
   type OrderFormState,
 } from "@/app/actions/external-orders";
-import { EXTERNAL_PAYMENT_STATUS, type ExternalPaymentStatus } from "@/lib/external-orders";
+import { externalOrderTotal } from "@/lib/order-money";
 import { counterpartyLabel } from "@/lib/counterparties";
 import { cn } from "@/lib/cn";
 import { adminInputClass, adminLabelClass } from "@/components/ui/form-classes";
@@ -97,7 +97,8 @@ export function OrderForm({
 
   const [rows, setRows] = useState<Row[]>([emptyRow(1)]);
   const [nextKey, setNextKey] = useState(2);
-  const [total, setTotal] = useState("");
+  const [adjustment, setAdjustment] = useState("");
+  const [paidNow, setPaidNow] = useState<"none" | "full" | "partial">("none");
 
   const patch = (key: number, over: Partial<Row>) =>
     setRows((rs) => rs.map((r) => (r.key === key ? { ...r, ...over } : r)));
@@ -124,7 +125,9 @@ export function OrderForm({
 
   const itemsSum = rows.reduce((s, r) => s + num(r.quantity) * num(r.unitPrice), 0);
   const expenseSum = rows.reduce((s, r) => s + num(r.quantity) * num(r.unitExpense), 0);
-  const finalTotal = total.trim() === "" ? itemsSum : num(total);
+  // Минус телефоны подставляют «длинный» - сервер его понимает, и здесь так же
+  const adjValue = num(adjustment.replace(/^[\u2212\u2013]/, "-"));
+  const finalTotal = externalOrderTotal(itemsSum, adjValue);
   const margin = finalTotal - expenseSum;
 
   return (
@@ -411,34 +414,80 @@ export function OrderForm({
             <input type="date" name="readyDate" className={cn(inputClass, "font-mono")} />
           </label>
 
+          {/* Оплата при оформлении - это платёж, а не статус: статус потом
+              считается из платежей. Поэтому «частично» - только с суммой */}
           <label className="flex flex-col gap-1.5">
-            <span className={labelClass}>ОПЛАТА</span>
-            <select name="status" defaultValue="unpaid" className={inputClass}>
-              {(Object.keys(EXTERNAL_PAYMENT_STATUS) as ExternalPaymentStatus[]).map((key) => (
-                <option key={key} value={key}>
-                  {EXTERNAL_PAYMENT_STATUS[key].label}
-                </option>
-              ))}
+            <span className={labelClass}>ОПЛАЧЕНО ПРИ ОФОРМЛЕНИИ</span>
+            <select
+              name="paidNow"
+              value={paidNow}
+              onChange={(e) => setPaidNow(e.target.value as "none" | "full" | "partial")}
+              className={inputClass}
+            >
+              <option value="none">Нет</option>
+              <option value="full">Полностью</option>
+              <option value="partial">Частично</option>
             </select>
           </label>
 
-          <label className="flex flex-col gap-1.5 sm:col-span-2">
-            <span className={labelClass}>ИТОГ ЗАКАЗА</span>
+          {paidNow === "partial" ? (
+            <label className="flex flex-col gap-1.5">
+              <span className={labelClass}>СКОЛЬКО ЗАПЛАТИЛИ, ₽</span>
+              <input
+                name="paidAmount"
+                inputMode="decimal"
+                placeholder="0.00"
+                className={cn(
+                  inputClass,
+                  "font-mono",
+                  state.fieldErrors?.paidAmount && "border-danger",
+                )}
+              />
+              {state.fieldErrors?.paidAmount && (
+                <span className="text-xs text-danger">{state.fieldErrors.paidAmount}</span>
+              )}
+            </label>
+          ) : (
+            <span className="hidden lg:block" aria-hidden />
+          )}
+
+          <label className="flex flex-col gap-1.5">
+            <span className={labelClass}>КОРРЕКТИРОВКА ИТОГА, ₽</span>
             <input
-              name="totalPrice"
-              value={total}
-              onChange={(e) => setTotal(e.target.value)}
+              name="adjustment"
+              value={adjustment}
+              onChange={(e) => setAdjustment(e.target.value)}
               inputMode="decimal"
-              placeholder={itemsSum.toFixed(2)}
+              placeholder="0"
               className={cn(
                 inputClass,
                 "font-mono",
-                state.fieldErrors?.totalPrice && "border-danger",
+                state.fieldErrors?.adjustment && "border-danger",
               )}
             />
             <span className="text-xs text-ink/45">
-              Пусто - возьмём сумму позиций. Заполняйте, если даёте скидку на заказ целиком.
+              Скидка на заказ целиком - с минусом (-500), наценка - без. Пусто - итог
+              равен сумме позиций.
             </span>
+            {state.fieldErrors?.adjustment && (
+              <span className="text-xs text-danger">{state.fieldErrors.adjustment}</span>
+            )}
+          </label>
+
+          <label className="flex flex-col gap-1.5 sm:col-span-2 lg:col-span-3">
+            <span className={labelClass}>ЗА ЧТО КОРРЕКТИРОВКА</span>
+            {/* Без корректировки заметка не сохраняется - поле выключено */}
+            <input
+              name="adjustmentNote"
+              maxLength={255}
+              disabled={adjValue === 0}
+              placeholder={
+                adjValue === 0
+                  ? "Сначала укажите корректировку"
+                  : "Скидка постоянному клиенту, доставка"
+              }
+              className={cn(inputClass, adjValue === 0 && "opacity-50")}
+            />
           </label>
 
           <label className="flex flex-col gap-1.5 sm:col-span-2 lg:col-span-4">
