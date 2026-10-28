@@ -21,8 +21,10 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   varchar,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 // ============================== Перечисления ==============================
 
@@ -257,7 +259,9 @@ export const categories = pgTable("categories", {
 
 export const orders = pgTable("orders", {
   id: serial("id").primaryKey(),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // restrict: клиента с заказами удалить нельзя - вместе с ним пропали бы
+  // заказы, а с ними выручка и история. Человека убирают отключением входа
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
   totalPrice: numeric("total_price", { precision: 10, scale: 2 }).notNull(),
   isUrgent: boolean("is_urgent").default(false).notNull(),
   status: ordersStatusEnum("status").default("pending"),
@@ -274,8 +278,16 @@ export const orders = pgTable("orders", {
    * платить не ту сумму.
    */
   documentsVisible: boolean("documents_visible").default(false).notNull(),
+  /**
+   * Одноразовый ключ оформления (uuid из скрытого поля формы). Двойной
+   * щелчок или повтор запроса приходят с тем же ключом, и вместо второго
+   * заказа клиента отправляют на уже созданный. У перенесённых и
+   * заведённых иначе заказов пусто.
+   */
+  checkoutToken: varchar("checkout_token", { length: 36 }),
 }, (t) => [
   index("orders_user_id").on(t.userId),
+  uniqueIndex("orders_checkout_token_unique").on(t.checkoutToken),
   index("orders_idx_orders_status").on(t.status),
   index("orders_idx_orders_is_urgent").on(t.isUrgent),
   index("orders_idx_orders_created_at").on(t.createdAt),
@@ -297,7 +309,10 @@ export const orderChats = pgTable("order_chats", {
 export const chatMessages = pgTable("chat_messages", {
   id: serial("id").primaryKey(),
   chatId: integer("chat_id").notNull().references(() => orderChats.id, { onDelete: "cascade" }),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // no action, а не restrict: проверка в конце оператора. Удаляя клиента,
+  // каскад сначала уберёт его чаты (а с ними и сообщения), а сообщения
+  // сотрудника в чужих чатах по-прежнему не дадут его удалить
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "no action" }),
   message: text("message").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
 }, (t) => [
@@ -362,10 +377,16 @@ export const commercialOffers = pgTable("commercial_offers", {
   status: commercialOffersStatusEnum("status").default("draft"),
   totalAmount: numeric("total_amount", { precision: 12, scale: 2 }).default("0.00"),
   createdBy: integer("created_by"),
+  /**
+   * Заказ, созданный из этого КП. По нему повторное нажатие «создать
+   * заказ» отправляет на уже созданный, а не заводит второй.
+   */
+  externalOrderId: integer("external_order_id").references(() => externalOrders.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).defaultNow().$onUpdate(() => new Date()),
 }, (t) => [
   unique("commercial_offers_idx_number").on(t.number),
+  index("commercial_offers_external_order_id").on(t.externalOrderId),
   index("commercial_offers_idx_status").on(t.status),
   index("commercial_offers_idx_created_by").on(t.createdBy),
 ]);
@@ -626,6 +647,10 @@ export const documents = pgTable("documents", {
   index("documents_idx_doc_type").on(t.docType),
   index("documents_idx_document_date").on(t.documentDate),
   index("documents_idx_created_at").on(t.createdAt),
+  // Частичный: у документов без номера (шаблон «не нумеровать») он пуст
+  uniqueIndex("documents_document_number_unique")
+    .on(t.documentNumber)
+    .where(sql`${t.documentNumber} is not null`),
 ]);
 
 export const documentHistory = pgTable("document_history", {
@@ -644,6 +669,19 @@ export const documentHistory = pgTable("document_history", {
   index("document_history_idx_document").on(t.documentId),
   index("document_history_idx_created_at").on(t.createdAt),
 ]);
+
+/**
+ * Атомарные счётчики номеров: закупки, КП, обращения, документы.
+ * Ключ вида `purchase:2026`, `offer:2026`, `ticket:20261028`,
+ * `doc:СЧ-2026`. Выдаёт номера nextNumber (lib/numbering-db.ts) - одним
+ * INSERT … ON CONFLICT DO UPDATE, поэтому два одновременных запроса
+ * не получают один номер. Прежний `count(*) + 1` давал совпадения и
+ * ошибку 500 на уникальном индексе.
+ */
+export const counters = pgTable("counters", {
+  key: varchar("key", { length: 120 }).primaryKey(),
+  value: integer("value").notNull().default(0),
+});
 
 export const documentNumberCounters = pgTable("document_number_counters", {
   id: serial("id").primaryKey(),
@@ -765,7 +803,8 @@ export const externalOrders = pgTable("external_orders", {
 export const externalOrderItems = pgTable("external_order_items", {
   id: serial("id").primaryKey(),
   externalOrderId: integer("external_order_id").notNull().references(() => externalOrders.id, { onDelete: "cascade" }),
-  productId: integer("product_id").references(() => products.id, { onDelete: "cascade" }),
+  // set null: позиция остаётся с названием (item_name), даже если товар удалили
+  productId: integer("product_id").references(() => products.id, { onDelete: "set null" }),
   isCustom: boolean("is_custom").default(false).notNull(),
   itemName: varchar("item_name", { length: 255 }),
   itemDescription: text("item_description"),
@@ -823,7 +862,7 @@ export const massMessages = pgTable("mass_messages", {
   specificUserIds: jsonb("specific_user_ids"),
   status: massMessagesStatusEnum("status").default("draft").notNull(),
   scheduledAt: timestamp("scheduled_at", { mode: "date" }),
-  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "restrict" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   sentAt: timestamp("sent_at", { withTimezone: true, mode: "date" }),
   totalRecipients: integer("total_recipients").default(0),
@@ -1047,7 +1086,12 @@ export const orderDocuments = pgTable("order_documents", {
 export const ordersAccounting = pgTable("orders_accounting", {
   id: serial("id").primaryKey(),
   source: ordersAccountingSourceEnum("source").default("site").notNull(),
-  orderId: integer("order_id").references(() => orders.id, { onDelete: "cascade" }),
+  /**
+   * restrict: бухгалтерия не исчезает вместе с заказом, а заказ, у
+   * которого есть карточка, удалить нельзя - его отменяют. Если заказ всё
+   * же нужно стереть (например тестовый), карточку удаляют явно перед ним.
+   */
+  orderId: integer("order_id").references(() => orders.id, { onDelete: "restrict" }),
   /**
    * Заказ менеджера. Удалить можно только заказ без платежей и списаний,
    * и тогда карточку удаляют вместе с ним (deleteExternalOrderChecked).
@@ -1078,10 +1122,21 @@ export const ordersAccounting = pgTable("orders_accounting", {
 export const orderItems = pgTable("order_items", {
   id: serial("id").primaryKey(),
   orderId: integer("order_id").notNull().references(() => orders.id, { onDelete: "cascade" }),
-  productId: integer("product_id").references(() => products.id, { onDelete: "cascade" }),
+  // set null: товар убрали из каталога, а позиция заказа остаётся -
+  // название и характеристики лежат в item_name на момент заказа
+  productId: integer("product_id").references(() => products.id, { onDelete: "set null" }),
   isCustom: boolean("is_custom").default(false).notNull(),
   itemName: varchar("item_name", { length: 255 }),
+  /**
+   * Чистое название товара на момент заказа, без характеристик. В
+   * item_name лежит «Название, Характеристика: значение», и группировать
+   * по нему аналитику нельзя - продажи одного товара раздробились бы по
+   * вариантам. Пусто у старых заказов и у своих позиций.
+   */
+  productName: varchar("product_name", { length: 255 }),
   itemNote: text("item_note"),
+  /** Единица измерения на момент заказа. Пусто у старых заказов - тогда берётся из товара. */
+  unit: varchar("unit", { length: 50 }),
   quantity: integer("quantity").notNull(),
   unitPrice: numeric("unit_price", { precision: 10, scale: 2 }),
   price: numeric("price", { precision: 10, scale: 2 }).notNull(),
@@ -1094,7 +1149,9 @@ export const orderItems = pgTable("order_items", {
 export const orderExpenses = pgTable("order_expenses", {
   id: serial("id").primaryKey(),
   orderAccountingId: integer("order_accounting_id").notNull().references(() => ordersAccounting.id, { onDelete: "cascade" }),
-  orderItemId: integer("order_item_id").references(() => orderItems.id, { onDelete: "cascade" }),
+  // set null: расход принадлежит заказу, а не позиции - удалили позицию,
+  // а затраты на неё остались в карточке
+  orderItemId: integer("order_item_id").references(() => orderItems.id, { onDelete: "set null" }),
   materialName: varchar("material_name", { length: 255 }),
   quantity: numeric("quantity", { precision: 10, scale: 4 }),
   unit: varchar("unit", { length: 50 }),
@@ -1498,7 +1555,7 @@ export const qcInspections = pgTable("qc_inspections", {
   /** По какому чек-листу */
   checklistId: integer("checklist_id").references(() => qcChecklists.id, { onDelete: "set null" }),
   /** Кто проверял */
-  inspectorId: integer("inspector_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  inspectorId: integer("inspector_id").notNull().references(() => users.id, { onDelete: "restrict" }),
   result: qcInspectionsResultEnum("result").default("passed").notNull(),
   /** Общее заключение */
   summary: text("summary"),
@@ -1524,7 +1581,7 @@ export const qcDefects = pgTable("qc_defects", {
   /** Фотоотчёт */
   photoPath: varchar("photo_path", { length: 255 }),
   status: qcDefectsStatusEnum("status").default("open").notNull(),
-  reportedBy: integer("reported_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  reportedBy: integer("reported_by").notNull().references(() => users.id, { onDelete: "restrict" }),
   fixedBy: integer("fixed_by").references(() => users.id, { onDelete: "set null" }),
   fixedAt: timestamp("fixed_at", { mode: "date" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
@@ -1654,7 +1711,8 @@ export const supportTickets = pgTable("support_tickets", {
 export const supportTicketMessages = pgTable("support_ticket_messages", {
   id: serial("id").primaryKey(),
   ticketId: integer("ticket_id").notNull().references(() => supportTickets.id, { onDelete: "cascade" }),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // no action: см. chat_messages.user_id
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "no action" }),
   message: text("message").notNull(),
   isInternal: boolean("is_internal").default(false),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
@@ -1669,7 +1727,7 @@ export const tasks = pgTable("tasks", {
   description: text("description"),
   taskItems: jsonb("task_items"),
   assignedTo: integer("assigned_to").references(() => users.id, { onDelete: "set null" }),
-  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "restrict" }),
   status: tasksStatusEnum("status").default("pending"),
   priority: tasksPriorityEnum("priority").default("medium"),
   dueDate: timestamp("due_date", { mode: "date" }),
@@ -1687,7 +1745,8 @@ export const tasks = pgTable("tasks", {
 export const taskComments = pgTable("task_comments", {
   id: serial("id").primaryKey(),
   taskId: integer("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // no action: см. chat_messages.user_id
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "no action" }),
   comment: text("comment").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
 }, (t) => [

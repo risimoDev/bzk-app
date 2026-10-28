@@ -234,7 +234,28 @@ export default async function AdminOffers({ searchParams }: PageProps<"/admin/of
                     ) : (
                       <span />
                     )}
-                    {canOrder && own.length > 0 && <OfferToOrderButton offerId={o.id} />}
+                    {/* Заказ из КП уже заведён - вместо кнопки ссылка на него:
+                        вторая кнопка плодила бы дубли. Из отклонённого и
+                        просроченного КП заказ не заводится вовсе */}
+                    {o.externalOrderId !== null ? (
+                      <Link
+                        href={`/admin/external-orders/${o.externalOrderId}`}
+                        className="text-sm text-brand hover:text-brand-bright"
+                      >
+                        Заказ № {o.externalOrderId} →
+                      </Link>
+                    ) : o.status === "accepted" ? (
+                      // Принято, но связи нет: заказ, скорее всего, завели
+                      // руками или до появления связи. Вторую кнопку не даём
+                      <span className="text-xs text-ink/45">
+                        Принято: заказ создан раньше - найдите его в списке заказов
+                      </span>
+                    ) : (
+                      canOrder &&
+                      own.length > 0 &&
+                      o.status !== "rejected" &&
+                      o.status !== "expired" && <OfferToOrderButton offerId={o.id} />
+                    )}
                   </div>
                 )}
 

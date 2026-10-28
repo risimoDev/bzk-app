@@ -3,8 +3,9 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { orderItems, orderPromocodes, orders } from "@/db/schema";
+import { orderItems, orderPromocodes, orders, users } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { readCart, resolveCart, writeCart } from "@/lib/cart";
 import {
@@ -17,6 +18,8 @@ import { discountLabel, urgentFee } from "@/lib/promocodes";
 import { recalcOrderMoney } from "@/lib/order-money-db";
 import { notifyNewOrder } from "@/lib/notify";
 import { audit } from "@/lib/audit";
+import { isUniqueViolation } from "@/lib/db-errors";
+import { buyerSnapshot, itemSnapshotName } from "@/lib/order-snapshot";
 import { clientIp } from "@/lib/client-ip";
 import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
 
@@ -57,6 +60,21 @@ async function promoLimitVerdict(keys: string[]) {
 
 async function recordPromoAttempt(keys: string[]) {
   for (const key of keys) await recordAttempt(key, "promo");
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Заказ, уже оформленный с этим ключом, - если он есть и принадлежит
+ * этому клиенту. Чужой ключ ничего не открывает.
+ */
+async function orderByToken(token: string, userId: number) {
+  const [row] = await db
+    .select({ id: orders.id })
+    .from(orders)
+    .where(and(eq(orders.checkoutToken, token), eq(orders.userId, userId)))
+    .limit(1);
+  return row?.id ?? null;
 }
 
 const schema = z.object({
@@ -132,6 +150,22 @@ export async function placeOrder(
   const user = await currentUser();
   if (!user) return { error: "Чтобы оформить заказ, войдите в кабинет" };
 
+  // Ключ оформления приходит из скрытого поля формы. Двойной щелчок или
+  // повтор запроса несёт тот же ключ: вместо второго заказа отправляем
+  // на уже созданный. Смотрим до проверки корзины - после первого заказа
+  // она пуста, и повтор получил бы «Корзина пуста».
+  const rawToken = String(formData.get("checkoutToken") ?? "").trim().toLowerCase();
+  const checkoutToken = UUID_RE.test(rawToken) ? rawToken : null;
+  // Повтор уже оформленного заказа ведёт на него. Зовётся и перед отказом
+  // по промокоду: при двойной отправке первый запрос мог успеть списать
+  // одноразовый код, и второй получил бы «код уже использован» вместо заказа
+  const redirectIfPlaced = async () => {
+    if (!checkoutToken) return;
+    const existing = await orderByToken(checkoutToken, Number(user.id));
+    if (existing !== null) redirect(`/client/orders/${existing}?new=1`);
+  };
+  await redirectIfPlaced();
+
   const ip = await clientIp();
   const limit = await checkRateLimit(ip, "checkout");
   if (!limit.ok) {
@@ -177,10 +211,14 @@ export async function placeOrder(
   let promo: PromoCheck | null = null;
   if (rawPromo) {
     const tooMany = await promoLimitVerdict(promoKeys);
-    if (tooMany) return { fieldErrors: { promoCode: tooMany } };
+    if (tooMany) {
+      await redirectIfPlaced();
+      return { fieldErrors: { promoCode: tooMany } };
+    }
 
     promo = await checkPromocode(rawPromo, beforeDiscount, { userId: Number(user.id) });
     if (!promo.ok) {
+      await redirectIfPlaced();
       await recordPromoAttempt(promoKeys);
       return { fieldErrors: { promoCode: promo.message } };
     }
@@ -188,6 +226,20 @@ export async function placeOrder(
 
   const discount = promo?.ok ? promo.discount : 0;
   const total = round2(Math.max(0, beforeDiscount - discount));
+
+  // Реквизиты покупателя на момент заказа: счёт и УПД по этому заказу
+  // потом не должны поменяться вслед за профилем
+  const [profile] = await db
+    .select({
+      isCorporate: users.isCorporate,
+      companyName: users.companyName,
+      inn: users.inn,
+      kpp: users.kpp,
+      legalAddress: users.legalAddress,
+    })
+    .from(users)
+    .where(eq(users.id, Number(user.id)))
+    .limit(1);
 
   await recordAttempt(ip, "checkout");
 
@@ -200,6 +252,7 @@ export async function placeOrder(
           userId: Number(user.id),
           totalPrice: total.toFixed(2),
           isUrgent,
+          checkoutToken,
           status: "pending",
           isNew: true,
           shippingAddress: v.address,
@@ -221,6 +274,7 @@ export async function placeOrder(
                   discount,
                 }
               : null,
+            ...(profile ? buyerSnapshot(profile) : {}),
           }),
         })
         .returning({ id: orders.id });
@@ -230,7 +284,11 @@ export async function placeOrder(
           orderId: order.id,
           productId: i.productId,
           isCustom: false,
-          itemName: i.name,
+          // Название с выбранными характеристиками и единица - снимок на
+          // момент заказа: товар потом переименуют или уберут
+          itemName: itemSnapshotName(i.name, i.options),
+          productName: i.name.slice(0, 255),
+          unit: i.unit,
           quantity: i.quantity,
           unitPrice: i.unitPrice.toFixed(2),
           // Колонка price хранит сумму строки целиком - так же, как у
@@ -272,7 +330,14 @@ export async function placeOrder(
     // покажет причину у поля промокода, и человеку достаточно убрать или
     // сменить код. Остальные ошибки - настоящие сбои, их не прячем
     if (error instanceof PromoUnavailableError) {
+      await redirectIfPlaced();
       return { fieldErrors: { promoCode: error.message } };
+    }
+    // Параллельный повтор с тем же ключом успел раньше: заказ уже есть,
+    // эта попытка откатилась целиком (вместе с промокодом)
+    if (checkoutToken && isUniqueViolation(error, "orders_checkout_token_unique")) {
+      await redirectIfPlaced();
+      return { error: "Не удалось оформить заказ. Обновите страницу и попробуйте ещё раз" };
     }
     throw error;
   }

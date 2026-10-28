@@ -255,19 +255,28 @@ export async function saveOrderItem(
   const unitPrice = parseMoney(formData.get("unitPrice"));
   if (Number.isNaN(unitPrice)) return { ok: false, error: "Цена вида 1234.56" };
 
+  let product: { name: string; unit: string | null } | null = null;
   if (productId !== null) {
     const [exists] = await db
-      .select({ id: products.id })
+      .select({ id: products.id, name: products.name, unit: products.unit })
       .from(products)
       .where(eq(products.id, productId))
       .limit(1);
     if (!exists) return { ok: false, error: "Товар не найден" };
+    product = exists;
   }
+
+  // Название и единица - снимок на момент правки: переименованный или
+  // удалённый товар не должен менять уже выставленный документ
+  const snapshot = {
+    itemName: product ? product.name.slice(0, 255) : itemName,
+    productName: product ? product.name.slice(0, 255) : null,
+    unit: product ? product.unit : null,
+  };
 
   const values = {
     productId,
     isCustom: productId === null,
-    itemName: productId === null ? itemName : null,
     itemNote: String(formData.get("itemNote") ?? "").trim().slice(0, 2000) || null,
     quantity,
     unitPrice: unitPrice.toFixed(2),
@@ -285,11 +294,20 @@ export async function saveOrderItem(
     if (!order) return null;
 
     if (itemId === null) {
-      await tx.insert(orderItems).values({ ...values, orderId });
+      await tx.insert(orderItems).values({ ...values, ...snapshot, orderId });
     } else {
+      // Позиция с тем же товаром сохраняет свой снимок: в нём название с
+      // выбранными при заказе характеристиками, а у нас только имя товара
+      const [before] = await tx
+        .select({ productId: orderItems.productId })
+        .from(orderItems)
+        .where(and(eq(orderItems.id, itemId), eq(orderItems.orderId, orderId)))
+        .limit(1);
+      const sameProduct = productId !== null && before?.productId === productId;
+
       const rows = await tx
         .update(orderItems)
-        .set(values)
+        .set(sameProduct ? values : { ...values, ...snapshot })
         .where(
           and(
             eq(orderItems.id, itemId),

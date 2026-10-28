@@ -9,6 +9,7 @@ import { materials, purchaseOrders, purchaseOrderItems, suppliers } from "@/db/s
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { nextPurchaseNumber } from "@/lib/numbering-db";
 import { applyMovement } from "@/lib/stock";
 import { RECEIVABLE, type PurchaseStatus } from "@/lib/purchases";
 import { localDate } from "@/lib/dates";
@@ -285,16 +286,9 @@ export async function createPurchase(
   const expected = String(formData.get("expectedDeliveryDate") ?? "").trim();
 
   const purchaseId = await db.transaction(async (tx) => {
-    // Номер считаем по числу закупок за год. На колонке стоит
-    // уникальный индекс: если две закупки заведут в одну секунду,
-    // вторая упадёт на вставке, а не получит чужой номер
-    const year = new Date().getFullYear();
-    const [{ n }] = await tx
-      .select({ n: sql<number>`count(*)::int` })
-      .from(purchaseOrders)
-      .where(sql`${purchaseOrders.orderNumber} like ${`ЗК-${year}-%`}`);
-
-    const orderNumber = `ЗК-${year}-${String(n + 1).padStart(3, "0")}`;
+    // Номер выдаёт атомарный счётчик: две закупки, заведённые в одну
+    // секунду, получают разные номера, а не падают на уникальном индексе
+    const orderNumber = await nextPurchaseNumber(tx);
 
     const [created] = await tx
       .insert(purchaseOrders)

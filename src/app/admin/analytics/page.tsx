@@ -113,7 +113,7 @@ export default async function AdminAnalytics() {
         left join products p on p.id = i.product_id
         where o.production_status <> 'cancelled'
         union all
-        select coalesce(p.name, i.item_name, 'без названия'),
+        select coalesce(p.name, i.product_name, i.item_name, 'без названия'),
                i.price, 0, i.quantity,
                's' || i.order_id
         from order_items i

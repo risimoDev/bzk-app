@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import {
   documentCategories,
@@ -16,6 +16,8 @@ import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { clientIp } from "@/lib/client-ip";
+import { isUniqueViolation } from "@/lib/db-errors";
+import { nextDocumentNumber } from "@/lib/numbering-db";
 import { renderTemplate, type FieldValue, type ItemRow } from "@/lib/document-templates";
 
 export type DocumentState = {
@@ -191,19 +193,15 @@ export async function createDocument(
         : template.contentTemplate;
   }
 
-  const documentId = await db.transaction(async (tx) => {
+  const insertDocument = () => db.transaction(async (tx) => {
     let number: string | null = manualNumber || null;
 
-    // Номер по шаблону: префикс, год и порядковый номер за год
+    // Номер по шаблону: префикс, год и порядковый номер за год. Выдаёт
+    // атомарный счётчик по паре «префикс + год»; он же учитывает номера,
+    // вписанные руками, так что совпасть с ними не может
     if (!number && template?.isNumbered !== false && template) {
-      const year = new Date().getFullYear();
       const prefix = (template.numberPrefix ?? "").trim() || "DOC-";
-      const like = `${prefix}${year}-%`;
-      const [{ n }] = await tx
-        .select({ n: sql<number>`count(*)::int` })
-        .from(documents)
-        .where(sql`${documents.documentNumber} like ${like}`);
-      number = `${prefix}${year}-${String(n + 1).padStart(3, "0")}`;
+      number = await nextDocumentNumber(tx, prefix);
     }
 
     const [created] = await tx
@@ -238,6 +236,36 @@ export async function createDocument(
 
     return created.id;
   });
+
+  const isTaken = (error: unknown) =>
+    isUniqueViolation(error, "documents_document_number_unique");
+
+  let documentId: number | null;
+  try {
+    documentId = await insertDocument();
+  } catch (error) {
+    if (!isTaken(error)) throw error;
+    if (manualNumber) {
+      // Номер вписали руками, и он занят: уникальный индекс не даёт двум
+      // документам один номер
+      documentId = null;
+    } else {
+      // Номер выдал счётчик, а чужой ручной документ успел занять его между
+      // чтением максимума и вставкой. Транзакция откатилась вместе с номером;
+      // второй заход видит уже занятое и берёт следующий. Ошибку у пустого
+      // поля номера человеку показывать нечего
+      try {
+        documentId = await insertDocument();
+      } catch (again) {
+        if (!isTaken(again)) throw again;
+        return { error: "Не удалось выдать номер документа. Нажмите «Создать» ещё раз" };
+      }
+    }
+  }
+
+  if (documentId === null) {
+    return { fieldErrors: { documentNumber: "Документ с таким номером уже есть" } };
+  }
 
   await audit("document.create", { type: "document", id: documentId }, { title, status });
 

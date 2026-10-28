@@ -120,6 +120,23 @@ try {
     `);
     const mismatched = claimed.filter((r) => r.order_status && r.order_status !== r.card_status);
 
+    // 0. КП, из которых заказ создан до появления commercial_offers.external_order_id:
+    // без привязки у них снова появилась бы кнопка «создать заказ» и дубль.
+    // Заказ узнаём по тексту описания, который ставит createOrderFromOffer
+    const offerLinks = await tx.execute(sql`
+      update commercial_offers o
+      set external_order_id = (
+        select min(e.id) from external_orders e
+        where e.description = 'По коммерческому предложению ' || o.number
+      )
+      where o.external_order_id is null
+        and exists (
+          select 1 from external_orders e
+          where e.description = 'По коммерческому предложению ' || o.number
+        )
+      returning o.id, o.number, o.external_order_id
+    `);
+
     // 1. Корректировка = итог − сумма позиций
     const adj = await tx.execute(sql`
       with sums as (
@@ -316,6 +333,8 @@ try {
     for (const r of mismatched) {
       log(`  карточка ${r.id} (${orderLabel(r)}): заказ «${r.order_status}», карточка «${r.card_status}» - взят статус заказа`);
     }
+    log(`КП, привязанных к уже созданным заказам: ${offerLinks.rows.length}`);
+    for (const r of offerLinks.rows) log(`  ${r.number} -> заказ м${r.external_order_id}`);
     log(`Корректировок заказов менеджера записано: ${adj.rows.length}`);
     for (const r of adj.rows) log(`  заказ м${r.id}: ${money(r.adj)}`);
     log(`Строк списания помечено: ${wo.rows.length}`);

@@ -158,8 +158,15 @@ export function DocumentForm({
               name="documentNumber"
               maxLength={50}
               placeholder="Оставьте пустым - присвоим по шаблону"
-              className={cn(inputClass, "font-mono")}
+              className={cn(
+                inputClass,
+                "font-mono",
+                state.fieldErrors?.documentNumber && "border-danger",
+              )}
             />
+            {state.fieldErrors?.documentNumber && (
+              <span className="text-xs text-danger">{state.fieldErrors.documentNumber}</span>
+            )}
           </label>
 
           <label className="flex flex-col gap-1.5">

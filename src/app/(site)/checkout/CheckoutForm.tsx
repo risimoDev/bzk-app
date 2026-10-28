@@ -36,9 +36,12 @@ export type CheckoutDefaults = {
  */
 export function CheckoutForm({
   subtotal,
+  checkoutToken,
   defaults,
 }: {
   subtotal: number;
+  /** Одноразовый ключ оформления - защита от двойного заказа. */
+  checkoutToken: string;
   defaults: CheckoutDefaults;
 }) {
   const [state, action, pending] = useActionState(placeOrder, initial);
@@ -71,6 +74,7 @@ export function CheckoutForm({
         action={action}
         className="flex flex-col gap-5 rounded-card border border-ink/10 bg-bone/85 p-6 sm:p-8"
       >
+        <input type="hidden" name="checkoutToken" value={checkoutToken} />
         <input type="hidden" name="isUrgent" value={isUrgent ? "1" : "0"} />
         <input type="hidden" name="promoCode" value={discount > 0 ? code : ""} />
 

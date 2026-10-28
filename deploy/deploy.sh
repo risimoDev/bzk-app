@@ -134,6 +134,26 @@ success "База данных готова к работе."
 log "Сборка Docker-образа приложения (Next.js 16 standalone)..."
 docker compose build --pull app
 
+# 5a. Проверка данных перед схемой: уникальный номер документа
+# push добавит уникальный индекс на documents.document_number. Если в базе
+# уже есть два документа с одним номером, индекс не создастся, а push
+# упадёт посреди применения схемы. Проверяем до него: при дублях выкладка
+# останавливается, старое приложение продолжает работать. На свежей базе
+# таблицы documents ещё нет - проверять нечего.
+log "Проверка дублей номеров документов перед применением схемы..."
+PSQL_DB=(docker compose exec -T db psql -U "${POSTGRES_USER:-bzk}" -d "${POSTGRES_DB:-bzk}" -v ON_ERROR_STOP=1 -t -A)
+HAS_DOCUMENTS="$("${PSQL_DB[@]}" -c "select to_regclass('public.documents') is not null" </dev/null)" ||
+  error "Не удалось проверить таблицу documents - выкладка остановлена, схема не применялась."
+if [ "${HAS_DOCUMENTS}" = "t" ]; then
+  DUPLICATES="$("${PSQL_DB[@]}" -c "select document_number || ' (' || count(*) || ' шт., id: ' || string_agg(id::text, ', ' order by id) || ')' from documents where document_number is not null group by document_number having count(*) > 1 order by document_number" </dev/null)" ||
+    error "Не удалось проверить дубли номеров документов - выкладка остановлена, схема не применялась."
+  if [ -n "${DUPLICATES}" ]; then
+    echo "${DUPLICATES}"
+    error "В documents есть повторяющиеся номера (список выше). Уникальный индекс на них не создастся. Выкладка остановлена ДО применения схемы, старое приложение работает как раньше. Поправьте номера у лишних документов (admin/documents) и запустите деплой снова."
+  fi
+fi
+success "Дублей номеров документов нет."
+
 # 6. Применение миграций схемы Drizzle ORM
 log "Применение схемы базы данных через drizzle-kit..."
 # Боевой образ (стадия runner) - standalone: в нём нет ни drizzle-kit,

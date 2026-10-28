@@ -241,6 +241,12 @@ export default async function InvoicePrintPage({ params }: PageProps<"/print/inv
           <b>{doc.amountInWords}</b>
         </p>
 
+        {doc.discount > 0 && (
+          <p style={{ marginTop: "3mm", fontSize: "8pt" }}>
+            Цены указаны с учётом скидки по заказу: {money.format(doc.discount)} руб.
+          </p>
+        )}
+
         <p style={{ marginTop: "3mm", fontSize: "8pt" }}>
           Без налога (НДС) - продавец применяет упрощённую систему налогообложения и не
           признаётся плательщиком налога на добавленную стоимость.

@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
 import {
   orders,
@@ -17,6 +17,7 @@ import { currentUser } from "@/auth";
 import { saveUpload, removeUpload } from "@/lib/uploads";
 import { isTicketClosed, TICKET_CATEGORIES, TICKET_PRIORITIES } from "@/lib/client-portal";
 import { localDate } from "@/lib/dates";
+import { nextTicketNumber } from "@/lib/numbering-db";
 import { notifyStaff } from "@/lib/notify";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
@@ -285,20 +286,13 @@ export async function createTicket(
     }
   }
 
-  // Номер обращения: TK-ГГГГММДД-NNNN, нумерация внутри дня. Берём max
-  // по номерам этого дня, а не последнюю запись по id: обращения разных
-  // дней перемешаны, и «последнее» может оказаться вчерашним.
-  const prefix = `TK-${localDate().replaceAll("-", "")}-`;
+  // Номер обращения: TK-ГГГГММДД-NNNN, нумерация внутри дня. Его выдаёт
+  // атомарный счётчик дня: max + 1 пересекался у двух обращений, поданных
+  // одновременно, и второе падало ошибкой на уникальном индексе.
+  const ymd = localDate().replaceAll("-", "");
 
   const number = await db.transaction(async (tx) => {
-    const [seq] = await tx
-      .select({
-        last: sql<number>`coalesce(max(cast(substring(${supportTickets.ticketNumber} from ${prefix.length + 1}) as integer)), 0)`,
-      })
-      .from(supportTickets)
-      .where(sql`${supportTickets.ticketNumber} like ${prefix + "%"}`);
-
-    const ticketNumber = prefix + String(Number(seq?.last ?? 0) + 1).padStart(4, "0");
+    const ticketNumber = await nextTicketNumber(tx, ymd);
 
     const [ticket] = await tx
       .insert(supportTickets)

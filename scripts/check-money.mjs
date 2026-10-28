@@ -370,6 +370,8 @@ try {
     await db.delete(externalOrders).where(inArray(externalOrders.id, extIds));
   }
   if (invoiceId) await db.delete(tochkaInvoices).where(eq(tochkaInvoices.id, invoiceId));
+  // Карточка сайтового заказа держит заказ (restrict) - сначала она
+  if (siteId) await db.delete(ordersAccounting).where(eq(ordersAccounting.orderId, siteId));
   if (siteId) await db.delete(orders).where(eq(orders.id, siteId));
   if (materialId) await db.delete(materials).where(eq(materials.id, materialId));
   if (userId) await db.delete(users).where(eq(users.id, userId));
