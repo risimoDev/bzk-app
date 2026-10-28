@@ -8,6 +8,7 @@ import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { ORDER_STATUS, statusOf, type OrderStatus } from "@/lib/order-status";
 import { can } from "@/lib/permissions";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Заказы · Админка",
@@ -54,7 +55,10 @@ export default async function AdminOrders(props: PageProps<"/admin/orders">) {
   }
   if (query) {
     const like = `%${query}%`;
-    const byId = /^\d+$/.test(query) ? eq(orders.id, Number(query)) : undefined;
+    // Длинное число - это не номер заказа, а, скорее, телефон: в integer
+    // оно не влезет, и сравнение с id уронило бы запрос
+    const orderId = parseId(query);
+    const byId = orderId === null ? undefined : eq(orders.id, orderId);
     const cond = or(ilike(users.name, like), ilike(users.email, like), byId);
     if (cond) filters.push(cond);
   }

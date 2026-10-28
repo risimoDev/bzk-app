@@ -17,6 +17,7 @@ import {
 } from "@/lib/client-portal";
 import { StatusControls, AssignControl, ReplyForm } from "./SupportControls";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Обращение · Админка",
@@ -41,8 +42,8 @@ export default async function AdminTicket({ params }: PageProps<"/admin/support/
   }
 
   const { id } = await params;
-  const ticketId = Number(id);
-  if (!Number.isInteger(ticketId) || ticketId <= 0) notFound();
+  const ticketId = parseId(id);
+  if (ticketId === null) notFound();
 
   const [ticket] = await db
     .select({

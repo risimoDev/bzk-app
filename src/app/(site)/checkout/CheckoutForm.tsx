@@ -49,6 +49,12 @@ export function CheckoutForm({
 
   const [isUrgent, setUrgent] = useState(false);
   const [code, setCode] = useState("");
+  // Ответ оформления, отказ по промокоду из которого человек уже видел и
+  // начал исправлять (поменял код или проверил заново): старый отказ
+  // рядом с новым кодом только путал бы
+  const [promoErrorSeen, setPromoErrorSeen] = useState<CheckoutState | null>(null);
+  const orderPromoError =
+    promoErrorSeen === state ? undefined : state.fieldErrors?.promoCode;
 
   const fee = isUrgent ? Math.round(subtotal * URGENT_RATE * 100) / 100 : 0;
   // Скидку показываем только пока условия те же, при которых её считали:
@@ -175,7 +181,11 @@ export function CheckoutForm({
         </dl>
 
         {/* Промокод - отдельная форма: она проверяет код, не отправляя заказ */}
-        <form action={promoAction} className="relative mt-6 flex flex-col gap-2">
+        <form
+          action={promoAction}
+          onSubmit={() => setPromoErrorSeen(state)}
+          className="relative mt-6 flex flex-col gap-2"
+        >
           <input type="hidden" name="isUrgent" value={isUrgent ? "1" : "0"} />
           <label
             htmlFor="promoCode"
@@ -188,7 +198,11 @@ export function CheckoutForm({
               id="promoCode"
               name="promoCode"
               value={code}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
+              onChange={(e) => {
+                setCode(e.target.value.toUpperCase());
+                setPromoErrorSeen(state);
+              }}
+              aria-invalid={Boolean(orderPromoError)}
               maxLength={50}
               placeholder="Если есть"
               className="min-w-0 flex-1 rounded-pill border border-ice/25 bg-transparent px-4 py-2 text-sm text-bone placeholder:text-ice/35 focus:outline-2 focus:outline-offset-1 focus:outline-brand-bright"
@@ -202,7 +216,18 @@ export function CheckoutForm({
               {promoPending ? "…" : "Проверить"}
             </button>
           </div>
-          {promo.message && (
+          {/* Отказ при оформлении важнее прежней проверки: код могли
+              исчерпать, пока человек заполнял форму, или он одноразовый
+              и уже был у этого клиента. Заказ при этом не создан */}
+          {orderPromoError ? (
+            <span
+              className="flex items-start gap-1.5 text-xs text-danger"
+              role="alert"
+            >
+              <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+              {orderPromoError}. Уберите код или введите другой - заказ пока не оформлен.
+            </span>
+          ) : promo.message && (
             <span
               className={cn(
                 "flex items-start gap-1.5 text-xs",

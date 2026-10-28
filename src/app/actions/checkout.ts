@@ -7,7 +7,12 @@ import { db } from "@/db";
 import { orderItems, orderPromocodes, orders } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { readCart, resolveCart, writeCart } from "@/lib/cart";
-import { checkPromocode, consumePromocode } from "@/lib/promocodes-db";
+import {
+  checkPromocode,
+  consumePromocode,
+  PromoUnavailableError,
+  type PromoCheck,
+} from "@/lib/promocodes-db";
 import { discountLabel, urgentFee } from "@/lib/promocodes";
 import { createAccountingForSiteOrder } from "@/lib/accounting-db";
 import { notifyNewOrder } from "@/lib/notify";
@@ -32,6 +37,28 @@ export type PromoState = {
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
+/**
+ * Ключи счётчика перебора промокодов: адрес и, если человек вошёл, его
+ * аккаунт. Одного адреса мало - его меняют, а аккаунт для оформления
+ * нужен всё равно.
+ */
+function promoLimitKeys(ip: string, userId?: string) {
+  return userId ? [ip, `promo-user:${userId}`] : [ip];
+}
+
+async function promoLimitVerdict(keys: string[]) {
+  let wait = 0;
+  for (const key of keys) {
+    const v = await checkRateLimit(key, "promo");
+    if (!v.ok) wait = Math.max(wait, v.retryAfter);
+  }
+  return wait === 0 ? null : `Слишком много попыток. Попробуйте ${retryAfterText(wait)}`;
+}
+
+async function recordPromoAttempt(keys: string[]) {
+  for (const key of keys) await recordAttempt(key, "promo");
+}
+
 const schema = z.object({
   name: z.string().trim().min(2, "Имя от двух букв").max(100),
   email: z.email("Похоже, адрес с опечаткой"),
@@ -54,20 +81,27 @@ export async function applyPromocode(
   if (items.length === 0) return { ok: false, message: "Корзина пуста" };
 
   // Промокод анонимный, поэтому ограничиваем по адресу: иначе действующие
-  // коды можно было бы вычислить перебором словаря
-  const ip = await clientIp();
-  const limit = await checkRateLimit(ip, "promo");
-  if (!limit.ok) {
-    return { ok: false, message: `Слишком много попыток. Попробуйте ${retryAfterText(limit.retryAfter)}` };
-  }
-  await recordAttempt(ip, "promo");
+  // коды можно было бы вычислить перебором словаря. Вошедшего считаем ещё
+  // и по аккаунту. Счётчик общий с оформлением заказа, поэтому пишем в
+  // него только неудачи: перебор - это неверные коды, а человек, который
+  // жмёт «Проверить» на верном, не должен потом упереться в лимит при
+  // оформлении
+  const user = await currentUser();
+  const keys = promoLimitKeys(await clientIp(), user?.id);
+  const tooMany = await promoLimitVerdict(keys);
+  if (tooMany) return { ok: false, message: tooMany };
 
   const subtotal = items.reduce((s, i) => s + i.lineTotal, 0);
   const urgent = String(formData.get("isUrgent") ?? "") === "1";
   const base = subtotal + urgentFee(subtotal, urgent);
 
-  const result = await checkPromocode(String(formData.get("promoCode") ?? ""), base);
-  if (!result.ok) return { ok: false, message: result.message };
+  const result = await checkPromocode(String(formData.get("promoCode") ?? ""), base, {
+    userId: user ? Number(user.id) : undefined,
+  });
+  if (!result.ok) {
+    await recordPromoAttempt(keys);
+    return { ok: false, message: result.message };
+  }
 
   return {
     ok: true,
@@ -134,81 +168,112 @@ export async function placeOrder(
   const fee = urgentFee(subtotal, isUrgent);
   const beforeDiscount = round2(subtotal + fee);
 
+  // Оформление - тоже проверка кода: без того же счётчика перебор просто
+  // перешёл бы сюда из applyPromocode. Как и там, считаем только неудачи.
+  // Отказ уходит в fieldErrors.promoCode - форма показывает его у поля
+  // промокода, заказ не создаётся
   const rawPromo = String(formData.get("promoCode") ?? "").trim();
-  const promo = rawPromo ? await checkPromocode(rawPromo, beforeDiscount) : null;
-  if (promo && !promo.ok) return { fieldErrors: { promoCode: promo.message } };
+  const promoKeys = promoLimitKeys(ip, user.id);
+  let promo: PromoCheck | null = null;
+  if (rawPromo) {
+    const tooMany = await promoLimitVerdict(promoKeys);
+    if (tooMany) return { fieldErrors: { promoCode: tooMany } };
+
+    promo = await checkPromocode(rawPromo, beforeDiscount, { userId: Number(user.id) });
+    if (!promo.ok) {
+      await recordPromoAttempt(promoKeys);
+      return { fieldErrors: { promoCode: promo.message } };
+    }
+  }
 
   const discount = promo?.ok ? promo.discount : 0;
   const total = round2(Math.max(0, beforeDiscount - discount));
 
   await recordAttempt(ip, "checkout");
 
-  const orderId = await db.transaction(async (tx) => {
-    const [order] = await tx
-      .insert(orders)
-      .values({
-        userId: Number(user.id),
-        totalPrice: total.toFixed(2),
-        isUrgent,
-        status: "pending",
-        isNew: true,
-        shippingAddress: v.address,
-        // Старый сайт клал сюда JSON: контакты на момент заказа плюс
-        // детали расчёта. Формат сохраняем - его читает parseContact
-        contactInfo: JSON.stringify({
-          name: v.name,
-          email: v.email,
-          phone: v.phone,
-          comment: v.comment ?? "",
-          is_urgent: isUrgent,
-          original_total_price: subtotal,
-          urgent_fee: fee,
-          promo_data: promo?.ok
-            ? {
-                code: promo.rule.code,
-                discount_type: promo.rule.discountType,
-                discount_value: promo.rule.discountValue,
-                discount,
-              }
-            : null,
-        }),
-      })
-      .returning({ id: orders.id });
+  let orderId: number;
+  try {
+    orderId = await db.transaction(async (tx) => {
+      const [order] = await tx
+        .insert(orders)
+        .values({
+          userId: Number(user.id),
+          totalPrice: total.toFixed(2),
+          isUrgent,
+          status: "pending",
+          isNew: true,
+          shippingAddress: v.address,
+          // Старый сайт клал сюда JSON: контакты на момент заказа плюс
+          // детали расчёта. Формат сохраняем - его читает parseContact
+          contactInfo: JSON.stringify({
+            name: v.name,
+            email: v.email,
+            phone: v.phone,
+            comment: v.comment ?? "",
+            is_urgent: isUrgent,
+            original_total_price: subtotal,
+            urgent_fee: fee,
+            promo_data: promo?.ok
+              ? {
+                  code: promo.rule.code,
+                  discount_type: promo.rule.discountType,
+                  discount_value: promo.rule.discountValue,
+                  discount,
+                }
+              : null,
+          }),
+        })
+        .returning({ id: orders.id });
 
-    await tx.insert(orderItems).values(
-      items.map((i) => ({
-        orderId: order.id,
-        productId: i.productId,
-        isCustom: false,
-        itemName: i.name,
-        quantity: i.quantity,
-        unitPrice: i.unitPrice.toFixed(2),
-        // Колонка price хранит сумму строки целиком - так же, как у
-        // заказов менеджера
-        price: round2(i.lineTotal).toFixed(2),
-        attributes: i.options.length > 0 ? i.options : null,
-      })),
-    );
+      await tx.insert(orderItems).values(
+        items.map((i) => ({
+          orderId: order.id,
+          productId: i.productId,
+          isCustom: false,
+          itemName: i.name,
+          quantity: i.quantity,
+          unitPrice: i.unitPrice.toFixed(2),
+          // Колонка price хранит сумму строки целиком - так же, как у
+          // заказов менеджера
+          price: round2(i.lineTotal).toFixed(2),
+          attributes: i.options.length > 0 ? i.options : null,
+        })),
+      );
 
-    if (promo?.ok) {
-      await tx.insert(orderPromocodes).values({
-        orderId: order.id,
-        promoCode: promo.rule.code,
-        discountType: promo.rule.discountType === "fixed" ? "fixed" : "percentage",
-        discountValue: promo.rule.discountValue,
-        appliedDiscount: discount.toFixed(2),
+      if (promo?.ok) {
+        await tx.insert(orderPromocodes).values({
+          orderId: order.id,
+          promoCode: promo.rule.code,
+          discountType: promo.rule.discountType === "fixed" ? "fixed" : "percentage",
+          discountValue: promo.rule.discountValue,
+          appliedDiscount: discount.toFixed(2),
+        });
+        // Лимит и одноразовость - ещё раз, уже под блокировкой строки
+        // кода: проверка выше была вне транзакции, и параллельный заказ
+        // мог успеть выбрать последнее использование
+        await consumePromocode(tx, promo.rule.code, {
+          userId: Number(user.id),
+          orderId: order.id,
+        });
+      }
+
+      await createAccountingForSiteOrder(tx, {
+        id: order.id,
+        clientName: v.name,
+        income: total.toFixed(2),
       });
-      await consumePromocode(tx, promo.rule.code);
-    }
 
-    await createAccountingForSiteOrder(tx, {
-      id: order.id,
-      clientName: v.name,
-      income: total.toFixed(2),
+      return order.id;
     });
-
-    return order.id;
-  });
+  } catch (error) {
+    // Ловим только отказ по промокоду: заказ откатился целиком, форма
+    // покажет причину у поля промокода, и человеку достаточно убрать или
+    // сменить код. Остальные ошибки - настоящие сбои, их не прячем
+    if (error instanceof PromoUnavailableError) {
+      return { fieldErrors: { promoCode: error.message } };
+    }
+    throw error;
+  }
 
   await writeCart([]);
 

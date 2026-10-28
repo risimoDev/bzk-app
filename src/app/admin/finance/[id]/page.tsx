@@ -15,6 +15,7 @@ import { can } from "@/lib/permissions";
 import { paymentStateOf, profitOf, SOURCE } from "@/lib/finance";
 import { DeleteRow, ExpenseForm, PaymentForm } from "../FinanceForms";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Запись бухгалтерии · Админка",
@@ -45,12 +46,13 @@ export default async function AdminFinanceEntry(
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const entryId = parseId(id);
+  if (entryId === null) notFound();
 
   const [entry] = await db
     .select()
     .from(ordersAccounting)
-    .where(eq(ordersAccounting.id, Number(id)))
+    .where(eq(ordersAccounting.id, entryId))
     .limit(1);
 
   if (!entry) notFound();

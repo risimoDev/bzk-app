@@ -9,6 +9,7 @@ import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import { safeDocumentHtml } from "@/lib/documents";
 import { TemplateForm } from "../TemplateForm";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Шаблон документа · Админка",
@@ -27,15 +28,16 @@ export default async function DocumentTemplatePage(
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const templateId = parseId(id);
+  if (templateId === null) notFound();
 
   const [[template], categories, [usage]] = await Promise.all([
-    db.select().from(documentTemplates).where(eq(documentTemplates.id, Number(id))).limit(1),
+    db.select().from(documentTemplates).where(eq(documentTemplates.id, templateId)).limit(1),
     db
       .select({ id: documentCategories.id, name: documentCategories.name })
       .from(documentCategories)
       .orderBy(asc(documentCategories.sortOrder), asc(documentCategories.name)),
-    db.select({ n: count() }).from(documents).where(eq(documents.templateId, Number(id))),
+    db.select({ n: count() }).from(documents).where(eq(documents.templateId, templateId)),
   ]);
 
   if (!template) notFound();

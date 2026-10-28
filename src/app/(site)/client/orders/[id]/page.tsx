@@ -15,6 +15,7 @@ import { uploadStatus, formatFileSize } from "@/lib/client-portal";
 import { docStatus } from "@/lib/documents-meta";
 import { OrderChat } from "@/components/client/OrderChat";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Заказ",
@@ -42,8 +43,8 @@ export default async function ClientOrderPage({ params }: PageProps<"/client/ord
   if (!user) redirect("/login?from=/client/orders");
 
   const { id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   const userId = Number(user.id);
 

@@ -425,6 +425,7 @@ export async function getInvoicePdf(documentId: string) {
   return requestBinary(`/invoice/v1.0/bills/${code}/${encodeURIComponent(documentId)}/file`);
 }
 
+/** Значения paymentStatus и их смысл - в lib/tochka-status.ts. */
 export type PaymentStatus = {
   Data?: { paymentStatus?: string; status?: string; paidAt?: string };
 };

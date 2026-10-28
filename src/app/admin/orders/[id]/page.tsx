@@ -17,6 +17,7 @@ import { DeleteOrderItemButton, OrderItemForm } from "./OrderItemForm";
 import { DocumentsToggle } from "../DocumentsToggle";
 import { ProofReview } from "./ProofReview";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Заказ · Админка",
@@ -47,7 +48,8 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   const [order] = await db
     .select({
@@ -68,7 +70,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
     })
     .from(orders)
     .leftJoin(users, eq(orders.userId, users.id))
-    .where(eq(orders.id, Number(id)))
+    .where(eq(orders.id, orderId))
     .limit(1);
 
   if (!order) notFound();
@@ -89,7 +91,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
     })
     .from(orderItems)
     .leftJoin(products, eq(orderItems.productId, products.id))
-    .where(eq(orderItems.orderId, Number(id)))
+    .where(eq(orderItems.orderId, orderId))
     .orderBy(asc(orderItems.id));
 
   // Макеты, которые клиент приложил к заказу: менеджер их принимает
@@ -104,7 +106,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
       createdAt: clientUploads.createdAt,
     })
     .from(clientUploads)
-    .where(eq(clientUploads.orderId, Number(id)))
+    .where(eq(clientUploads.orderId, orderId))
     .orderBy(desc(clientUploads.createdAt));
 
   const st = statusOf(order.status);

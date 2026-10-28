@@ -14,6 +14,7 @@ import { plural, rublesInWords } from "@/lib/num2words";
 import { parseLocalDate } from "@/lib/dates";
 import { PrintBar } from "@/components/print/PrintBar";
 import { docStyles } from "@/components/print/doc-styles";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Коммерческое предложение",
@@ -42,8 +43,8 @@ export default async function OfferPrintPage({ params }: PageProps<"/print/offer
   if (!(await can("documents", "view"))) redirect("/login?from=/admin/offers");
 
   const { id } = await params;
-  const offerId = Number(id);
-  if (!Number.isInteger(offerId) || offerId <= 0) notFound();
+  const offerId = parseId(id);
+  if (offerId === null) notFound();
 
   const [offer] = await db
     .select()

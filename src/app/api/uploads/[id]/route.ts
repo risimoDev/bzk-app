@@ -6,6 +6,7 @@ import { db } from "@/db";
 import { clientUploads } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { uploadPath } from "@/lib/uploads";
+import { parseId } from "@/lib/ids";
 
 /**
  * Выдача клиентского файла.
@@ -19,8 +20,8 @@ export async function GET(_req: Request, ctx: RouteContext<"/api/uploads/[id]">)
   if (!user) return new Response("Требуется вход", { status: 401 });
 
   const { id } = await ctx.params;
-  const fileId = Number(id);
-  if (!Number.isInteger(fileId) || fileId <= 0) {
+  const fileId = parseId(id);
+  if (fileId === null) {
     return new Response("Файл не найден", { status: 404 });
   }
 

@@ -18,6 +18,7 @@ import { qcResult } from "@/lib/quality";
 import { InspectionForm, type ChecklistOption } from "./InspectionForm";
 import { DefectForm } from "./DefectForm";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Проверка · Админка",
@@ -47,8 +48,8 @@ export default async function AdminInspect({
   }
 
   const { id } = await params;
-  const productionOrderId = Number(id);
-  if (!Number.isInteger(productionOrderId) || productionOrderId <= 0) notFound();
+  const productionOrderId = parseId(id);
+  if (productionOrderId === null) notFound();
 
   const [order] = await db
     .select({

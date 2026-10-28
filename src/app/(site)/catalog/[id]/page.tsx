@@ -27,6 +27,7 @@ import { currentUser } from "@/auth";
 import { reviews, orderItems, orders } from "@/db/schema";
 import { Star } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 const money = new Intl.NumberFormat("ru-RU", {
   style: "currency",
@@ -127,7 +128,10 @@ export async function generateMetadata(
   props: PageProps<"/catalog/[id]">,
 ): Promise<Metadata> {
   const { id } = await props.params;
-  const data = /^\d+$/.test(id) ? await getProduct(Number(id)) : null;
+  // Не «только цифры», а id в пределах integer: /catalog/99999999999
+  // проходил проверку цифрами и ронял запрос переполнением
+  const productId = parseId(id);
+  const data = productId === null ? null : await getProduct(productId);
   if (!data) return { title: "Товар не найден" };
 
   const description =
@@ -156,12 +160,12 @@ export async function generateMetadata(
 
 export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const productId = parseId(id);
+  if (productId === null) notFound();
 
-  const data = await getProduct(Number(id));
+  const data = await getProduct(productId);
   if (!data) notFound();
 
-  const productId = Number(id);
   const user = await currentUser();
 
   // Отзыв показываем только одобренный: очередь модерации живёт в

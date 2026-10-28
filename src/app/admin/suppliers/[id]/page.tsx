@@ -10,6 +10,7 @@ import { can } from "@/lib/permissions";
 import { purchaseStatusOf } from "@/lib/purchases";
 import { DeleteSupplierButton, SupplierForm } from "../SupplierForm";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Подрядчик · Админка",
@@ -39,8 +40,8 @@ export default async function AdminSupplier({
   }
 
   const { id } = await params;
-  const supplierId = Number(id);
-  if (!Number.isInteger(supplierId) || supplierId <= 0) notFound();
+  const supplierId = parseId(id);
+  if (supplierId === null) notFound();
 
   const [row] = await db
     .select()

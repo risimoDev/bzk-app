@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useActionState, useState } from "react";
 import { ShoppingBag } from "lucide-react";
-import { addToCart } from "@/app/actions/cart";
+import { addToCart, type CartState } from "@/app/actions/cart";
 import { Button } from "@/components/ui/Button";
 import { normalizeQuantity, unitPriceFor, type PriceTier } from "@/lib/product-price";
 
@@ -14,6 +14,8 @@ const money = new Intl.NumberFormat("ru-RU", {
 const count = new Intl.NumberFormat("ru-RU");
 
 type Option = { valueId: number; value: string; priceModifier: string | null };
+
+const initial: CartState = {};
 
 /**
  * Выбор характеристик и количества с расчётом суммы.
@@ -44,6 +46,7 @@ export function AddToCartForm({
   multiplicity: number;
   attributes: { name: string; values: Option[] }[];
 }) {
+  const [state, formAction, pending] = useActionState(addToCart, initial);
   const [quantityInput, setQuantityInput] = useState(String(minQuantity));
   const [selected, setSelected] = useState<number[]>(() =>
     attributes.map((a) => a.values[0]?.valueId ?? 0),
@@ -69,10 +72,9 @@ export function AddToCartForm({
     : null;
 
   return (
-    <form action={addToCart} className="mt-8 flex flex-col gap-6">
+    <form action={formAction} className="mt-8 flex flex-col gap-6">
+      {/* Минимум и шаг сервер берёт из базы по товару - в форму их не кладём */}
       <input type="hidden" name="productId" value={productId} />
-      <input type="hidden" name="minQuantity" value={minQuantity} />
-      <input type="hidden" name="multiplicity" value={multiplicity} />
 
       {attributes.map((attr, attrIndex) => (
         <fieldset key={attr.name} className="border-0 p-0">
@@ -148,11 +150,24 @@ export function AddToCartForm({
           />
         </div>
 
-        <Button type="submit" size="lg">
+        <Button type="submit" size="lg" disabled={pending}>
           <ShoppingBag className="size-5" />
           В корзину
         </Button>
       </div>
+
+      {/* Отказ сервера: товар сняли с продажи или набор характеристик
+          не сошёлся с тем, что сейчас в базе */}
+      {state.error && (
+        <p role="alert" className="text-sm text-danger">
+          {state.error}
+        </p>
+      )}
+      {state.ok && state.message && (
+        <p role="status" className="text-sm text-ok">
+          {state.message}
+        </p>
+      )}
 
       <div
         aria-live="polite"

@@ -17,6 +17,7 @@ import { docStatus, docType, safeDocumentHtml, DOC_ACTIONS } from "@/lib/documen
 import { DocumentStatusForm } from "./StatusForm";
 import { DocumentBody } from "@/components/admin/DocumentBody";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Документ · Админка",
@@ -51,8 +52,8 @@ export default async function AdminDocument({ params }: PageProps<"/admin/docume
   }
 
   const { id } = await params;
-  const docId = Number(id);
-  if (!Number.isInteger(docId) || docId <= 0) notFound();
+  const docId = parseId(id);
+  if (docId === null) notFound();
 
   const [doc] = await db
     .select({

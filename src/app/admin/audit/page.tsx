@@ -7,6 +7,7 @@ import { auditLog, users } from "@/db/schema";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { AdminPager, offsetOf, pageFrom } from "@/components/admin/AdminPager";
 import { can } from "@/lib/permissions";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Журнал действий · Админка",
@@ -147,7 +148,7 @@ export default async function AdminAudit({ searchParams }: PageProps<"/admin/aud
   const sp = await searchParams;
   const q = one(sp.q).trim().slice(0, 100);
   const userRaw = one(sp.user);
-  const userId = /^\d+$/.test(userRaw) ? Number(userRaw) : null;
+  const userId = parseId(userRaw);
   const type = one(sp.type);
   const page = pageFrom(sp.page);
 

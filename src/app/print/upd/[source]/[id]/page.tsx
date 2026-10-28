@@ -6,6 +6,7 @@ import { buildUpd, longDate, type UpdRow } from "@/lib/upd";
 import { missingFields, REQUIRED_FOR_DOCUMENTS, COMPANY_FIELDS } from "@/lib/company";
 import { PrintBar } from "@/components/print/PrintBar";
 import { docStyles } from "@/components/print/doc-styles";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "УПД",
@@ -33,8 +34,8 @@ const shortDate = new Intl.DateTimeFormat("ru-RU", {
  */
 export default async function UpdPrintPage({ params }: PageProps<"/print/upd/[source]/[id]">) {
   const { source: rawSource, id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   // Номера сайтовых и менеджерских заказов идут своими
   // последовательностями и пересекаются - без источника «заказ № 17»

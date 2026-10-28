@@ -12,6 +12,7 @@ import {
 import { paymentQrSvg } from "@/lib/payment-qr";
 import { PrintBar } from "@/components/print/PrintBar";
 import { docStyles } from "@/components/print/doc-styles";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Счёт на оплату",
@@ -38,8 +39,8 @@ const longDateFmt = new Intl.DateTimeFormat("ru-RU", {
  */
 export default async function InvoicePrintPage({ params }: PageProps<"/print/invoice/[source]/[id]">) {
   const { source: rawSource, id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   // Номера сайтовых и менеджерских заказов идут своими
   // последовательностями и пересекаются - без источника «заказ № 17»

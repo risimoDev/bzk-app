@@ -211,7 +211,7 @@ bash deploy/backup-now.sh
 ```bash
 bash deploy/restore.sh
 ```
-*Интерактивное меню с выбором даты бэкапа и подтверждением.*
+*Интерактивное меню с выбором даты бэкапа и подтверждением. Можно сразу указать файл: `bash deploy/restore.sh backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.dump`. Понимает и новые `.dump`, и старые `.sql.gz`; восстановление идёт одной транзакцией - если дамп битый, база остаётся как была.*
 
 ### Быстрый перезапуск:
 ```bash
@@ -230,14 +230,54 @@ bash deploy/deploy.sh
 ## 10. Резервное копирование (Автоматическое)
 
 В `docker-compose.yml` встроен независимый фоновый сервис `backup`:
-- Каждую ночь в **03:00** (по часовому поясу компании) создаётся сжатый дамп `backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.sql.gz`.
+- Каждую ночь в **03:00** (по часовому поясу компании) создаётся дамп `backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.dump` - формат custom (`pg_dump -Fc`), он уже сжат. Перед тем как дать файлу имя, скрипт проверяет его через `pg_restore --list`; не собравшийся дамп удаляется, а не остаётся рядом с целыми. Копии до этого перехода называются `….sql.gz` и удаляются по тому же сроку.
 - Рядом кладётся архив всех загруженных файлов - макетов клиентов, фотоотчётов брака, картинок каталога: `backups/uploads-ГГГГ-ММ-ДД-ЧЧММ.tar.gz`. Без него дамп неполон: в базе лежат только имена файлов.
 - Дампы старше 14 дней (`BACKUP_RETAIN_DAYS`) и архивы файлов старше 7 дней (`BACKUP_UPLOADS_RETAIN_DAYS`) удаляются автоматически. Файлы весят на порядки больше базы, поэтому хранятся меньше.
 - Всё сохраняется на хосте в `/opt/bzk-app/backups/`.
+
+Восстановить базу - проще всего `bash deploy/restore.sh` (см. выше). Вручную, при остановленном приложении (`docker compose stop app`); папка `backups/` видна в контейнере базы как `/backups`:
+```bash
+# новые копии (.dump)
+docker compose exec -T db pg_restore -U bzk -d bzk --clean --if-exists \
+  --no-owner --single-transaction /backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.dump
+
+# старые копии (.sql.gz) - простой SQL, накатывать на пустую базу
+gunzip -c backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.sql.gz | docker compose exec -T db psql -U bzk -d bzk
+```
 
 Восстановить файлы из ночного архива:
 ```bash
 docker compose exec -T app tar -xzf - -C /app/storage/uploads < backups/uploads-ГГГГ-ММ-ДД-ЧЧММ.tar.gz
 ```
 
-Рекомендуется периодически копировать папку `/opt/bzk-app/backups/` на внешнее хранилище (Яндекс.Диск, S3 или дополнительный сервер).
+### Копии вне сервера (rclone)
+
+Копии на том же диске не спасут, если пропадёт сам сервер. Сервис `backup` умеет после каждого успешного дампа отправить его во внешнее хранилище через [rclone](https://rclone.org) (Яндекс.Диск, S3, SFTP и т.д.) - если задана переменная `RCLONE_REMOTE`. В образе `postgres:17-alpine` rclone нет; без него скрипт пишет в лог предупреждение и работает как раньше. Архивы файлов (`uploads-…`) не выгружаются - они большие; их при желании копируйте отдельно.
+
+Как включить, не меняя `docker-compose.yml`:
+
+1. На своём компьютере настройте хранилище: `rclone config` (например, удалённое хранилище с именем `yadisk`). Скопируйте получившийся `rclone.conf` на сервер в `/opt/bzk-app/rclone.conf` и закройте его: `chmod 600 rclone.conf`. В git этот файл не попадает (`/rclone.conf` в `.gitignore`) - в нём ключи доступа.
+2. В `.env` добавьте `RCLONE_REMOTE=yadisk:bzk-backups` (имя хранилища из конфига и папка в нём).
+3. Рядом с `docker-compose.yml` создайте `docker-compose.override.yml` - Compose подхватит его сам:
+   ```yaml
+   services:
+     backup:
+       environment:
+         RCLONE_REMOTE: ${RCLONE_REMOTE:-}
+         RCLONE_CONFIG: /config/rclone.conf
+       volumes:
+         # Не только для чтения: у хранилищ со входом через OAuth
+         # (Яндекс.Диск, Google Drive) rclone дописывает в конфиг
+         # обновлённый токен
+         - ./rclone.conf:/config/rclone.conf
+       # rclone ставится при каждом старте контейнера. Не поставился (нет
+       # сети) - бэкап всё равно запускается, а в логе будет предупреждение
+       entrypoint:
+         - /bin/sh
+         - -c
+         - 'apk add --no-cache rclone >/dev/null 2>&1 || echo "[backup] rclone не установился"; exec /bin/sh /usr/local/bin/backup.sh'
+   ```
+   `docker compose up` (и `deploy/deploy.sh`) подхватывают этот файл без дополнительных флагов.
+4. `docker compose up -d backup`, затем `bash deploy/logs.sh backup` (или `docker compose logs backup`): в логе должна появиться строка `выгружено: yadisk:bzk-backups/bzk-….dump`.
+
+Срок хранения во внешнем хранилище скрипт не отслеживает - настройте его там (правило жизненного цикла в S3) или периодически чистите `rclone delete --min-age 60d yadisk:bzk-backups`.

@@ -11,6 +11,7 @@ import {
   externalProductionStatus,
 } from "@/lib/external-orders";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Заказ",
@@ -42,8 +43,8 @@ export default async function ClientExternalOrderPage({
   if (!user) redirect("/login?from=/client/orders");
 
   const { id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   const order = await clientExternalOrder(Number(user.id), orderId);
   if (!order) notFound();

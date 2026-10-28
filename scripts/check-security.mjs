@@ -68,6 +68,7 @@ const PUBLIC_ACTIONS = new Set([
   "setQuantity",
   "removeFromCart",
   "clearCart", // корзина анонимная
+  "pruneCart", // убирает из своей же куки строки, которые корзина не показывает
   "applyPromocode", // анонимная проверка, ограничена по адресу
 ]);
 

@@ -49,6 +49,7 @@ import { startProduction } from "@/app/admin/production/actions";
 import { WriteOffForm } from "./WriteOffForm";
 import { DocumentsToggle } from "@/app/admin/orders/DocumentsToggle";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Внешний заказ · Админка",
@@ -95,8 +96,8 @@ export default async function AdminExternalOrder({
   }
 
   const { id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   const [order] = await db
     .select()

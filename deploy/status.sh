@@ -63,7 +63,8 @@ echo ""
 
 echo "--- 5. Последние резервные копии ---"
 if [ -d "${ROOT_DIR}/backups" ]; then
-  find "${ROOT_DIR}/backups" -type f -name "*.sql.gz" -printf "%TY-%Tm-%Td %TH:%TM: %p (%s bytes)\n" 2>/dev/null | sort -r | head -n 5 || echo "Бэкапов пока нет."
+  # Ночной бэкап пишет .dump (формат custom), ручные и старые копии - .sql.gz
+  find "${ROOT_DIR}/backups" -type f \( -name "*.dump" -o -name "*.sql.gz" \) -printf "%TY-%Tm-%Td %TH:%TM: %p (%s bytes)\n" 2>/dev/null | sort -r | head -n 5 || echo "Бэкапов пока нет."
 else
   echo "Папка backups/ ещё не создана."
 fi

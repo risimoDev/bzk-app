@@ -14,6 +14,7 @@ import {
 import { CounterpartyForm } from "../CounterpartyForm";
 import { ArchiveButton, LinkAccountForm } from "./LinkControls";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Контрагент · Админка",
@@ -43,8 +44,8 @@ export default async function AdminCounterparty({
   }
 
   const { id } = await params;
-  const clientId = Number(id);
-  if (!Number.isInteger(clientId) || clientId <= 0) notFound();
+  const clientId = parseId(id);
+  if (clientId === null) notFound();
 
   const [row] = await db
     .select()

@@ -19,6 +19,7 @@ import { PriceTierForm } from "./PriceTierForm";
 import { ProductImages } from "./ProductImages";
 import { AttributesEditor, type AttributeRow } from "./AttributesEditor";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Товар · Админка",
@@ -43,7 +44,8 @@ export default async function AdminProduct(
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const productId = parseId(id);
+  if (productId === null) notFound();
 
   const [product] = await db
     .select({
@@ -61,7 +63,7 @@ export default async function AdminProduct(
     })
     .from(products)
     .leftJoin(categories, eq(products.categoryId, categories.id))
-    .where(eq(products.id, Number(id)))
+    .where(eq(products.id, productId))
     .limit(1);
 
   if (!product) notFound();

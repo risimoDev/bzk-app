@@ -23,6 +23,7 @@ import {
 } from "./LeadControls";
 import { CompleteReminderButton } from "../ReminderControls";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Лид · Админка",
@@ -57,8 +58,8 @@ export default async function AdminLead({ params }: PageProps<"/admin/crm/[id]">
   }
 
   const { id } = await params;
-  const leadId = Number(id);
-  if (!Number.isInteger(leadId) || leadId <= 0) notFound();
+  const leadId = parseId(id);
+  if (leadId === null) notFound();
 
   const [lead] = await db
     .select({

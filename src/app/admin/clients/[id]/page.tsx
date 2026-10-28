@@ -12,6 +12,7 @@ import { currentUser } from "@/auth";
 import { setBlocked, setEditorAccess, setWarehouseAccess } from "../actions";
 import { ResetLinkButton } from "./ResetLinkButton";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Клиент · Админка",
@@ -42,12 +43,13 @@ export default async function AdminClient(
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const clientId = parseId(id);
+  if (clientId === null) notFound();
 
   const [client] = await db
     .select()
     .from(users)
-    .where(eq(users.id, Number(id)))
+    .where(eq(users.id, clientId))
     .limit(1);
 
   if (!client) notFound();

@@ -15,6 +15,7 @@ import { ProductImage } from "@/components/catalog/ProductImage";
 import { FavoriteButton } from "@/components/catalog/FavoriteButton";
 import { TapeLabel } from "@/components/ui/TapeLabel";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 /**
  * Заголовок и описание можно переопределить в админке: если для
@@ -82,7 +83,9 @@ async function getCategories() {
 export default async function CatalogPage(props: PageProps<"/catalog">) {
   const params = await props.searchParams;
   const raw = Array.isArray(params.category) ? params.category[0] : params.category;
-  const activeId = raw && /^\d+$/.test(raw) ? Number(raw) : undefined;
+  // Негодная категория - не ошибка, а просто весь каталог: адрес мог
+  // остаться от старого сайта или быть подобран руками
+  const activeId = parseId(raw) ?? undefined;
 
   const [items, cats] = await Promise.all([getCatalog(activeId), getCategories()]);
   const active = cats.find((c) => c.id === activeId);

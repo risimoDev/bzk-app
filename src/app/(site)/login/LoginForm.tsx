@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useActionState } from "react";
+import { startTransition, useActionState, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { TriangleAlert } from "lucide-react";
 import { Field } from "@/components/ui/Field";
@@ -18,12 +18,33 @@ export function LoginForm() {
     {},
   );
 
+  // Номер попытки - ключ виджета капчи. Токен Turnstile одноразовый: после
+  // неверного пароля старый уже потрачен, и все следующие попытки падали
+  // бы на капче, пока токен не протухнет. Новый ключ на каждую отправку
+  // пересоздаёт виджет, и к ответу сервера он уже решает новую капчу
+  const [attempt, setAttempt] = useState(0);
+
   // После смены пароля в кабинете сессии сбрасываются, и человек попадает
   // сюда. Скажем прямо, почему пришлось войти заново.
   const passwordChanged = params.get("reason") === "password-changed";
 
   return (
-    <form action={action} className="flex flex-col gap-5">
+    <form
+      action={action}
+      onSubmit={(e) => {
+        // React 19 после действия очищает неуправляемые поля формы. На
+        // втором шаге входа это стирало почту и пароль, и код уходил
+        // вместе с пустыми полями. Отправляем сами - без сброса. Атрибут
+        // action остаётся на случай, если скрипты не загрузились
+        e.preventDefault();
+        // Поля читаем до смены ключа: вместе со старым виджетом уйдёт
+        // и его скрытое поле с токеном
+        const data = new FormData(e.currentTarget);
+        setAttempt((n) => n + 1);
+        startTransition(() => action(data));
+      }}
+      className="flex flex-col gap-5"
+    >
       <input type="hidden" name="redirectTo" value={redirectTo} />
 
       {passwordChanged && !state.error && (
@@ -90,7 +111,14 @@ export function LoginForm() {
         </Field>
       )}
 
-      <Turnstile />
+      {/* С токеном второго шага капчу не показываем: сервер её на этом
+          шаге не спрашивает. Если токен истечёт, сервер вернёт форму на
+          первый шаг без него, и виджет появится заново со свежей капчей */}
+      {state.challenge ? (
+        <input type="hidden" name="loginChallenge" value={state.challenge} />
+      ) : (
+        <Turnstile key={attempt} />
+      )}
 
       <Button type="submit" size="lg" disabled={pending} className="mt-1">
         {pending ? "Проверяем…" : "Войти"}

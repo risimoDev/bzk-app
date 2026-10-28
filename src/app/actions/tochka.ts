@@ -11,6 +11,7 @@ import {
   sendInvoiceToEmail,
   TochkaError,
 } from "@/lib/tochka";
+import { tochkaStatusOf, isKnownTochkaStatus } from "@/lib/tochka-status";
 
 export type TochkaState = { ok: boolean; message?: string };
 
@@ -70,24 +71,33 @@ export async function syncPaymentStatuses(
   }
 
   let changed = 0;
+  let unknown = 0;
   const failures: string[] = [];
 
   for (const inv of waiting) {
     try {
       const r = await getInvoicePaymentStatus(inv.documentId);
-      const raw = (r.Data?.paymentStatus ?? r.Data?.status ?? "").toLowerCase();
+      const raw = r.Data?.paymentStatus ?? r.Data?.status ?? "";
 
-      // Названия статусов у банка свои; сводим к трём нашим
-      const status =
-        raw.includes("paid") || raw.includes("оплач")
-          ? "paid"
-          : raw.includes("expir") || raw.includes("истек")
-            ? "expired"
-            : null;
+      // Только точное совпадение со словарём: подстрока "paid" сидит и в
+      // "unpaid", и неоплаченный счёт становился оплаченным
+      const status = tochkaStatusOf(raw);
+
+      // Незнакомый статус не трогаем, но пишем в журнал: если банк
+      // переименует значения, сверка замолчит, и это надо заметить
+      if (!isKnownTochkaStatus(raw)) {
+        unknown++;
+        console.warn(
+          `[tochka] неизвестный статус оплаты счёта ${inv.documentId}: ${JSON.stringify(raw)}`,
+        );
+      }
 
       if (!status) continue;
 
-      const paidAt = r.Data?.paidAt ? new Date(r.Data.paidAt) : new Date();
+      // Кривая дата от банка не должна ронять запись статуса
+      const bankPaidAt = r.Data?.paidAt ? new Date(r.Data.paidAt) : null;
+      const paidAt =
+        bankPaidAt && !Number.isNaN(bankPaidAt.getTime()) ? bankPaidAt : new Date();
       await db
         .update(tochkaInvoices)
         .set({
@@ -107,12 +117,17 @@ export async function syncPaymentStatuses(
     return { ok: false, message: `Банк не ответил: ${failures[0]}` };
   }
 
+  const base =
+    changed === 0
+      ? `Проверено счетов: ${waiting.length}, изменений нет`
+      : `Обновлено счетов: ${changed} из ${waiting.length}`;
+
   return {
     ok: true,
     message:
-      changed === 0
-        ? `Проверено счетов: ${waiting.length}, изменений нет`
-        : `Обновлено счетов: ${changed} из ${waiting.length}`,
+      unknown > 0
+        ? `${base}. Статус банка не распознан у ${unknown} - подробности в журнале сервера`
+        : base,
   };
 }
 
