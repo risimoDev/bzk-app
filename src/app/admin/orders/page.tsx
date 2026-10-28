@@ -187,7 +187,7 @@ export default async function AdminOrders(props: PageProps<"/admin/orders">) {
                         >
                           {o.id}
                         </Link>
-                        {o.isNew && (
+                        {o.isNew && o.status !== "cancelled" && (
                           <span className="ml-2 rounded bg-brand/12 px-1.5 py-0.5 font-display text-[0.58rem] tracking-wider text-brand">
                             НОВЫЙ
                           </span>

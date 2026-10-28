@@ -46,7 +46,11 @@ const nextConfig: NextConfig = {
 
   // Адреса старого сайта. Список и объяснения - в src/lib/redirects.ts
   async redirects() {
-    return legacyRedirects;
+    // /client без раздела раньше вёл в 404: корень кабинета - обзор
+    return [
+      ...legacyRedirects,
+      { source: "/client", destination: "/client/dashboard", permanent: false },
+    ];
   },
 
   async rewrites() {

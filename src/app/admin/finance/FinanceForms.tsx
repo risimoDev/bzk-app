@@ -1,6 +1,7 @@
 "use client";
 
-import { useActionState, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useLatestActionState } from "@/components/admin/useLatestActionState";
 import { Check, Plus, Trash2, TriangleAlert, X } from "lucide-react";
 import { ConfirmButton } from "@/components/ui/ConfirmButton";
 import {
@@ -87,7 +88,7 @@ export function ExpenseForm({
   cardId: number;
   categories: CategoryOption[];
 }) {
-  const [state, action, pending] = useActionState(addExpense, initial);
+  const [state, action, pending] = useLatestActionState(addExpense, initial);
   const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
@@ -144,7 +145,7 @@ export function ExpenseForm({
 }
 
 export function PaymentForm({ cardId }: { cardId: number }) {
-  const [state, action, pending] = useActionState(addPayment, initial);
+  const [state, action, pending] = useLatestActionState(addPayment, initial);
   const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
@@ -190,7 +191,7 @@ export function PaymentForm({ cardId }: { cardId: number }) {
 }
 
 export function GeneralExpenseForm({ categories }: { categories: CategoryOption[] }) {
-  const [state, action, pending] = useActionState(addGeneralExpense, initial);
+  const [state, action, pending] = useLatestActionState(addGeneralExpense, initial);
   const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
@@ -275,7 +276,7 @@ export function DeleteRow({
 }) {
   const fn =
     kind === "expense" ? deleteExpense : kind === "payment" ? deletePayment : deleteGeneralExpense;
-  const [state, action, pending] = useActionState(fn, initial);
+  const [state, action, pending] = useLatestActionState(fn, initial);
 
   return (
     <form action={action} className="inline-flex items-center gap-2">

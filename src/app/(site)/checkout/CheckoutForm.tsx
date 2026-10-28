@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { startTransition, useActionState, useState } from "react";
 import { Check, Ticket, TriangleAlert } from "lucide-react";
 import {
   applyPromocode,
@@ -72,6 +72,16 @@ export function CheckoutForm({
       <form
         id="checkout"
         action={action}
+        onSubmit={(e) => {
+          // React 19 после действия очищает неуправляемые поля формы: после
+          // отказа сервера имя и телефон откатывались к профилю, а адрес и
+          // комментарий пустели. Отправляем сами - без сброса. Атрибут
+          // action остаётся на случай, если скрипты не загрузились.
+          // Скрытые поля (токен, срочность, промокод) читаются из формы так же
+          e.preventDefault();
+          const data = new FormData(e.currentTarget);
+          startTransition(() => action(data));
+        }}
         className="flex flex-col gap-5 rounded-card border border-ink/10 bg-bone/85 p-6 sm:p-8"
       >
         <input type="hidden" name="checkoutToken" value={checkoutToken} />

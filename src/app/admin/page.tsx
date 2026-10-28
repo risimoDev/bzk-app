@@ -104,7 +104,7 @@ export default async function AdminDashboard() {
         ? db
             .select({
               open: sql<number>`count(*) filter (where ${inArray(orders.status, [...SITE_OPEN])})::int`,
-              fresh: sql<number>`count(*) filter (where ${eq(orders.isNew, true)})::int`,
+              fresh: sql<number>`count(*) filter (where ${eq(orders.isNew, true)} and ${orders.status} <> 'cancelled')::int`,
             })
             .from(orders)
         : Promise.resolve([]),
@@ -417,7 +417,7 @@ export default async function AdminDashboard() {
                         <span className="min-w-0">
                           <span className="font-mono text-xs text-ink/45">№ {o.id} · </span>
                           <span className="text-sm text-ink">{o.clientName ?? "-"}</span>
-                          {o.isNew && (
+                          {o.isNew && o.status !== "cancelled" && (
                             <span className="ml-2 rounded bg-brand/12 px-1.5 py-0.5 font-display text-[0.55rem] tracking-wider text-brand">
                               НОВЫЙ
                             </span>

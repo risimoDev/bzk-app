@@ -105,10 +105,13 @@ export default async function CartPage() {
                                 </span>
                                 {o.value}
                                 {o.modifier !== 0 && (
-                                  <span className="ml-1 font-mono text-xs text-brand">
-                                    {o.modifier > 0 ? "+" : "−"}
-                                    {money.format(Math.abs(o.modifier))}
-                                  </span>
+                                  <>
+                                    {" "}
+                                    <span className="font-mono text-xs text-brand">
+                                      ({o.modifier > 0 ? "+" : "−"}
+                                      {money.format(Math.abs(o.modifier))})
+                                    </span>
+                                  </>
                                 )}
                               </li>
                             ))}

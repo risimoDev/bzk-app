@@ -19,6 +19,7 @@ import { statusOf } from "@/lib/order-status";
 import { can } from "@/lib/permissions";
 import { parseContact } from "@/lib/order-contact";
 import { toggleUrgent } from "../actions";
+import { formatOrderAttribute, parseOrderAttributes } from "@/lib/order-attributes";
 import { StatusForm } from "./StatusForm";
 import { readOrderMessages } from "@/lib/order-chat";
 import { OrderChat } from "./OrderChat";
@@ -235,10 +236,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
                 <tbody>
                   {items.map((it) => {
                     const name = it.productName ?? it.itemName ?? "Без названия";
-                    const attrs =
-                      it.attributes && typeof it.attributes === "object"
-                        ? Object.entries(it.attributes as Record<string, unknown>)
-                        : [];
+                    const attrs = parseOrderAttributes(it.attributes);
 
                     return (
                       <Fragment key={it.id}>
@@ -261,10 +259,8 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
                           )}
                           {attrs.length > 0 && (
                             <ul className="mt-1 flex flex-wrap gap-x-3 text-xs text-ink/50">
-                              {attrs.map(([k, v]) => (
-                                <li key={k}>
-                                  {k}: {String(v)}
-                                </li>
+                              {attrs.map((a, i) => (
+                                <li key={i}>{formatOrderAttribute(a)}</li>
                               ))}
                             </ul>
                           )}
@@ -481,7 +477,9 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
             </div>
           )}
 
-          {editable && (
+          {/* Отменённому и завершённому заказу срочность менять нельзя: у
+              первого нет работы, у второго итог уже закрыт. Сервер отказывает так же */}
+          {editable && order.status !== "cancelled" && order.status !== "completed" && (
             <form action={toggleUrgent}>
               <input type="hidden" name="orderId" value={order.id} />
               <input

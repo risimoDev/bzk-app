@@ -1,4 +1,4 @@
-import NextAuth, { CredentialsSignin } from "next-auth";
+import NextAuth, { AuthError, CredentialsSignin } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import { eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
@@ -74,6 +74,29 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   session: { strategy: "jwt", maxAge: 30 * 24 * 60 * 60 },
 
   pages: { signIn: "/login" },
+
+  logger: {
+    // Неверный пароль для Auth.js - ошибка, и по умолчанию она печатается
+    // со стеком на десяток строк: каждая опечатка клиента забивала лог.
+    // Это штатный отказ, а не поломка, - хватает одной строки. Прочие
+    // ошибки выводим так же, как делает Auth.js сам
+    error(error) {
+      if (error instanceof CredentialsSignin) {
+        console.error(`[auth] ${error.type}${error.code ? ` (${error.code})` : ""}: вход отклонён`);
+        return;
+      }
+      const name = error instanceof AuthError ? error.type : error.name;
+      console.error(`[auth][error] ${name}: ${error.message}`);
+      const cause = error.cause;
+      if (cause && typeof cause === "object" && "err" in cause && cause.err instanceof Error) {
+        const { err, ...data } = cause as { err: Error } & Record<string, unknown>;
+        console.error("[auth][cause]:", err.stack);
+        console.error("[auth][details]:", JSON.stringify(data, null, 2));
+      } else if (error.stack) {
+        console.error(error.stack.replace(/.*/, "").substring(1));
+      }
+    },
+  },
 
   providers: [
     Credentials({

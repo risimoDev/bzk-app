@@ -526,6 +526,22 @@ export async function applyPaidTochkaInvoice(tx: Tx, invoiceId: number) {
 
 /** Срочность заказа с сайта: надбавка меняет итог, а за ним доход и налог. */
 export async function setSiteOrderUrgent(tx: Tx, orderId: number, urgent: boolean) {
+  // Отменённому и завершённому заказу итог уже не пересчитывают: надбавка
+  // изменила бы деньги закрытого заказа
+  const [current] = await tx
+    .select({ status: orders.status })
+    .from(orders)
+    .where(eq(orders.id, orderId))
+    .for("no key update")
+    .limit(1);
+  if (current && (current.status === "cancelled" || current.status === "completed")) {
+    throw new MoneyRuleError(
+      current.status === "cancelled"
+        ? "Заказ отменён - срочность менять нельзя"
+        : "Заказ завершён - срочность менять нельзя",
+    );
+  }
+
   const updated = await tx
     .update(orders)
     .set({ isUrgent: urgent })

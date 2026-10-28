@@ -1,6 +1,7 @@
 "use client";
 
-import { startTransition, useActionState, useRef, useEffect } from "react";
+import { startTransition, useRef, useEffect } from "react";
+import { useLatestActionState } from "@/components/admin/useLatestActionState";
 import { Check, PackageMinus, TriangleAlert, Undo2 } from "lucide-react";
 import { ConfirmButton } from "@/components/ui/ConfirmButton";
 import { returnWriteOffToStock, writeOffMaterial, type WriteOffState } from "./actions";
@@ -32,7 +33,7 @@ export function WriteOffForm({
   orderId: number;
   materials: MaterialOption[];
 }) {
-  const [state, action, pending] = useActionState(writeOffMaterial, initial);
+  const [state, action, pending] = useLatestActionState(writeOffMaterial, initial);
   const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
@@ -121,7 +122,7 @@ export function ReturnWriteOffButton({
   orderId: number;
   movementId: number;
 }) {
-  const [state, action, pending] = useActionState(returnWriteOffToStock, initial);
+  const [state, action, pending] = useLatestActionState(returnWriteOffToStock, initial);
 
   return (
     <form action={action} className="inline-flex items-center gap-2">

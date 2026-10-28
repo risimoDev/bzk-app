@@ -1,6 +1,7 @@
 "use client";
 
-import { useActionState, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
+import { useLatestActionState } from "@/components/admin/useLatestActionState";
 import { Send } from "lucide-react";
 import { replyToOrderChat, type ChatState } from "../actions";
 import type { ChatMessage } from "@/lib/order-chat";
@@ -30,7 +31,7 @@ export function OrderChat({
   messages: ChatMessage[];
   canReply: boolean;
 }) {
-  const [state, action, pending] = useActionState(replyToOrderChat, initial);
+  const [state, action, pending] = useLatestActionState(replyToOrderChat, initial);
   const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {

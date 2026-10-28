@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState } from "react";
+import { useLatestActionState } from "@/components/admin/useLatestActionState";
 import { changeStatus, type StatusState } from "../actions";
 import { ORDER_STATUS, nextStatuses } from "@/lib/order-status";
 import { cn } from "@/lib/cn";
@@ -15,7 +15,7 @@ const initial: StatusState = {};
  * гасит производство и выводит заказ из выручки - об этом подсказка.
  */
 export function StatusForm({ orderId, status }: { orderId: number; status: string | null }) {
-  const [state, action, pending] = useActionState(changeStatus, initial);
+  const [state, action, pending] = useLatestActionState(changeStatus, initial);
   const options = nextStatuses(status);
 
   return (

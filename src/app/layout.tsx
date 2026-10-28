@@ -45,6 +45,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="ru"
+      data-scroll-behavior="smooth"
       className={`${oswald.variable} ${golos.variable} ${jetbrains.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col bg-bone text-ink">{children}</body>

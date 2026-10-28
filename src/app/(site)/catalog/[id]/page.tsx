@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { cache } from "react";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { eq, and, asc, desc } from "drizzle-orm";
@@ -40,7 +41,7 @@ const reviewDate = new Intl.DateTimeFormat("ru-RU", {
   year: "numeric",
 });
 
-async function getProduct(id: number) {
+const getProduct = cache(async (id: number) => {
   const [item] = await db
     .select({
       id: products.id,
@@ -122,7 +123,7 @@ async function getProduct(id: number) {
   const logo = images.find((i) => i.kind === "logo") ?? null;
 
   return { item, photos, logo, tiers, attributes };
-}
+});
 
 export async function generateMetadata(
   props: PageProps<"/catalog/[id]">,
@@ -132,6 +133,8 @@ export async function generateMetadata(
   // проходил проверку цифрами и ронял запрос переполнением
   const productId = parseId(id);
   const data = productId === null ? null : await getProduct(productId);
+  // Статус 404 для несуществующего товара отдаёт proxy.ts: отсюда и из
+  // страницы notFound() приходит уже после loading.tsx, когда ответ начат
   if (!data) return { title: "Товар не найден" };
 
   const description =

@@ -80,6 +80,7 @@ export async function buildTimeline(order: {
   const rows = await db
     .select({
       stageId: productionOrderStages.stageId,
+      orderStatus: productionOrders.status,
       name: productionStages.name,
       status: productionOrderStages.status,
       startedAt: productionOrderStages.startedAt,
@@ -94,13 +95,28 @@ export async function buildTimeline(order: {
     .where(eq(productionOrders.orderId, order.id))
     .orderBy(asc(productionOrderStages.sortOrder), asc(productionOrderStages.id));
 
-  const production: TimelineStep[] = rows.map((r) => ({
-    key: `prod-${r.stageId}`,
-    label: r.name,
-    done: r.status === "completed",
-    current: r.status === "in_progress",
-    date: r.completedAt ?? r.startedAt ?? null,
-  }));
+  const production: TimelineStep[] = rows.map((r) => {
+    // У отменённого заказа незаконченные этапы не идут: ни «в работе», ни
+    // дат начала. Пройденным остаётся только то, что реально закрыто и
+    // имеет дату закрытия - это уже случилось, и отмена этого не стирает
+    if (status === "cancelled" || r.orderStatus === "cancelled") {
+      const closed = r.status === "completed" && r.completedAt != null;
+      return {
+        key: `prod-${r.stageId}`,
+        label: r.name,
+        done: closed,
+        current: false,
+        date: closed ? r.completedAt : null,
+      };
+    }
+    return {
+      key: `prod-${r.stageId}`,
+      label: r.name,
+      done: r.status === "completed",
+      current: r.status === "in_progress",
+      date: r.completedAt ?? r.startedAt ?? null,
+    };
+  });
 
   return { steps, production, halted };
 }

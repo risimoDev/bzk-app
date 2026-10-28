@@ -108,7 +108,14 @@ export async function toggleUrgent(formData: FormData) {
   const urgent = formData.get("urgent") === "1";
   if (!Number.isInteger(id) || id <= 0) return;
 
-  const summary = await db.transaction((tx) => setSiteOrderUrgent(tx, id, urgent));
+  let summary: Awaited<ReturnType<typeof setSiteOrderUrgent>>;
+  try {
+    summary = await db.transaction((tx) => setSiteOrderUrgent(tx, id, urgent));
+  } catch (e) {
+    // Заказ закрыт - тихо ничего не меняем, кнопки для него и так нет
+    if (e instanceof MoneyRuleError) return;
+    throw e;
+  }
   if (!summary) return;
 
   await audit("order.urgent", { type: "order", id }, {
