@@ -29,6 +29,8 @@ import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
 import { paymentStateOf } from "@/lib/finance";
 import { debtOf } from "@/lib/order-money";
+import { ReturnWriteOffButton, WriteOffForm } from "@/app/admin/materials/WriteOffForm";
+import { activeMaterialOptions, listWriteOffs } from "@/lib/write-off-db";
 
 export const metadata: Metadata = {
   title: "Заказ · Админка",
@@ -136,6 +138,20 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
         .orderBy(asc(products.name))
     : [];
   const contact = parseContact(order.contactInfo);
+
+  // Материалы со склада: список списаний видит любой, кто смотрит склад,
+  // форму - кто его правит. Менеджерские заказы так делали давно, сайтовые
+  // - нет, и себестоимость по факту у них собрать было нельзя
+  const [canStockView, canStock] = await Promise.all([
+    can("materials", "view"),
+    can("materials", "edit"),
+  ]);
+  const [writeOffs, materialList] = canStockView
+    ? await Promise.all([
+        listWriteOffs(db, { source: "site", id: order.id }),
+        canStock ? activeMaterialOptions(db) : Promise.resolve([]),
+      ])
+    : [[], []];
 
   // Оплата - из бухгалтерской карточки: платежи вносит бухгалтерия, а
   // оплаченный счёт Точки попадает туда сам при сверке
@@ -522,6 +538,47 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
               )}
             </ul>
           </div>
+
+          {canStockView && (
+            <div className="rounded-xl border border-ink/10 bg-bone p-5">
+              <h2 className="font-display text-[0.62rem] tracking-[0.18em] text-ink/40">
+                МАТЕРИАЛЫ СО СКЛАДА
+              </h2>
+
+              {writeOffs.length > 0 && (
+                <ul className="mt-3 flex flex-col gap-1.5 border-b border-ink/10 pb-3 text-sm">
+                  {writeOffs.map((w) => (
+                    <li key={w.id} className="flex items-center justify-between gap-3">
+                      <span className={cn("text-ink/75", w.returned && "text-ink/40 line-through")}>
+                        {w.name}
+                      </span>
+                      <span className="flex items-center gap-2 whitespace-nowrap font-mono text-xs text-ink/50">
+                        {Number(w.quantity)} {w.unit}
+                        {w.amount && ` · ${Number(w.amount).toLocaleString("ru-RU")} ₽`}
+                        {w.returned ? (
+                          <span className="font-sans text-ok">возвращено</span>
+                        ) : (
+                          canStock && (
+                            <ReturnWriteOffButton
+                              source="site"
+                              orderId={order.id}
+                              movementId={w.id}
+                            />
+                          )
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {canStock && (
+                <div className="mt-3">
+                  <WriteOffForm source="site" orderId={order.id} materials={materialList} />
+                </div>
+              )}
+            </div>
+          )}
 
           {order.readyDate && (
             <div className="rounded-xl border border-ink/10 bg-bone p-5">

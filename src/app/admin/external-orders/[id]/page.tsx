@@ -2,11 +2,10 @@ import type { Metadata } from "next";
 import { Fragment } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { and, asc, desc, eq, sql } from "drizzle-orm";
+import { asc, desc, eq, sql } from "drizzle-orm";
 import {
   ArrowLeft,
   ExternalLink,
-  Factory,
   Mail,
   MapPin,
   Phone,
@@ -19,9 +18,6 @@ import {
   externalOrders,
   externalOrderItems,
   externalOrderReadyHistory,
-  materials,
-  materialsMovements,
-  materialsStock,
   products,
   suppliers,
   users,
@@ -46,8 +42,9 @@ import {
   ReadyDateForm,
 } from "./OrderControls";
 import { DeleteItemButton, ItemForm } from "./ItemForm";
-import { startProduction } from "@/app/admin/production/actions";
-import { WriteOffForm } from "./WriteOffForm";
+import { StartProductionForm } from "@/app/admin/production/ProductionForms";
+import { ReturnWriteOffButton, WriteOffForm } from "@/app/admin/materials/WriteOffForm";
+import { activeMaterialOptions, listWriteOffs } from "@/lib/write-off-db";
 import { PaymentForm } from "@/app/admin/finance/FinanceForms";
 import { debtOf, externalOrderTotal } from "@/lib/order-money";
 import { DocumentsToggle } from "@/app/admin/orders/DocumentsToggle";
@@ -218,38 +215,9 @@ export default async function AdminExternalOrder({
   const paidSum = Number(paidRow?.paid ?? 0);
 
   const [materialList, writeOffs] = await Promise.all([
-    canStock
-      ? db
-          .select({
-            id: materials.id,
-            name: materials.name,
-            unit: materials.unit,
-            quantity: materialsStock.quantity,
-          })
-          .from(materials)
-          .leftJoin(materialsStock, eq(materialsStock.materialId, materials.id))
-          .orderBy(asc(materials.name))
-      : Promise.resolve([]),
+    canStock ? activeMaterialOptions(db) : Promise.resolve([]),
     // Списания по этому заказу: движение помечено ссылкой на него
-    db
-      .select({
-        id: materialsMovements.id,
-        quantity: materialsMovements.quantity,
-        createdAt: materialsMovements.createdAt,
-        name: materials.name,
-        unit: materials.unit,
-        cost: materials.costPerUnit,
-      })
-      .from(materialsMovements)
-      .innerJoin(materials, eq(materials.id, materialsMovements.materialId))
-      .where(
-        and(
-          eq(materialsMovements.referenceType, "order"),
-          eq(materialsMovements.referenceId, orderId),
-          eq(materialsMovements.type, "out"),
-        ),
-      )
-      .orderBy(desc(materialsMovements.createdAt)),
+    listWriteOffs(db, { source: "external", id: orderId }),
   ]);
 
   const defects = production[0]
@@ -696,16 +664,7 @@ export default async function AdminExternalOrder({
               </Link>
             ) : (
               canStartProduction && (
-                <form action={startProduction} className="mt-3">
-                  <input type="hidden" name="externalOrderId" value={order.id} />
-                  <button
-                    type="submit"
-                    className="flex w-full items-center justify-center gap-2 rounded-lg bg-brand px-4 py-2 font-display text-xs tracking-wider text-bone hover:bg-brand-bright"
-                  >
-                    <Factory className="size-3.5" aria-hidden />
-                    ЗАПУСТИТЬ В ПРОИЗВОДСТВО
-                  </button>
-                </form>
+                <StartProductionForm field="externalOrderId" orderId={order.id} />
               )
             )}
           </div>
@@ -767,12 +726,22 @@ export default async function AdminExternalOrder({
               {writeOffs.length > 0 && (
                 <ul className="mt-3 flex flex-col gap-1.5 border-b border-ink/10 pb-3 text-sm">
                   {writeOffs.map((w) => (
-                    <li key={w.id} className="flex justify-between gap-3">
-                      <span className="text-ink/75">{w.name}</span>
-                      <span className="whitespace-nowrap font-mono text-xs text-ink/50">
+                    <li key={w.id} className="flex items-center justify-between gap-3">
+                      <span className={cn("text-ink/75", w.returned && "text-ink/40 line-through")}>
+                        {w.name}
+                      </span>
+                      <span className="flex items-center gap-2 whitespace-nowrap font-mono text-xs text-ink/50">
                         {Number(w.quantity)} {w.unit}
-                        {w.cost &&
-                          ` · ${money.format(Number(w.quantity) * Number(w.cost))}`}
+                        {w.amount && ` · ${money.format(Number(w.amount))}`}
+                        {w.returned ? (
+                          <span className="font-sans text-ok">возвращено</span>
+                        ) : (
+                          <ReturnWriteOffButton
+                            source="external"
+                            orderId={order.id}
+                            movementId={w.id}
+                          />
+                        )}
                       </span>
                     </li>
                   ))}
@@ -781,7 +750,8 @@ export default async function AdminExternalOrder({
 
               <div className="mt-3">
                 <WriteOffForm
-                  externalOrderId={order.id}
+                  source="external"
+                  orderId={order.id}
                   materials={materialList}
                 />
               </div>

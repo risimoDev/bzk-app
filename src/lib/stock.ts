@@ -1,16 +1,26 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { materials, materialsStock, materialsMovements, stockAlerts } from "@/db/schema";
 
-type Tx = Parameters<Parameters<typeof import("@/db").db.transaction>[0]>[0];
+import type { Tx } from "@/lib/order-money-db";
+
+/** Отказ склада по правилу (уход в минус, неверное количество) - текст показывается человеку. */
+export class StockError extends Error {}
 
 export type MovementInput = {
   materialId: number;
   type: "in" | "out";
   /** Количество строкой: numeric в Postgres точный */
   quantity: string;
-  referenceType: "order" | "manual";
+  /**
+   * order - заказ менеджера, site_order - заказ с сайта (номера двух
+   * таблиц пересекаются, по одному referenceId их не различить),
+   * purchase - приёмка закупки.
+   */
+  referenceType: "order" | "site_order" | "manual" | "purchase";
   referenceId?: number | null;
   comment?: string | null;
+  /** Это движение отменяет другое (возврат списания на склад) */
+  reversesMovementId?: number | null;
 };
 
 /**
@@ -24,24 +34,23 @@ export type MovementInput = {
  * строки остатка и на то, что при ошибке откатится всё разом.
  */
 export async function applyMovement(tx: Tx, input: MovementInput) {
-  const { materialId, type, quantity, referenceType, referenceId, comment } = input;
+  const { materialId, type, quantity, referenceType, referenceId, comment, reversesMovementId } = input;
   const amount = Number(quantity);
 
   if (!Number.isFinite(amount) || amount <= 0) {
-    throw new Error("Количество должно быть больше нуля");
+    throw new StockError("Количество должно быть больше нуля");
   }
 
   const [material] = await tx
     .select({
       name: materials.name,
       unit: materials.unit,
-      minStock: materials.minStock,
     })
     .from(materials)
     .where(eq(materials.id, materialId))
     .limit(1);
 
-  if (!material) throw new Error("Материал не найден");
+  if (!material) throw new StockError("Материал не найден");
 
   // Строки остатка может не быть - материал заводили без прихода
   await tx
@@ -62,7 +71,7 @@ export async function applyMovement(tx: Tx, input: MovementInput) {
   const next = type === "in" ? have + amount : have - amount;
 
   if (next < 0) {
-    throw new Error(
+    throw new StockError(
       `Нельзя списать ${amount} ${material.unit}: на складе ${have}`,
     );
   }
@@ -72,43 +81,81 @@ export async function applyMovement(tx: Tx, input: MovementInput) {
     .set({ quantity: next.toFixed(2) })
     .where(eq(materialsStock.materialId, materialId));
 
-  await tx.insert(materialsMovements).values({
-    materialId,
-    type,
-    quantity,
-    referenceType,
-    referenceId: referenceId ?? null,
-    comment: comment ?? null,
-  });
+  const [movement] = await tx
+    .insert(materialsMovements)
+    .values({
+      materialId,
+      type,
+      quantity,
+      referenceType,
+      referenceId: referenceId ?? null,
+      comment: comment ?? null,
+      reversesMovementId: reversesMovementId ?? null,
+    })
+    .returning({ id: materialsMovements.id });
 
+  await syncStockAlerts(tx, materialId);
+
+  return { previous: have, current: next, movementId: movement.id };
+}
+
+/**
+ * Оповещения о нехватке материала приводятся к фактическому остатку.
+ *
+ * Звать после любого изменения остатка и после правки минимума или
+ * активности материала: раньше оповещение пересчитывалось только при
+ * движении, и поднятый минимум не вызывал тревоги, а сброшенный не гасил
+ * уже открытую. Материал без минимума или выключенный оповещений не
+ * даёт - открытые гасятся.
+ */
+export async function syncStockAlerts(tx: Tx, materialId: number) {
+  const [material] = await tx
+    .select({
+      name: materials.name,
+      unit: materials.unit,
+      minStock: materials.minStock,
+      isActive: materials.isActive,
+    })
+    .from(materials)
+    .where(eq(materials.id, materialId))
+    .limit(1);
+  if (!material) return;
+
+  const [stock] = await tx
+    .select({ quantity: materialsStock.quantity })
+    .from(materialsStock)
+    .where(eq(materialsStock.materialId, materialId))
+    .limit(1);
+
+  const have = Number(stock?.quantity ?? 0);
   const min = Number(material.minStock ?? 0);
+  const needAlert = material.isActive !== false && min > 0 && have < min;
 
-  if (min > 0 && next < min) {
-    const [open] = await tx
-      .select({ id: stockAlerts.id })
-      .from(stockAlerts)
-      .where(
-        sql`${stockAlerts.materialId} = ${materialId} AND ${stockAlerts.isResolved} = false`,
-      )
-      .limit(1);
+  const [open] = await tx
+    .select({ id: stockAlerts.id })
+    .from(stockAlerts)
+    .where(and(eq(stockAlerts.materialId, materialId), eq(stockAlerts.isResolved, false)))
+    .limit(1);
 
-    if (!open) {
-      await tx.insert(stockAlerts).values({
-        materialId,
-        alertType: next <= 0 ? "out_of_stock" : "low_stock",
-        message: `${material.name}: остаток ${next.toFixed(2)} ${material.unit} при минимуме ${min}`,
-      });
+  if (!needAlert) {
+    if (open) {
+      await tx
+        .update(stockAlerts)
+        .set({ isResolved: true, resolvedAt: new Date() })
+        .where(and(eq(stockAlerts.materialId, materialId), eq(stockAlerts.isResolved, false)));
     }
+    return;
   }
 
-  if (min > 0 && next >= min) {
-    await tx
-      .update(stockAlerts)
-      .set({ isResolved: true, resolvedAt: new Date() })
-      .where(
-        sql`${stockAlerts.materialId} = ${materialId} AND ${stockAlerts.isResolved} = false`,
-      );
-  }
+  const values = {
+    alertType: have <= 0 ? ("out_of_stock" as const) : ("low_stock" as const),
+    message: `${material.name}: остаток ${have.toFixed(2)} ${material.unit} при минимуме ${min}`,
+  };
 
-  return { previous: have, current: next };
+  if (open) {
+    // Открытое оповещение освежаем: остаток и минимум могли измениться
+    await tx.update(stockAlerts).set(values).where(eq(stockAlerts.id, open.id));
+  } else {
+    await tx.insert(stockAlerts).values({ materialId, ...values });
+  }
 }

@@ -66,7 +66,13 @@ const ACTION_LABEL: Record<string, string> = {
   "material.create": "Заведён материал",
   "material.update": "Изменён материал",
   "material.write_off": "Списан материал",
+  "material.write_off_return": "Списание возвращено на склад",
   "purchase.create": "Оформлена закупка",
+  "purchase.receive": "Принята позиция закупки",
+  "purchase.payment_add": "Отмечена оплата закупки",
+  "purchase.payment_cancel": "Отменена оплата закупки",
+  "quality.inspection": "Проведена проверка качества",
+  "quality.defect": "Зарегистрирован дефект",
   "offer.create": "Создано КП",
   "offer.status": "Сменён статус КП",
   "offer.to_order": "КП превращено в заказ",
@@ -115,6 +121,8 @@ const ENTITY: Record<string, { label: string; href?: (id: number) => string }> =
   document_category: { label: "Раздел документов" },
   general_expense: { label: "Общий расход" },
   review: { label: "Отзыв" },
+  qc_inspection: { label: "Проверка качества", href: (id) => `/admin/quality/inspections/${id}` },
+  qc_defect: { label: "Дефект" },
 };
 
 function one(value: string | string[] | undefined) {

@@ -29,6 +29,7 @@ export const EXTERNAL_PRODUCTION_STATUS = {
   pending: { label: "Новый", className: "bg-ink/10 text-ink/70" },
   processing: { label: "В обработке", className: "bg-navy/12 text-navy" },
   in_work: { label: "В работе", className: "bg-warn/15 text-warn" },
+  ready: { label: "Готов к выдаче", className: "bg-ok/12 text-ok" },
   delayed: { label: "Отложен", className: "bg-warn/15 text-warn" },
   shipped: { label: "Отправлен", className: "bg-brand/15 text-brand" },
   delivered: { label: "Доставлен", className: "bg-brand/15 text-brand" },

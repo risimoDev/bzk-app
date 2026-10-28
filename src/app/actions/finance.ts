@@ -12,7 +12,14 @@ import {
 } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
-import { addOrderPayment, recalcCard, type MoneySummary } from "@/lib/order-money-db";
+import { PurchaseRuleError, deleteGeneralExpenseRow } from "@/lib/purchases-db";
+import {
+  MoneyRuleError,
+  addOrderPayment,
+  deleteExpenseRow,
+  recalcCard,
+  type MoneySummary,
+} from "@/lib/order-money-db";
 
 export type FinanceState = {
   ok?: boolean;
@@ -138,22 +145,14 @@ export async function deleteExpense(
     return { error: "Расход не найден" };
   }
 
-  const result = await db.transaction(async (tx) => {
-    const removed = await tx
-      .delete(orderExpenses)
-      .where(
-        and(
-          eq(orderExpenses.id, expenseId),
-          // Номер приходит из формы: без привязки к карточке можно было бы
-          // удалить чужую строку
-          eq(orderExpenses.orderAccountingId, cardId),
-        ),
-      )
-      .returning({ id: orderExpenses.id, amount: orderExpenses.amount });
-    if (removed.length === 0) return null;
-    return { amount: removed[0].amount, summary: await recalcCard(tx, cardId) };
-  });
-
+  let result: Awaited<ReturnType<typeof deleteExpenseRow>>;
+  try {
+    result = await db.transaction((tx) => deleteExpenseRow(tx, cardId, expenseId));
+  } catch (e) {
+    // Списание материала удалять нельзя - только вернуть на склад
+    if (e instanceof MoneyRuleError) return { error: e.message };
+    throw e;
+  }
   if (!result) return { error: "Расход не найден" };
 
   await audit("finance.expense_delete", { type: "orders_accounting", id: cardId }, {
@@ -303,11 +302,14 @@ export async function deleteGeneralExpense(
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id) || id <= 0) return { error: "Расход не найден" };
 
-  const removed = await db
-    .delete(generalExpenses)
-    .where(eq(generalExpenses.id, id))
-    .returning({ id: generalExpenses.id });
-  if (removed.length === 0) return { error: "Расход не найден" };
+  let removed: Awaited<ReturnType<typeof deleteGeneralExpenseRow>>;
+  try {
+    removed = await db.transaction((tx) => deleteGeneralExpenseRow(tx, id));
+  } catch (e) {
+    if (e instanceof PurchaseRuleError) return { error: e.message };
+    throw e;
+  }
+  if (!removed) return { error: "Расход не найден" };
 
   await audit("finance.general_expense_delete", { type: "general_expense", id });
   revalidatePath("/admin/finance");

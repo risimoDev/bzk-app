@@ -16,7 +16,7 @@ import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { notifyOrderMessage, notifyOrderStatus, notifyUser } from "@/lib/notify";
-import { ORDER_STATUS, isOrderStatus } from "@/lib/order-status";
+import { ORDER_STATUS, isOrderStatus, statusNote } from "@/lib/order-status";
 import {
   MoneyRuleError,
   changeOrderStatus,
@@ -87,6 +87,7 @@ export async function changeStatus(
       userId: order.userId,
       orderId: id,
       statusLabel: ORDER_STATUS[status].label,
+      note: statusNote(status),
     });
   }
 

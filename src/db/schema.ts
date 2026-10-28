@@ -10,6 +10,7 @@
 import {
   boolean,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -43,7 +44,7 @@ export const documentsStatusEnum = pgEnum("documents_status", ["draft", "pending
 export const documentsDocTypeEnum = pgEnum("documents_doc_type", ["incoming", "internal", "outgoing", "accounting"]);
 export const export1cLogExportTypeEnum = pgEnum("export_1c_log_export_type", ["orders", "products", "clients", "payments"]);
 export const externalOrdersStatusEnum = pgEnum("external_orders_status", ["unpaid", "partial", "paid"]);
-export const externalOrdersProductionStatusEnum = pgEnum("external_orders_production_status", ["pending", "processing", "in_work", "delayed", "shipped", "delivered", "cancelled", "completed"]);
+export const externalOrdersProductionStatusEnum = pgEnum("external_orders_production_status", ["pending", "processing", "in_work", "ready", "delayed", "shipped", "delivered", "cancelled", "completed"]);
 export const externalOrderReadyHistoryChangeTypeEnum = pgEnum("external_order_ready_history_change_type", ["set", "prolong", "edit"]);
 export const massMessagesMessageTypeEnum = pgEnum("mass_messages_message_type", ["email", "telegram", "both"]);
 export const massMessagesTargetAudienceEnum = pgEnum("mass_messages_target_audience", ["all", "customers", "admins", "managers", "specific"]);
@@ -54,7 +55,7 @@ export const materialsCategoryEnum = pgEnum("materials_category", ["paper", "vin
 export const materialsMaterialTypeEnum = pgEnum("materials_material_type", ["sheet", "roll", "piece", "liquid"]);
 export const materialsBatchesStatusEnum = pgEnum("materials_batches_status", ["active", "depleted", "expired", "returned"]);
 export const materialsMovementsTypeEnum = pgEnum("materials_movements_type", ["in", "out"]);
-export const materialsMovementsReferenceTypeEnum = pgEnum("materials_movements_reference_type", ["order", "manual"]);
+export const materialsMovementsReferenceTypeEnum = pgEnum("materials_movements_reference_type", ["order", "manual", "purchase", "site_order"]);
 export const miniWarehouseItemsStatusEnum = pgEnum("mini_warehouse_items_status", ["in_stock", "in_production", "shipped", "returned"]);
 export const notificationsTypeEnum = pgEnum("notifications_type", ["info", "success", "warning", "error"]);
 export const notificationsTargetAudienceEnum = pgEnum("notifications_target_audience", ["all", "clients", "admins", "managers"]);
@@ -63,7 +64,7 @@ export const notificationLogChannelEnum = pgEnum("notification_log_channel", ["e
 export const notificationLogStatusEnum = pgEnum("notification_log_status", ["sent", "failed", "queued"]);
 export const notificationPrefsPrefChannelEnum = pgEnum("notification_prefs_pref_channel", ["telegram", "email", "both"]);
 export const notificationSubscriptionsChannelEnum = pgEnum("notification_subscriptions_channel", ["email", "telegram", "flash"]);
-export const ordersStatusEnum = pgEnum("orders_status", ["pending", "processing", "in_work", "delayed", "shipped", "delivered", "cancelled", "completed"]);
+export const ordersStatusEnum = pgEnum("orders_status", ["pending", "processing", "in_work", "ready", "delayed", "shipped", "delivered", "cancelled", "completed"]);
 export const ordersAccountingSourceEnum = pgEnum("orders_accounting_source", ["site", "external"]);
 export const ordersAccountingStatusEnum = pgEnum("orders_accounting_status", ["unpaid", "partial", "paid"]);
 export const ordersAccountingOldSourceEnum = pgEnum("orders_accounting_old_source", ["site", "external"]);
@@ -846,10 +847,18 @@ export const generalExpenses = pgTable("general_expenses", {
   categoryId: integer("category_id"),
   amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
   description: text("description"),
+  /**
+   * Оплата закупки: расход заведён отметкой «Оплачено» на закупке. По этим
+   * строкам считается purchase_orders.paid_amount, поэтому такой расход
+   * нельзя удалить из бухгалтерии отдельно - только отменой оплаты.
+   * set null: удалённая закупка не должна утащить за собой расход.
+   */
+  purchaseOrderId: integer("purchase_order_id").references(() => purchaseOrders.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   expenseDate: timestamp("expense_date", { mode: "date" }).defaultNow().notNull(),
 }, (t) => [
   index("general_expenses_category_id").on(t.categoryId),
+  index("general_expenses_purchase_order_id").on(t.purchaseOrderId),
 ]);
 
 export const massMessages = pgTable("mass_messages", {
@@ -948,9 +957,23 @@ export const materialsMovements = pgTable("materials_movements", {
   referenceType: materialsMovementsReferenceTypeEnum("reference_type").notNull(),
   referenceId: integer("reference_id"),
   comment: text("comment"),
+  /**
+   * Приход, которым отменено списание: ссылка на отменяемое движение.
+   * Уникальный индекс - одно списание вернуть на склад дважды нельзя,
+   * даже если нажали «Вернуть» в двух вкладках.
+   */
+  reversesMovementId: integer("reverses_movement_id"),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
 }, (t) => [
   index("materials_movements_material_id").on(t.materialId),
+  uniqueIndex("materials_movements_reverses_unique").on(t.reversesMovementId),
+  // Имя задано явно: сгенерированное длиннее 63 знаков, Postgres его обрезает
+  // и push потом вечно предлагает пересоздать ключ (HANDOFF, п. 12)
+  foreignKey({
+    columns: [t.reversesMovementId],
+    foreignColumns: [t.id],
+    name: "materials_movements_reverses_fk",
+  }).onDelete("set null"),
 ]);
 
 export const materialsStock = pgTable("materials_stock", {
@@ -1171,12 +1194,18 @@ export const orderExpenses = pgTable("order_expenses", {
    * дважды: по рецептуре и по факту.
    */
   isWriteOff: boolean("is_write_off").default(false).notNull(),
+  /**
+   * Движение склада, которым материал списан. По нему «вернуть на склад»
+   * знает материал и количество, не гадая по названию.
+   */
+  materialMovementId: integer("material_movement_id").references(() => materialsMovements.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   expenseDate: timestamp("expense_date", { mode: "date" }).defaultNow().notNull(),
 }, (t) => [
   index("order_expenses_ibfk_2").on(t.categoryId),
   index("order_expenses_fk_order_expenses_accounting").on(t.orderAccountingId),
   index("order_expenses_idx_order_item_id").on(t.orderItemId),
+  index("order_expenses_material_movement_id").on(t.materialMovementId),
 ]);
 
 export const orderPayments = pgTable("order_payments", {

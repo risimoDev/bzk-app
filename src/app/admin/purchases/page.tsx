@@ -1,14 +1,15 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { desc, eq, count, sql, asc } from "drizzle-orm";
+import { desc, eq, count, sql, asc, inArray } from "drizzle-orm";
 import { Truck, Phone, Mail, Plus } from "lucide-react";
 import { db } from "@/db";
-import { purchaseOrders, purchaseOrderItems, suppliers, materials } from "@/db/schema";
+import { purchaseOrders, purchaseOrderItems, suppliers, materials, generalExpenses } from "@/db/schema";
 import { AdminPage, AdminStat, AdminEmpty } from "@/components/admin/AdminPage";
 import { AdminPager, offsetOf, pageFrom } from "@/components/admin/AdminPager";
 import { can } from "@/lib/permissions";
 import { purchaseStatusOf, paymentStatusOf, RECEIVABLE, type PurchaseStatus } from "@/lib/purchases";
 import { ReceiveForm } from "./ReceiveForm";
+import { CancelPaymentButton, PurchasePaymentForm } from "./PaymentForm";
 import { parseLocalDate } from "@/lib/dates";
 import { cn } from "@/lib/cn";
 
@@ -52,6 +53,7 @@ export default async function AdminPurchases({ searchParams }: PageProps<"/admin
         status: purchaseOrders.status,
         paymentStatus: purchaseOrders.paymentStatus,
         total: purchaseOrders.totalAmount,
+        paid: purchaseOrders.paidAmount,
         expected: purchaseOrders.expectedDeliveryDate,
         createdAt: purchaseOrders.createdAt,
         supplierName: suppliers.name,
@@ -96,6 +98,26 @@ export default async function AdminPurchases({ searchParams }: PageProps<"/admin
     : [];
 
   const canCreate = await can("materials", "create");
+
+  // Оплату отмечает тот, кто ведёт расходы: она же записывается в
+  // бухгалтерию (см. markPurchasePaid)
+  const [canPay, canUnpay] = await Promise.all([
+    editable ? can("finance", "create") : Promise.resolve(false),
+    editable ? can("finance", "delete") : Promise.resolve(false),
+  ]);
+
+  const payments = orders.length
+    ? await db
+        .select({
+          id: generalExpenses.id,
+          purchaseOrderId: generalExpenses.purchaseOrderId,
+          amount: generalExpenses.amount,
+          date: generalExpenses.expenseDate,
+        })
+        .from(generalExpenses)
+        .where(inArray(generalExpenses.purchaseOrderId, orders.map((o) => o.id)))
+        .orderBy(asc(generalExpenses.expenseDate), asc(generalExpenses.id))
+    : [];
 
   return (
     <AdminPage
@@ -142,6 +164,9 @@ export default async function AdminPurchases({ searchParams }: PageProps<"/admin
             const receivable =
               editable && RECEIVABLE.includes((o.status ?? "draft") as PurchaseStatus);
             const expected = parseLocalDate(o.expected);
+            const ownPayments = payments.filter((p) => p.purchaseOrderId === o.id);
+            const total = Number(o.total ?? 0);
+            const remaining = Math.max(0, Math.round((total - Number(o.paid ?? 0)) * 100) / 100);
 
             return (
               <li
@@ -161,6 +186,8 @@ export default async function AdminPurchases({ searchParams }: PageProps<"/admin
                     </span>
                     <span className={cn("text-xs", pay.className)}>
                       {pay.label}
+                      {o.paymentStatus === "partial" &&
+                        ` · ${money.format(Number(o.paid ?? 0))} из ${money.format(total)}`}
                     </span>
                   </div>
 
@@ -224,6 +251,29 @@ export default async function AdminPurchases({ searchParams }: PageProps<"/admin
                       })}
                     </tbody>
                   </table>
+                )}
+
+                {(ownPayments.length > 0 || (canPay && o.status !== "cancelled" && remaining > 0)) && (
+                  <div className="flex flex-col gap-3 border-t border-ink/10 px-5 py-3">
+                    {ownPayments.length > 0 && (
+                      <ul className="flex flex-col gap-1 text-xs text-ink/65">
+                        {ownPayments.map((p) => (
+                          <li key={p.id} className="flex items-center justify-between gap-3">
+                            <span>
+                              Оплата от {dt.format(p.date)}
+                            </span>
+                            <span className="flex items-center gap-2 font-mono tabular-nums">
+                              {money.format(Number(p.amount))}
+                              {canUnpay && <CancelPaymentButton expenseId={p.id} />}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {canPay && o.status !== "cancelled" && remaining > 0 && (
+                      <PurchasePaymentForm purchaseOrderId={o.id} remaining={remaining} />
+                    )}
+                  </div>
                 )}
               </li>
             );

@@ -21,6 +21,15 @@
  *     чтобы после перехода на «итог = позиции + корректировка» ни один
  *     итог не поменялся.
  *  2. Строки «Списано со склада: …» получают признак списания.
+ *  2a. Приходы по приёмке закупок («Приёмка по закупке …») получают тип
+ *     движения «purchase»: раньше их писали как «по заказу», и номер
+ *     закупки путался с номером заказа менеджера.
+ *  2b. Строки списания связываются с движением склада, которым
+ *     материал списан (order_expenses.material_movement_id): по связи
+ *     работает «Вернуть на склад». Сопоставление - заказ, количество и
+ *     время создания (старое списание писало движение и расход одной
+ *     транзакцией, now() у обоих одинаков; название материала не годится -
+ *     его переименовывают), самое раннее ещё не связанное движение.
  *  3. Оплаченные счета Точки, привязанные к заказу, становятся платежами
  *     (если ещё не стали). Раньше переноса - иначе заказ получил бы и
  *     платёж-перенос на всю сумму, и платёж по счёту.
@@ -162,6 +171,45 @@ try {
         and description like 'Списано со склада:%'
       returning id
     `);
+
+    // 2a. Приёмки закупок: тип движения «закупка» вместо «заказ»
+    const purchaseMoves = await tx.execute(sql`
+      update materials_movements set reference_type = 'purchase'
+      where reference_type = 'order' and type = 'in'
+        and comment like 'Приёмка по закупке%'
+      returning id
+    `);
+
+    // 2b. Связь строки списания с движением склада. Дальше всё идёт по
+    // связи; без неё «вернуть на склад» гадало бы по названию
+    const { rows: unlinked } = await tx.execute(sql`
+      select e.id, e.created_at::text as created_at, e.quantity::text as quantity, a.external_order_id
+      from order_expenses e
+      join orders_accounting a on a.id = e.order_accounting_id
+      where e.is_write_off and e.material_movement_id is null
+        and e.material_name is not null and e.quantity is not null
+        and a.external_order_id is not null
+      order by e.id
+    `);
+    let linkedWriteOffs = 0;
+    for (const e of unlinked) {
+      const { rows } = await tx.execute(sql`
+        select m.id
+        from materials_movements m
+        where m.type = 'out' and m.reference_type = 'order'
+          and m.reference_id = ${e.external_order_id}
+          and m.created_at = ${e.created_at}::timestamptz
+          and m.quantity = ${e.quantity}::numeric
+          and not exists (select 1 from order_expenses x where x.material_movement_id = m.id)
+        order by m.id
+        limit 1
+      `);
+      if (rows.length === 0) continue;
+      await tx.execute(sql`
+        update order_expenses set material_movement_id = ${rows[0].id} where id = ${e.id}
+      `);
+      linkedWriteOffs++;
+    }
 
     // 3. Оплаченные счета Точки без платежа - раньше переноса
     const invoices = await tx.execute(sql`
@@ -338,6 +386,8 @@ try {
     log(`Корректировок заказов менеджера записано: ${adj.rows.length}`);
     for (const r of adj.rows) log(`  заказ м${r.id}: ${money(r.adj)}`);
     log(`Строк списания помечено: ${wo.rows.length}`);
+    log(`Приходов по закупкам переведено в тип «закупка»: ${purchaseMoves.rows.length}`);
+    log(`Строк списания связано с движениями склада: ${linkedWriteOffs} из ${unlinked.length}`);
     log(`Платежей по оплаченным счетам Точки: ${tochka}`);
     const legacySum = legacy.reduce((s, r) => s + r.rest, 0);
     log(`Платежей-переносов «оплачен без платежа»: ${legacy.length} на ${money(legacySum)}`);

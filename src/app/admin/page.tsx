@@ -38,7 +38,7 @@ const dt = new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit" }
 const today = new Intl.DateTimeFormat("ru-RU", { weekday: "long", day: "numeric", month: "long" });
 
 /** Статусы заказа с сайта, при которых он ещё в работе. */
-const SITE_OPEN = ["pending", "processing", "in_work", "delayed", "shipped"] as const;
+const SITE_OPEN = ["pending", "processing", "in_work", "ready", "delayed", "shipped"] as const;
 
 /** Закрытые заказы менеджера - те же, что считает isExternalClosed. */
 const EXTERNAL_CLOSED = ["completed", "cancelled"] as const;

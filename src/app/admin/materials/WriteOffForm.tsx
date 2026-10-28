@@ -1,8 +1,9 @@
 "use client";
 
-import { useActionState, useRef, useEffect } from "react";
-import { Check, PackageMinus, TriangleAlert } from "lucide-react";
-import { writeOffMaterial, type WriteOffState } from "@/app/admin/materials/actions";
+import { startTransition, useActionState, useRef, useEffect } from "react";
+import { Check, PackageMinus, TriangleAlert, Undo2 } from "lucide-react";
+import { ConfirmButton } from "@/components/ui/ConfirmButton";
+import { returnWriteOffToStock, writeOffMaterial, type WriteOffState } from "./actions";
 import { cn } from "@/lib/cn";
 import { adminInputClass, adminLabelClass } from "@/components/ui/form-classes";
 
@@ -16,17 +17,19 @@ export type MaterialOption = {
 };
 
 /**
- * Списание материала на заказ.
+ * Списание материала на заказ - менеджера или с сайта.
  *
  * Рядом с каждым материалом показан остаток: списывать вслепую то, чего
  * на складе нет, - верный способ увести остаток в минус (сервер этого
  * не даст, но узнать об этом лучше до нажатия).
  */
 export function WriteOffForm({
-  externalOrderId,
+  source,
+  orderId,
   materials,
 }: {
-  externalOrderId: number;
+  source: "site" | "external";
+  orderId: number;
   materials: MaterialOption[];
 }) {
   const [state, action, pending] = useActionState(writeOffMaterial, initial);
@@ -37,8 +40,22 @@ export function WriteOffForm({
   }, [state]);
 
   return (
-    <form ref={formRef} action={action} className="flex flex-col gap-3">
-      <input type="hidden" name="externalOrderId" value={externalOrderId} />
+    <form
+      ref={formRef}
+      action={action}
+      onSubmit={(e) => {
+        // React 19 после действия очищает поля формы, в том числе при
+        // ошибке, и введённое терялось. Отправляем сами - без сброса;
+        // после успеха поля чистит эффект ниже. Атрибут action остаётся на
+        // случай, если скрипты не загрузились
+        e.preventDefault();
+        const data = new FormData(e.currentTarget);
+        startTransition(() => action(data));
+      }}
+      className="flex flex-col gap-3"
+    >
+      <input type="hidden" name="source" value={source} />
+      <input type="hidden" name="orderId" value={orderId} />
 
       <label className="flex flex-col gap-1.5">
         <span className={labelClass}>МАТЕРИАЛ</span>
@@ -93,3 +110,37 @@ export function WriteOffForm({
 
 const labelClass = adminLabelClass;
 const inputClass = adminInputClass;
+
+/** «Вернуть на склад» для строки списания. */
+export function ReturnWriteOffButton({
+  source,
+  orderId,
+  movementId,
+}: {
+  source: "site" | "external";
+  orderId: number;
+  movementId: number;
+}) {
+  const [state, action, pending] = useActionState(returnWriteOffToStock, initial);
+
+  return (
+    <form action={action} className="inline-flex items-center gap-2">
+      <input type="hidden" name="source" value={source} />
+      <input type="hidden" name="orderId" value={orderId} />
+      <input type="hidden" name="movementId" value={movementId} />
+      <ConfirmButton
+        title="Вернуть материал на склад?"
+        text="Остаток материала вырастет, а строка расхода по этому списанию пропадёт из бухгалтерии заказа."
+        confirmLabel="Вернуть на склад"
+        disabled={pending}
+        ariaLabel="Вернуть на склад"
+        hint="Вернуть на склад"
+        className="flex items-center gap-1 rounded p-1 text-xs text-ink/40 hover:bg-brand/10 hover:text-brand disabled:opacity-50"
+      >
+        <Undo2 className="size-3.5" aria-hidden />
+        <span>вернуть</span>
+      </ConfirmButton>
+      {state.error && <span className="text-xs text-danger">{state.error}</span>}
+    </form>
+  );
+}

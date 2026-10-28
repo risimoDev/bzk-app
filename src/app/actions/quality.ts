@@ -15,6 +15,8 @@ import {
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { saveQcPhoto, removeUpload } from "@/lib/uploads";
+import { QualityRuleError, checkDefectRefs, handleFailedInspection } from "@/lib/quality-db";
+import { audit } from "@/lib/audit";
 import {
   overallResult,
   isDefectClosed,
@@ -115,6 +117,9 @@ export async function createInspection(
 
   const result = overallResult(marks);
 
+  // Брак: пауза в цехе и задача - в той же транзакции, что и сама
+  // проверка. Иначе при сбое проверка записалась бы, а заказ пошёл дальше
+  let paused = false;
   const inspectionId = await db.transaction(async (tx) => {
     const [inspection] = await tx
       .insert(qcInspections)
@@ -137,11 +142,30 @@ export async function createInspection(
       })),
     );
 
+    if (result === "failed") {
+      const handled = await handleFailedInspection(tx, {
+        productionOrderId,
+        inspectionId: inspection.id,
+        inspectorId: Number(user.id),
+      });
+      paused = handled.paused;
+    }
+
     return inspection.id;
+  });
+
+  await audit("quality.inspection", { type: "qc_inspection", id: inspectionId }, {
+    productionOrderId,
+    result,
+    paused,
   });
 
   revalidatePath("/admin/quality");
   revalidatePath(`/admin/quality/inspections/${inspectionId}`);
+  if (result === "failed") {
+    revalidatePath("/admin/production");
+    revalidatePath("/admin/tasks");
+  }
 
   const failed = marks.filter((m) => m.status === "fail").length;
   return {
@@ -149,7 +173,9 @@ export async function createInspection(
     message:
       result === "passed"
         ? "Проверка пройдена"
-        : `Отмечено несоответствий: ${failed}. Итог - «${result === "failed" ? "брак" : "с замечаниями"}»`,
+        : result === "failed"
+          ? `Отмечено несоответствий: ${failed}. Итог - «брак»${paused ? ": производство приостановлено" : ""}, заведена задача на разбор`
+          : `Отмечено несоответствий: ${failed}. Итог - «с замечаниями»`,
   };
 }
 
@@ -171,17 +197,31 @@ export async function createDefect(
   const rawSeverity = String(formData.get("severity") ?? "major");
   const severity = (rawSeverity in QC_SEVERITY ? rawSeverity : "major") as QcSeverity;
 
-  if (!Number.isInteger(productionOrderId)) {
+  if (!Number.isInteger(productionOrderId) || productionOrderId <= 0) {
     return { ok: false, message: "Не указан производственный заказ" };
+  }
+  if (inspectionId !== null && (!Number.isInteger(inspectionId) || inspectionId <= 0)) {
+    return { ok: false, message: "Проверка указана неверно" };
   }
   if (title === "") return { ok: false, message: "Опишите дефект в одну строку" };
 
+  // Ссылки проверяем до загрузки снимка: файл не должен лечь на диск, если
+  // дефект всё равно не запишется
+  try {
+    await checkDefectRefs(db, productionOrderId, inspectionId);
+  } catch (e) {
+    if (e instanceof QualityRuleError) return { ok: false, message: e.message };
+    throw e;
+  }
+
   const photo = formData.get("photo");
   let photoPath: string | null = null;
+  let savedName: string | null = null;
 
   if (photo instanceof File && photo.size > 0) {
     try {
       const saved = await saveQcPhoto(photo);
+      savedName = saved.filename;
       // В базе лежит путь относительно хранилища: так по нему сразу видно,
       // из какой он папки
       photoPath = `qc/${saved.filename}`;
@@ -190,14 +230,30 @@ export async function createDefect(
     }
   }
 
-  await db.insert(qcDefects).values({
-    inspectionId,
+  let defectId: number;
+  try {
+    const [created] = await db
+      .insert(qcDefects)
+      .values({
+        inspectionId,
+        productionOrderId,
+        severity,
+        title,
+        description: description || null,
+        photoPath,
+        reportedBy: Number(user.id),
+      })
+      .returning({ id: qcDefects.id });
+    defectId = created.id;
+  } catch {
+    // Запись не легла - снимок остался бы сиротой в хранилище
+    if (savedName) await removeUpload(savedName, "qc");
+    return { ok: false, message: "Не удалось записать дефект. Попробуйте ещё раз" };
+  }
+
+  await audit("quality.defect", { type: "qc_defect", id: defectId }, {
     productionOrderId,
     severity,
-    title,
-    description: description || null,
-    photoPath,
-    reportedBy: Number(user.id),
   });
 
   revalidatePath("/admin/quality");

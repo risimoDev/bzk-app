@@ -91,7 +91,7 @@ export default async function AdminInspect({
       .from(productionOrderStages)
       .innerJoin(productionStages, eq(productionStages.id, productionOrderStages.stageId))
       .where(eq(productionOrderStages.productionOrderId, productionOrderId))
-      .orderBy(asc(productionStages.sortOrder)),
+      .orderBy(asc(productionOrderStages.sortOrder), asc(productionOrderStages.id)),
     db
       .select({
         id: qcInspections.id,

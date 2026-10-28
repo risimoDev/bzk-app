@@ -1,21 +1,25 @@
 "use server";
 
-import { eq, asc, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { db } from "@/db";
-import {
-  productionOrders,
-  productionOrderStages,
-  productionStages,
-  productionStageLog,
-  orders,
-} from "@/db/schema";
+import { orders } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { notifyOrderStatus } from "@/lib/notify";
-import { ORDER_STATUS } from "@/lib/order-status";
+import { ORDER_STATUS, statusNote } from "@/lib/order-status";
+import { advanceProduction, setProductionHold, startProductionOf } from "@/lib/production-db";
 import { currentUser } from "@/auth";
-import { MoneyRuleError, changeOrderStatus, type OrderRef } from "@/lib/order-money-db";
+import { MoneyRuleError, type OrderRef } from "@/lib/order-money-db";
+
+/**
+ * Состояние форм цеха. Раньше действия молча возвращались при любом
+ * отказе, и менеджер нажимал «Этап готов» на приостановленном заказе, не
+ * понимая, почему ничего не происходит.
+ */
+export type ProductionState = { ok?: boolean; error?: string; message?: string };
+
+const DENIED: ProductionState = { error: "У вашей роли нет права менять производство" };
 
 /**
  * Запускает заказ в производство.
@@ -25,12 +29,13 @@ import { MoneyRuleError, changeOrderStatus, type OrderRef } from "@/lib/order-mo
  * производства» без стадий значило бы вести производство в двух местах.
  * В форму приходит либо `orderId`, либо `externalOrderId`.
  *
- * Сразу раскладывает заказ по всем активным этапам: без этого доска
- * пуста, и непонятно, что заказу вообще предстоит. Первый этап
- * становится текущим и переходит в работу.
+ * Правила - в startProductionOf (lib/production-db.ts).
  */
-export async function startProduction(formData: FormData) {
-  if (!(await can("kanban", "edit"))) return;
+export async function startProduction(
+  _prev: ProductionState,
+  formData: FormData,
+): Promise<ProductionState> {
+  if (!(await can("kanban", "edit"))) return DENIED;
 
   const rawOrder = String(formData.get("orderId") ?? "").trim();
   const rawExternal = String(formData.get("externalOrderId") ?? "").trim();
@@ -39,75 +44,25 @@ export async function startProduction(formData: FormData) {
   const externalOrderId = rawExternal === "" ? null : Number(rawExternal);
 
   const valid = (v: number | null) => v === null || (Number.isInteger(v) && v > 0);
-  if (!valid(orderId) || !valid(externalOrderId)) return;
+  if (!valid(orderId) || !valid(externalOrderId)) return { error: "Заказ не найден" };
   // Ровно один из двух: заказ либо сайтовый, либо менеджерский
-  if ((orderId === null) === (externalOrderId === null)) return;
+  if ((orderId === null) === (externalOrderId === null)) return { error: "Заказ не найден" };
 
   const me = await currentUser();
-
-  // Повторный запуск того же заказа создал бы дубль на доске
-  const [existing] = await db
-    .select({ id: productionOrders.id })
-    .from(productionOrders)
-    .where(
-      orderId !== null
-        ? eq(productionOrders.orderId, orderId)
-        : eq(productionOrders.externalOrderId, externalOrderId!),
-    )
-    .limit(1);
-  if (existing) return;
-
-  const stages = await db
-    .select()
-    .from(productionStages)
-    .where(eq(productionStages.isActive, true))
-    .orderBy(asc(productionStages.sortOrder));
-
-  if (stages.length === 0) return;
-
   const ref: OrderRef =
     orderId !== null
       ? { source: "site", id: orderId }
       : { source: "external", id: externalOrderId! };
 
-  // Статус заказа меняется через общий changeOrderStatus: он же
-  // пересчитывает деньги и не даёт производству оживить отменённый заказ.
-  // Раньше статус писался напрямую, и отменённый заказ уходил «в работу»,
-  // а его карточка оставалась вне выручки
   let statusChanged = false;
   try {
-    await db.transaction(async (tx) => {
-      const [created] = await tx
-        .insert(productionOrders)
-        .values({
-          orderId,
-          externalOrderId,
-          status: "in_progress",
-          currentStageId: stages[0].id,
-          startedAt: new Date(),
-          createdBy: me ? Number(me.id) : null,
-        })
-        .returning({ id: productionOrders.id });
-
-      await tx.insert(productionOrderStages).values(
-        stages.map((s, i) => ({
-          productionOrderId: created.id,
-          stageId: s.id,
-          status: i === 0 ? ("in_progress" as const) : ("pending" as const),
-          startedAt: i === 0 ? new Date() : null,
-          estimatedHours: s.defaultDurationHours,
-          sortOrder: s.sortOrder ?? i,
-        })),
-      );
-
-      // Сам заказ тоже переводим в работу - иначе клиент видит
-      // «в обработке», пока в цехе уже режут
-      const res = await changeOrderStatus(tx, ref, "in_work", { system: true });
-      statusChanged = res.changed;
-    });
+    const res = await db.transaction((tx) =>
+      startProductionOf(tx, ref, me ? Number(me.id) : null),
+    );
+    statusChanged = res.statusChanged;
   } catch (e) {
-    // Отменённый заказ в цех не запускаем - транзакция откатилась целиком
-    if (e instanceof MoneyRuleError) return;
+    // Транзакция откатилась целиком - заказ остался как был
+    if (e instanceof MoneyRuleError) return { error: e.message };
     throw e;
   }
 
@@ -135,172 +90,92 @@ export async function startProduction(formData: FormData) {
   }
 
   revalidatePath("/admin/production");
+  return { ok: true, message: "Заказ запущен в производство" };
 }
 
-/** Закрывает текущий этап и переводит заказ на следующий. */
-export async function advanceStage(formData: FormData) {
-  if (!(await can("kanban", "edit"))) return;
+/**
+ * Закрывает текущий этап и переводит заказ на следующий; последний этап
+ * завершает производство и ставит заказу «Готов к выдаче». Правила - в
+ * advanceProduction (lib/production-db.ts).
+ */
+export async function advanceStage(
+  _prev: ProductionState,
+  formData: FormData,
+): Promise<ProductionState> {
+  if (!(await can("kanban", "edit"))) return DENIED;
 
   const productionOrderId = Number(formData.get("productionOrderId"));
-  if (!Number.isInteger(productionOrderId) || productionOrderId <= 0) return;
+  if (!Number.isInteger(productionOrderId) || productionOrderId <= 0) {
+    return { error: "Производственный заказ не найден" };
+  }
 
   const me = await currentUser();
 
-  const rows = await db
-    .select({
-      id: productionOrderStages.id,
-      stageId: productionOrderStages.stageId,
-      status: productionOrderStages.status,
-      sortOrder: productionOrderStages.sortOrder,
-    })
-    .from(productionOrderStages)
-    .where(eq(productionOrderStages.productionOrderId, productionOrderId))
-    .orderBy(asc(productionOrderStages.sortOrder));
-
-  const current = rows.find((r) => r.status === "in_progress") ?? rows.find((r) => r.status === "pending");
-  if (!current) return;
-
-  const next = rows.find(
-    (r) => (r.sortOrder ?? 0) > (current.sortOrder ?? 0) && r.status === "pending",
-  );
-
-  // Что рассказать клиенту, решаем по итогам транзакции: пока она не
-  // прошла, заказ ещё на прежней стадии
-  let finishedOrderId: number | null = null;
-  let finishedExternalId: number | null = null;
-  let finishedChanged = false;
-
+  let result: Awaited<ReturnType<typeof advanceProduction>>;
   try {
-    await db.transaction(async (tx) => {
-      // Отменённое (или уже завершённое) производство не продвигаем: этап
-      // закрылся бы, а последний перевёл бы отменённый заказ в «Завершён»
-      const [po] = await tx
-        .select({
-          status: productionOrders.status,
-          orderId: productionOrders.orderId,
-          externalOrderId: productionOrders.externalOrderId,
-        })
-        .from(productionOrders)
-        .where(eq(productionOrders.id, productionOrderId))
-        .for("no key update")
-        .limit(1);
-      if (!po || po.status === "cancelled" || po.status === "completed") {
-        throw new MoneyRuleError("Производство не идёт");
-      }
-
-      await tx
-        .update(productionOrderStages)
-        .set({ status: "completed", completedAt: new Date() })
-        .where(eq(productionOrderStages.id, current.id));
-
-      // Журнал ссылается на экземпляр этапа в конкретном заказе
-      // (production_order_stages.id), а не на справочник этапов
-      await tx.insert(productionStageLog).values({
-        productionOrderStageId: current.id,
-        productionOrderId,
-        action: "completed",
-        userId: me ? Number(me.id) : null,
-      });
-
-      if (next) {
-        await tx
-          .update(productionOrderStages)
-          .set({ status: "in_progress", startedAt: new Date() })
-          .where(eq(productionOrderStages.id, next.id));
-
-        await tx
-          .update(productionOrders)
-          .set({ currentStageId: next.stageId })
-          .where(eq(productionOrders.id, productionOrderId));
-      } else {
-        // Этапов больше нет - производство закончено
-        await tx
-          .update(productionOrders)
-          .set({
-            status: "completed",
-            currentStageId: null,
-            completedAt: new Date(),
-          })
-          .where(eq(productionOrders.id, productionOrderId));
-
-        // Статус заказа - через общий changeOrderStatus: он пересчитает
-        // деньги и откажет, если заказ тем временем отменили
-        if (po.orderId) {
-          const res = await changeOrderStatus(
-            tx,
-            { source: "site", id: po.orderId },
-            "completed",
-            { system: true },
-          );
-          finishedOrderId = po.orderId;
-          finishedChanged = res.changed;
-        }
-
-        if (po.externalOrderId) {
-          await changeOrderStatus(
-            tx,
-            { source: "external", id: po.externalOrderId },
-            "completed",
-            { system: true },
-          );
-          finishedExternalId = po.externalOrderId;
-        }
-      }
-    });
+    result = await db.transaction((tx) =>
+      advanceProduction(tx, productionOrderId, me ? Number(me.id) : null),
+    );
   } catch (e) {
-    if (e instanceof MoneyRuleError) return;
+    if (e instanceof MoneyRuleError) return { error: e.message };
     throw e;
   }
 
   await audit("production.advance", { type: "production_order", id: productionOrderId }, {
-    stageId: current.stageId,
-    finished: finishedOrderId ?? finishedExternalId,
+    stageId: result.closedStageId,
+    finished: result.siteOrderId ?? result.externalOrderId,
   });
 
-  if (finishedExternalId !== null) {
-    revalidatePath(`/admin/external-orders/${finishedExternalId}`);
+  if (result.externalOrderId !== null) {
+    revalidatePath(`/admin/external-orders/${result.externalOrderId}`);
     revalidatePath("/admin/external-orders");
   }
 
-  if (finishedOrderId !== null) {
+  if (result.siteOrderId !== null) {
     const [site] = await db
       .select({ userId: orders.userId })
       .from(orders)
-      .where(eq(orders.id, finishedOrderId))
+      .where(eq(orders.id, result.siteOrderId))
       .limit(1);
 
-    if (site && finishedChanged) {
+    if (site && result.siteStatusChanged) {
       await notifyOrderStatus({
         userId: site.userId,
-        orderId: finishedOrderId,
-        statusLabel: ORDER_STATUS.completed.label,
+        orderId: result.siteOrderId,
+        statusLabel: ORDER_STATUS.ready.label,
+        note: statusNote("ready"),
       });
     }
-    revalidatePath(`/client/orders/${finishedOrderId}`);
+    revalidatePath(`/admin/orders/${result.siteOrderId}`);
+    revalidatePath(`/client/orders/${result.siteOrderId}`);
   }
 
   revalidatePath("/admin/production");
+  return {
+    ok: true,
+    message: result.finished ? "Производство завершено - заказ готов к выдаче" : "Этап закрыт",
+  };
 }
 
 /** Приостановить или вернуть в работу. */
-export async function setHold(formData: FormData) {
-  if (!(await can("kanban", "edit"))) return;
+export async function setHold(
+  _prev: ProductionState,
+  formData: FormData,
+): Promise<ProductionState> {
+  if (!(await can("kanban", "edit"))) return DENIED;
 
   const id = Number(formData.get("productionOrderId"));
   const hold = formData.get("hold") === "1";
-  if (!Number.isInteger(id) || id <= 0) return;
+  if (!Number.isInteger(id) || id <= 0) return { error: "Производственный заказ не найден" };
 
-  await db
-    .update(productionOrders)
-    .set({ status: hold ? "on_hold" : "in_progress" })
-    .where(
-      and(
-        eq(productionOrders.id, id),
-        // Завершённый заказ приостанавливать нечего
-        eq(productionOrders.status, hold ? "in_progress" : "on_hold"),
-      ),
-    );
+  try {
+    await db.transaction((tx) => setProductionHold(tx, id, hold));
+  } catch (e) {
+    if (e instanceof MoneyRuleError) return { error: e.message };
+    throw e;
+  }
 
   await audit("production.hold", { type: "production_order", id }, { hold });
   revalidatePath("/admin/production");
+  return { ok: true, message: hold ? "Производство приостановлено" : "Производство продолжено" };
 }

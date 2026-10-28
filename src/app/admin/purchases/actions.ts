@@ -10,9 +10,14 @@ import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { nextPurchaseNumber } from "@/lib/numbering-db";
-import { applyMovement } from "@/lib/stock";
-import { RECEIVABLE, type PurchaseStatus } from "@/lib/purchases";
-import { localDate } from "@/lib/dates";
+import {
+  PurchaseRuleError,
+  addPurchasePayment,
+  receivePurchaseItem,
+  removePurchasePayment,
+} from "@/lib/purchases-db";
+import { StockError } from "@/lib/stock";
+import type { PurchaseStatus } from "@/lib/purchases";
 
 export type ReceiveState = { ok?: string; error?: string };
 
@@ -29,8 +34,9 @@ const receiveSchema = z.object({
  * Приёмка позиции закупки на склад.
  *
  * Пополнение остатка идёт через общий applyMovement - тот же путь, что
- * и у ручного прихода. Движение помечается ссылкой на закупку, поэтому
- * в истории материала видно, откуда он взялся.
+ * и у ручного прихода. Движение помечается типом «закупка» и ссылкой на
+ * неё, поэтому в истории материала видно, откуда он взялся. Цена материала
+ * пересчитывается средневзвешенно (см. receivePurchaseItem).
  */
 export async function receiveItem(
   _prev: ReceiveState,
@@ -50,93 +56,26 @@ export async function receiveItem(
   }
 
   const { itemId, quantity } = parsed.data;
-  const amount = Number(quantity);
 
+  let result: Awaited<ReturnType<typeof receivePurchaseItem>>;
   try {
-    await db.transaction(async (tx) => {
-      const [item] = await tx
-        .select({
-          id: purchaseOrderItems.id,
-          purchaseOrderId: purchaseOrderItems.purchaseOrderId,
-          materialId: purchaseOrderItems.materialId,
-          ordered: purchaseOrderItems.quantity,
-          received: purchaseOrderItems.receivedQuantity,
-        })
-        .from(purchaseOrderItems)
-        .where(eq(purchaseOrderItems.id, itemId))
-        .for("update")
-        .limit(1);
-
-      if (!item) throw new Error("Позиция не найдена");
-
-      const [order] = await tx
-        .select({ status: purchaseOrders.status, number: purchaseOrders.orderNumber })
-        .from(purchaseOrders)
-        .where(eq(purchaseOrders.id, item.purchaseOrderId))
-        .limit(1);
-
-      if (!order || !RECEIVABLE.includes((order.status ?? "draft") as PurchaseStatus)) {
-        throw new Error("Эту закупку сейчас нельзя принимать");
-      }
-
-      const already = Number(item.received ?? 0);
-      const ordered = Number(item.ordered);
-
-      // Принять больше заказанного - почти всегда опечатка, и она
-      // молча раздувает остаток на складе
-      if (already + amount > ordered) {
-        throw new Error(
-          `Уже принято ${already} из ${ordered}. Больше заказанного принять нельзя`,
-        );
-      }
-
-      await applyMovement(tx, {
-        materialId: item.materialId,
-        type: "in",
-        quantity,
-        referenceType: "order",
-        referenceId: item.purchaseOrderId,
-        comment: `Приёмка по закупке ${order.number}`,
-      });
-
-      await tx
-        .update(purchaseOrderItems)
-        .set({ receivedQuantity: (already + amount).toFixed(2) })
-        .where(eq(purchaseOrderItems.id, itemId));
-
-      // Статус закупки пересчитываем по всем позициям сразу: принята
-      // целиком только когда каждая позиция закрыта полностью
-      const rest = await tx
-        .select({
-          ordered: purchaseOrderItems.quantity,
-          received: purchaseOrderItems.receivedQuantity,
-        })
-        .from(purchaseOrderItems)
-        .where(eq(purchaseOrderItems.purchaseOrderId, item.purchaseOrderId));
-
-      const allDone = rest.every(
-        (r) => Number(r.received ?? 0) >= Number(r.ordered),
-      );
-      const anyDone = rest.some((r) => Number(r.received ?? 0) > 0);
-
-      await tx
-        .update(purchaseOrders)
-        .set({
-          status: allDone ? "received" : anyDone ? "partially_received" : order.status,
-          // Календарный день берём в поясе компании, иначе ночная
-          // приёмка запишется вчерашним числом
-          actualDeliveryDate: allDone ? localDate() : null,
-        })
-        .where(eq(purchaseOrders.id, item.purchaseOrderId));
-    });
+    result = await db.transaction((tx) => receivePurchaseItem(tx, { itemId, quantity }));
   } catch (e) {
-    return {
-      error: e instanceof Error ? e.message : "Не удалось принять позицию",
-    };
+    if (e instanceof PurchaseRuleError || e instanceof StockError) return { error: e.message };
+    throw e;
   }
+
+  await audit("purchase.receive", { type: "purchase_order", id: result.purchaseOrderId }, {
+    itemId,
+    materialId: result.materialId,
+    quantity,
+    costBefore: result.oldCost,
+    costAfter: result.newCost,
+  });
 
   revalidatePath("/admin/purchases");
   revalidatePath("/admin/materials");
+  revalidatePath(`/admin/materials/${result.materialId}`);
 
   return { ok: "Позиция принята на склад" };
 }
@@ -267,11 +206,17 @@ export async function createPurchase(
   }
 
   const known = await db
-    .select({ id: materials.id })
+    .select({ id: materials.id, name: materials.name, isActive: materials.isActive })
     .from(materials)
     .where(inArray(materials.id, [...new Set(items.map((i) => i.materialId))]));
   if (known.length !== new Set(items.map((i) => i.materialId)).size) {
     return { error: "Материал из позиции не найден" };
+  }
+  // Отключённый материал в форме не предлагается, но номер приходит из
+  // формы: сервер сам не принимает то, что выключено
+  const disabled = known.find((m) => m.isActive === false);
+  if (disabled) {
+    return { error: `Материал «${disabled.name}» отключён - закупить его нельзя` };
   }
 
   const shipping = String(formData.get("shippingCost") ?? "").trim();
@@ -319,4 +264,110 @@ export async function createPurchase(
 
   revalidatePath("/admin/purchases");
   redirect("/admin/purchases");
+}
+
+// ------------------------------------------------------------ оплата закупки
+
+export type PaymentFormState = {
+  ok?: boolean;
+  error?: string;
+  message?: string;
+  fieldErrors?: Record<string, string>;
+};
+
+/** Дата оплаты. Пусто - сегодня; выдуманное число вроде 31 февраля - ошибка. */
+function paymentDate(raw: FormDataEntryValue | null): Date | null {
+  const text = String(raw ?? "").trim();
+  if (text === "") return new Date();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!m) return null;
+  // Полдень, чтобы календарный день не съехал при смене часового пояса
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12);
+  const ok =
+    d.getFullYear() === Number(m[1]) &&
+    d.getMonth() === Number(m[2]) - 1 &&
+    d.getDate() === Number(m[3]);
+  return ok ? d : null;
+}
+
+/**
+ * Отметка об оплате закупки.
+ *
+ * Оплата - это ещё и расход компании, поэтому нужны оба права: менять
+ * закупки (materials.edit) и заводить расходы (finance.create). У
+ * менеджера второго нет, и он отметить оплату не может - как и вписать тот
+ * же расход в бухгалтерии руками. Права не расширяем: платит и отмечает
+ * тот, кто и так ведёт деньги.
+ */
+export async function markPurchasePaid(
+  _prev: PaymentFormState,
+  formData: FormData,
+): Promise<PaymentFormState> {
+  if (!(await can("materials", "edit")) || !(await can("finance", "create"))) {
+    return { error: "Отметить оплату закупки может тот, кто ведёт расходы (бухгалтерия)" };
+  }
+
+  const purchaseOrderId = Number(formData.get("purchaseOrderId"));
+  if (!Number.isInteger(purchaseOrderId) || purchaseOrderId <= 0) {
+    return { error: "Закупка не найдена" };
+  }
+
+  const amount = toNumber(formData.get("amount") ?? undefined);
+  if (Number.isNaN(amount) || amount <= 0) {
+    return { fieldErrors: { amount: "Сумма вида 1234.56, больше нуля" } };
+  }
+
+  const paidAt = paymentDate(formData.get("paidAt"));
+  if (!paidAt) return { fieldErrors: { paidAt: "Такой даты нет" } };
+
+  let result: Awaited<ReturnType<typeof addPurchasePayment>>;
+  try {
+    result = await db.transaction((tx) => addPurchasePayment(tx, { purchaseOrderId, amount, paidAt }));
+  } catch (e) {
+    if (e instanceof PurchaseRuleError) return { error: e.message };
+    throw e;
+  }
+
+  await audit("purchase.payment_add", { type: "purchase_order", id: purchaseOrderId }, {
+    amount: amount.toFixed(2),
+    expenseId: result.expenseId,
+    status: result.status,
+  });
+
+  revalidatePath("/admin/purchases");
+  revalidatePath("/admin/finance");
+  revalidatePath("/admin/analytics");
+  return { ok: true, message: "Оплата отмечена, расход записан в бухгалтерию" };
+}
+
+/** Отмена ошибочной оплаты: расход удаляется, статус пересчитывается. */
+export async function cancelPurchasePayment(
+  _prev: PaymentFormState,
+  formData: FormData,
+): Promise<PaymentFormState> {
+  if (!(await can("materials", "edit")) || !(await can("finance", "delete"))) {
+    return { error: "Отменять оплату закупки может только администратор" };
+  }
+
+  const expenseId = Number(formData.get("expenseId"));
+  if (!Number.isInteger(expenseId) || expenseId <= 0) return { error: "Оплата не найдена" };
+
+  let result: Awaited<ReturnType<typeof removePurchasePayment>>;
+  try {
+    result = await db.transaction((tx) => removePurchasePayment(tx, expenseId));
+  } catch (e) {
+    if (e instanceof PurchaseRuleError) return { error: e.message };
+    throw e;
+  }
+
+  await audit("purchase.payment_cancel", { type: "purchase_order", id: result.purchaseOrderId }, {
+    expenseId,
+    amount: result.amount,
+    status: result.status,
+  });
+
+  revalidatePath("/admin/purchases");
+  revalidatePath("/admin/finance");
+  revalidatePath("/admin/analytics");
+  return { ok: true, message: "Оплата отменена" };
 }

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { ArrowLeft } from "lucide-react";
 import { db } from "@/db";
 import { materials, suppliers } from "@/db/schema";
@@ -36,6 +36,8 @@ export default async function NewPurchase() {
         costPerUnit: materials.costPerUnit,
       })
       .from(materials)
+      // Отключённый материал не закупают (сервер его тоже не примет)
+      .where(sql`${materials.isActive} is not false`)
       .orderBy(asc(materials.name)),
   ]);
 

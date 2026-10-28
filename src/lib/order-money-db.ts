@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, count, eq, inArray, notInArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, notInArray, sql, type SQL } from "drizzle-orm";
 import { db, type Db } from "@/db";
 import {
   externalOrderItems,
@@ -11,6 +11,8 @@ import {
   orders,
   ordersAccounting,
   productionOrders,
+  productionOrderStages,
+  productionStageLog,
   tochkaInvoices,
 } from "@/db/schema";
 import { estimatedExpense, estimatedExpenseForOrder, taxRate } from "@/lib/accounting-db";
@@ -554,6 +556,13 @@ export async function changeOrderStatus(
      * одного: отменённый заказ производство не оживляет.
      */
     system?: boolean;
+    /**
+     * Менять статус, только если заказ сейчас в одном из этих статусов;
+     * в остальных - молча ничего (`changed: false`). Для производства:
+     * заказ, который менеджер уже отправил или закрыл вручную, цех
+     * «в работу» и «готов к выдаче» не откатывает.
+     */
+    onlyFrom?: readonly OrderStatus[];
   } = {},
 ) {
   const [row] =
@@ -582,6 +591,7 @@ export async function changeOrderStatus(
     );
   }
   if (from === next) return { changed: false as const, from };
+  if (opts.onlyFrom && !opts.onlyFrom.includes(from)) return { changed: false as const, from };
 
   if (ref.source === "site") {
     // Заказ увидели - метка «новый» больше не нужна
@@ -610,6 +620,41 @@ export async function changeOrderStatus(
       .update(productionOrders)
       .set({ status: "on_hold" })
       .where(and(ofOrder, eq(productionOrders.status, "cancelled")));
+  } else if (next === "in_work" && (from === "ready" || from === "completed")) {
+    // Заказ вернули в работу (нашли недочёт, приняли на доработку): без
+    // этого он числился бы «В работе», а производство осталось завершённым
+    // и этапов, которые можно закрыть, не было. Переоткрываем последний
+    // этап - доделать его и закрыть заново
+    const [po] = await tx
+      .select({ id: productionOrders.id })
+      .from(productionOrders)
+      .where(and(ofOrder, eq(productionOrders.status, "completed")))
+      .for("no key update")
+      .limit(1);
+    if (po) {
+      const [last] = await tx
+        .select({ id: productionOrderStages.id, stageId: productionOrderStages.stageId })
+        .from(productionOrderStages)
+        .where(eq(productionOrderStages.productionOrderId, po.id))
+        .orderBy(desc(productionOrderStages.sortOrder), desc(productionOrderStages.id))
+        .limit(1);
+      if (last) {
+        await tx
+          .update(productionOrderStages)
+          .set({ status: "in_progress", completedAt: null })
+          .where(eq(productionOrderStages.id, last.id));
+        await tx
+          .update(productionOrders)
+          .set({ status: "in_progress", currentStageId: last.stageId, completedAt: null })
+          .where(eq(productionOrders.id, po.id));
+        await tx.insert(productionStageLog).values({
+          productionOrderStageId: last.id,
+          productionOrderId: po.id,
+          action: "returned",
+          userId: null,
+        });
+      }
+    }
   }
 
   await recalcOrderMoney(tx, ref);
@@ -691,16 +736,17 @@ export async function deleteExternalOrderChecked(tx: Tx, externalOrderId: number
  */
 export async function recordWriteOffExpense(
   tx: Tx,
-  externalOrderId: number,
+  ref: OrderRef,
   input: {
     materialName: string;
     quantity: string;
     unit: string | null;
     costPerUnit: string | null;
     cost: number;
+    /** Движение склада, которым материал списан (для «вернуть на склад») */
+    movementId?: number | null;
   },
 ) {
-  const ref: OrderRef = { source: "external", id: externalOrderId };
   const before = await recalcOrderMoney(tx, ref);
   if (!before) return null;
 
@@ -714,9 +760,47 @@ export async function recordWriteOffExpense(
     amount: input.cost.toFixed(2),
     description: `Списано со склада: ${input.materialName}`,
     isWriteOff: true,
+    materialMovementId: input.movementId ?? null,
   });
 
   return recalcOrderMoney(tx, ref);
+}
+
+/**
+ * Удаление строки расхода заказа.
+ *
+ * Строку списания материала отдельно не удаляют: материал остался бы
+ * выданным со склада, а расход пропал - склад и деньги разъехались бы.
+ * Для этого есть «Вернуть на склад» (и приход, и расход - вместе).
+ * `null` - строки в этой карточке нет.
+ */
+export async function deleteExpenseRow(tx: Tx, cardId: number, expenseId: number) {
+  const [row] = await tx
+    .select({ isWriteOff: orderExpenses.isWriteOff })
+    .from(orderExpenses)
+    .where(and(eq(orderExpenses.id, expenseId), eq(orderExpenses.orderAccountingId, cardId)))
+    .for("no key update")
+    .limit(1);
+  if (!row) return null;
+  if (row.isWriteOff) {
+    throw new MoneyRuleError(
+      "Это списание материала со склада. Удалить его нельзя - верните материал на склад в карточке заказа, тогда расход снимется сам",
+    );
+  }
+
+  const removed = await tx
+    .delete(orderExpenses)
+    .where(
+      and(
+        eq(orderExpenses.id, expenseId),
+        // Номер приходит из формы: без привязки к карточке можно было бы
+        // удалить чужую строку
+        eq(orderExpenses.orderAccountingId, cardId),
+      ),
+    )
+    .returning({ amount: orderExpenses.amount });
+  if (removed.length === 0) return null;
+  return { amount: removed[0].amount, summary: await recalcCard(tx, cardId) };
 }
 
 // ------------------------------------------------------------------ отчёты

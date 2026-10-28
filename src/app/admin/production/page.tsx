@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { eq, asc, desc, inArray, sql } from "drizzle-orm";
-import { Play, Pause, Check, Flame, ClipboardCheck } from "lucide-react";
+import { Flame, ClipboardCheck } from "lucide-react";
 import { db } from "@/db";
 import {
   productionOrders,
@@ -14,7 +14,7 @@ import {
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import { productionStatusOf, priorityOf } from "@/lib/production";
-import { startProduction, advanceStage, setHold } from "./actions";
+import { StageControls, StartProductionForm } from "./ProductionForms";
 import { cn } from "@/lib/cn";
 
 export const metadata: Metadata = {
@@ -52,7 +52,7 @@ export default async function AdminProduction() {
       .select()
       .from(productionStages)
       .where(eq(productionStages.isActive, true))
-      .orderBy(asc(productionStages.sortOrder)),
+      .orderBy(asc(productionStages.sortOrder), asc(productionStages.id)),
 
     // Всё, что в цехе: и в работе, и приостановленное. Заказы обоих
     // типов лежат в одной таблице, поэтому подтягиваем и тех и других
@@ -206,20 +206,11 @@ export default async function AdminProduction() {
                 </span>
 
                 {editable && (
-                  <form action={startProduction}>
-                    <input
-                      type="hidden"
-                      name={o.kind === "site" ? "orderId" : "externalOrderId"}
-                      value={o.id}
-                    />
-                    <button
-                      type="submit"
-                      className="flex items-center gap-1.5 rounded-lg bg-brand px-3 py-1.5 text-xs text-bone transition-colors hover:bg-brand-bright"
-                    >
-                      <Play className="size-3" aria-hidden />
-                      В работу
-                    </button>
-                  </form>
+                  <StartProductionForm
+                    compact
+                    field={o.kind === "site" ? "orderId" : "externalOrderId"}
+                    orderId={o.id}
+                  />
                 )}
               </li>
             ))}
@@ -327,61 +318,10 @@ export default async function AdminProduction() {
                           </Link>
 
                           {editable && (
-                            <div className="mt-3 flex gap-1.5">
-                              <form action={advanceStage} className="flex-1">
-                                <input
-                                  type="hidden"
-                                  name="productionOrderId"
-                                  value={card.id}
-                                />
-                                <button
-                                  type="submit"
-                                  disabled={card.status === "on_hold"}
-                                  title={
-                                    card.status === "on_hold"
-                                      ? "Сначала снимите паузу"
-                                      : "Закрыть этап и передать дальше"
-                                  }
-                                  className="flex w-full items-center justify-center gap-1 rounded-md bg-brand px-2 py-1.5 text-[0.68rem] text-bone transition-colors hover:bg-brand-bright disabled:cursor-not-allowed disabled:opacity-40"
-                                >
-                                  <Check className="size-3" aria-hidden />
-                                  Этап готов
-                                </button>
-                              </form>
-
-                              <form action={setHold}>
-                                <input
-                                  type="hidden"
-                                  name="productionOrderId"
-                                  value={card.id}
-                                />
-                                <input
-                                  type="hidden"
-                                  name="hold"
-                                  value={card.status === "on_hold" ? "0" : "1"}
-                                />
-                                <button
-                                  type="submit"
-                                  aria-label={
-                                    card.status === "on_hold"
-                                      ? "Вернуть в работу"
-                                      : "Приостановить"
-                                  }
-                                  title={
-                                    card.status === "on_hold"
-                                      ? "Вернуть в работу"
-                                      : "Приостановить"
-                                  }
-                                  className="rounded-md border border-ink/15 px-2 py-1.5 text-ink/55 transition-colors hover:border-warn hover:text-warn"
-                                >
-                                  {card.status === "on_hold" ? (
-                                    <Play className="size-3" />
-                                  ) : (
-                                    <Pause className="size-3" />
-                                  )}
-                                </button>
-                              </form>
-                            </div>
+                            <StageControls
+                              productionOrderId={card.id}
+                              onHold={card.status === "on_hold"}
+                            />
                           )}
                         </li>
                       );

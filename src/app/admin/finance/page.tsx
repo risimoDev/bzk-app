@@ -98,6 +98,7 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
         id: generalExpenses.id,
         amount: generalExpenses.amount,
         description: generalExpenses.description,
+        purchaseOrderId: generalExpenses.purchaseOrderId,
         expenseDate: generalExpenses.expenseDate,
         categoryName: expensesCategories.name,
       })
@@ -343,7 +344,11 @@ export default async function AdminFinance(props: PageProps<"/admin/finance">) {
                   </td>
                   {canDelete && (
                     <td className="whitespace-nowrap px-4 py-3 text-right">
-                      <DeleteRow kind="general" rowId={g.id} />
+                      {g.purchaseOrderId !== null ? (
+                        <span className="text-xs text-ink/35">оплата закупки</span>
+                      ) : (
+                        <DeleteRow kind="general" rowId={g.id} />
+                      )}
                     </td>
                   )}
                 </tr>

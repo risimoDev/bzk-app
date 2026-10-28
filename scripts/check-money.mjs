@@ -285,7 +285,7 @@ try {
   await db.insert(materialsStock).values({ materialId, quantity: "100.00" });
   const afterWriteOff = await db.transaction(async (tx) => {
     await applyMovement(tx, { materialId, type: "out", quantity: "2", referenceType: "order", referenceId: extId, comment: `Заказ менеджера № ${extId}` });
-    return svc.recordWriteOffExpense(tx, extId, { materialName: "Проверка денег - материал", quantity: "2", unit: "м", costPerUnit: "50.00", cost: 100 });
+    return svc.recordWriteOffExpense(tx, ext, { materialName: "Проверка денег - материал", quantity: "2", unit: "м", costPerUnit: "50.00", cost: 100 });
   });
   check(
     "списание: расход = ручной + факт, оценка не удваивает",

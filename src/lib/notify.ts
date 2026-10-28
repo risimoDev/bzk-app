@@ -192,9 +192,13 @@ export async function notifyOrderStatus(input: {
   userId: number;
   orderId: number;
   statusLabel: string;
+  /** Пояснение под стадией - например, что заказ можно забирать. */
+  note?: string;
 }) {
   const text =
-    `<b>Заказ № ${input.orderId}</b>\n` + `Новая стадия: ${esc(input.statusLabel)}`;
+    `<b>Заказ № ${input.orderId}</b>\n` +
+    `Новая стадия: ${esc(input.statusLabel)}` +
+    (input.note ? `\n${esc(input.note)}` : "");
 
   return notifyUser(input.userId, "order_status_changed", `Заказ № ${input.orderId}`, text, [
     [{ text: "Открыть заказ", url: absoluteUrl(`/client/orders/${input.orderId}`) }],

@@ -235,7 +235,13 @@ export default async function AdminFinanceEntry(
                       </td>
                       {canDelete && (
                         <td className="whitespace-nowrap px-4 py-3 text-right">
-                          <DeleteRow kind="expense" cardId={entry.id} rowId={e.id} />
+                          {/* Списание снимается возвратом материала на склад в
+                              карточке заказа, а не удалением строки */}
+                          {e.isWriteOff ? (
+                            <span className="text-xs text-ink/35">вернуть на склад</span>
+                          ) : (
+                            <DeleteRow kind="expense" cardId={entry.id} rowId={e.id} />
+                          )}
                         </td>
                       )}
                     </tr>
