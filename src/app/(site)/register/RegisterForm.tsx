@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useActionState } from "react";
+import { startTransition, useActionState, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import { Field } from "@/components/ui/Field";
 import { Button } from "@/components/ui/Button";
@@ -13,10 +13,22 @@ export function RegisterForm() {
     register,
     {},
   );
+  const [attempt, setAttempt] = useState(0);
   const err = state.fieldErrors ?? {};
 
   return (
-    <form action={action} className="flex flex-col gap-5">
+    <form
+      action={action}
+      onSubmit={(e) => {
+        // React 19 после действия очищает неуправляемые поля формы: после
+        // ошибки сервера введённые данные не должны сбрасываться.
+        e.preventDefault();
+        const data = new FormData(e.currentTarget);
+        setAttempt((n) => n + 1);
+        startTransition(() => action(data));
+      }}
+      className="flex flex-col gap-5"
+    >
       {state.error && (
         <p
           role="alert"
@@ -100,7 +112,7 @@ export function RegisterForm() {
         )}
       </Field>
 
-      <Turnstile />
+      <Turnstile key={attempt} />
 
       <Button type="submit" size="lg" disabled={pending} className="mt-1">
         {pending ? "Создаём…" : "Создать аккаунт"}

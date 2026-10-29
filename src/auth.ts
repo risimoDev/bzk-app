@@ -74,6 +74,7 @@ declare module "next-auth" {
 }
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
+  trustHost: true,
   // Сессия в JWT: провайдер Credentials не умеет работать с адаптером
   // базы, а держать таблицу сессий ради этого незачем. 30 дней - срок
   // клиента; сотрудника колбэк session отзывает через 7 дней от входа
