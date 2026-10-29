@@ -60,7 +60,7 @@ const SECTIONS = [
       { href: "/admin/external-orders", label: "Заказы менеджера", icon: ClipboardList, module: "orders" },
       { href: "/admin/products", label: "Товары", icon: Package, module: "products" },
       { href: "/admin/clients", label: "Клиенты", icon: Users, module: "users" },
-      { href: "/admin/counterparties", label: "Контрагенты", icon: Contact, module: "users" },
+      { href: "/admin/counterparties", label: "Контрагенты", icon: Contact, module: "counterparties" },
       { href: "/admin/production", label: "Производство", icon: Factory, module: "kanban" },
       { href: "/admin/quality", label: "Качество", icon: ClipboardCheck, module: "orders" },
       { href: "/admin/tasks", label: "Задачи", icon: ListChecks, module: "tasks" },
@@ -77,7 +77,7 @@ const SECTIONS = [
   {
     title: "Клиенты и документы",
     items: [
-      { href: "/admin/crm", label: "CRM", icon: Handshake, module: "users" },
+      { href: "/admin/crm", label: "CRM", icon: Handshake, module: "crm" },
       { href: "/admin/support", label: "Поддержка", icon: LifeBuoy, module: "messaging" },
       { href: "/admin/inbox", label: "Сообщения с сайта", icon: Inbox, module: "messaging" },
       { href: "/admin/promocodes", label: "Промокоды", icon: Ticket, module: "settings" },

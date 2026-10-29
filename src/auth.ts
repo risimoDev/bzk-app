@@ -5,7 +5,8 @@ import bcrypt from "bcryptjs";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { credentialsSchema } from "@/lib/validation";
-import { verifyTotp } from "@/lib/totp";
+import { consumeTotp } from "@/lib/totp-db";
+import { sessionRevoked } from "@/lib/session-policy";
 import { clientIp } from "@/lib/client-ip";
 import {
   checkRateLimit,
@@ -55,6 +56,8 @@ declare module "next-auth" {
       role: UserRole;
       canUseEditor: boolean;
       miniWarehouseEnabled: boolean;
+      /** Включён ли второй фактор - по нему админка напоминает о защите. */
+      totpEnabled: boolean;
     };
   }
 
@@ -65,12 +68,16 @@ declare module "next-auth" {
     miniWarehouseEnabled?: boolean;
     /** Момент последней смены пароля (мс) - для отзыва старых сессий. */
     passwordChangedAt?: number;
+    /** Версия сессий пользователя на момент входа - для отзыва токенов. */
+    sessionVersion?: number;
   }
 }
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   // Сессия в JWT: провайдер Credentials не умеет работать с адаптером
-  // базы, а держать таблицу сессий ради этого незачем.
+  // базы, а держать таблицу сессий ради этого незачем. 30 дней - срок
+  // клиента; сотрудника колбэк session отзывает через 7 дней от входа
+  // (lib/session-policy.ts), а любого - по версии сессий в базе.
   session: { strategy: "jwt", maxAge: 30 * 24 * 60 * 60 },
 
   pages: { signIn: "/login" },
@@ -156,7 +163,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             throw new TotpRequiredError();
           }
 
-          if (!verifyTotp(user.totpSecret, given)) {
+          // consumeTotp ещё и запоминает код: тот же код второй раз не
+          // пройдёт, даже если его подсмотрели или перехватили
+          if (!(await consumeTotp(user.id, user.totpSecret, given))) {
             await recordAttempt(email, "login");
             await recordAttempt(ip, "loginIp");
             throw new TotpInvalidError();
@@ -180,6 +189,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           // В токен кладём момент последней смены пароля; сессия сверяет
           // его с базой и отзывается, если пароль сменили позже
           passwordChangedAt: user.passwordChangedAt?.getTime() ?? 0,
+          sessionVersion: user.sessionVersion,
         };
       },
     }),
@@ -193,6 +203,10 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         token.canUseEditor = user.canUseEditor;
         token.miniWarehouseEnabled = user.miniWarehouseEnabled;
         token.pwdAt = user.passwordChangedAt ?? 0;
+        token.sv = user.sessionVersion ?? 0;
+        // Момент входа: срок сессии сотрудника считается от него, а не от
+        // последнего запроса (Auth.js продлевает токен на каждом)
+        token.loginAt = Date.now();
       }
       return token;
     },
@@ -212,6 +226,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           canUseEditor: users.canUseEditor,
           miniWarehouseEnabled: users.miniWarehouseEnabled,
           passwordChangedAt: users.passwordChangedAt,
+          sessionVersion: users.sessionVersion,
+          totpEnabledAt: users.totpEnabledAt,
         })
         .from(users)
         .where(eq(users.id, id))
@@ -220,7 +236,19 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       // Пароль сменили после того, как выдан этот токен - сессия недействительна
       const changedAt = fresh?.passwordChangedAt?.getTime() ?? 0;
       const issuedFor = Number(token.pwdAt ?? 0);
-      if (!fresh || fresh.isBlocked || changedAt > issuedFor) {
+      if (
+        !fresh ||
+        fresh.isBlocked ||
+        changedAt > issuedFor ||
+        // Версия сессий выросла (выход со всех устройств, блокировка,
+        // отключение 2FA) или у сотрудника вышла неделя со входа
+        sessionRevoked({
+          role: fresh.role,
+          tokenVersion: token.sv,
+          currentVersion: fresh.sessionVersion,
+          loginAt: token.loginAt,
+        })
+      ) {
         // Пустой id - признак недействительной сессии для вызывающего кода
         session.user = { ...session.user, id: "" };
         return session;
@@ -234,6 +262,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       // включить раздел прямо сейчас, и клиенту не придётся перевходить
       session.user.canUseEditor = fresh.canUseEditor;
       session.user.miniWarehouseEnabled = fresh.miniWarehouseEnabled ?? false;
+      session.user.totpEnabled = Boolean(fresh.totpEnabledAt);
       return session;
     },
   },

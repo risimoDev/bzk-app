@@ -88,14 +88,16 @@ export default async function UpdPrintPage({ params }: PageProps<"/print/upd/[so
       <PrintBar
         title={`УПД по заказу №${upd.documentNumber}`}
         backHref={backHref}
+        // Предупреждение и ссылка в настройки - только сотруднику: клиенту
+        // они ни к чему, а адрес админки ему знать незачем
         warning={
-          missing.length > 0
+          access.isStaff && missing.length > 0
             ? `Не заполнены реквизиты продавца: ${missing
                 .map((f) => COMPANY_FIELDS[f].toLowerCase())
                 .join(", ")}. Документ выйдет с пустыми полями.`
             : undefined
         }
-        settingsHref="/admin/settings/company"
+        settingsHref={access.isStaff ? "/admin/settings/company" : undefined}
       />
 
       <article className="doc doc--landscape">

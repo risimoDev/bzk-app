@@ -8,6 +8,7 @@
  * генератором, не перенеся правки.
  */
 import {
+  bigint,
   boolean,
   date,
   foreignKey,
@@ -149,6 +150,19 @@ export const users = pgTable("users", {
    * добавить код в приложение, запер бы себя сам.
    */
   totpEnabledAt: timestamp("totp_enabled_at", { withTimezone: true, mode: "date" }),
+  /**
+   * Номер последнего принятого тридцатисекундного окна одноразового кода.
+   * Код принимается, только если его окно строго позже этого номера, и
+   * запись обновляется одним UPDATE ... WHERE: так подсмотренный код
+   * нельзя предъявить второй раз, даже двумя запросами одновременно.
+   */
+  totpLastCounter: bigint("totp_last_counter", { mode: "number" }),
+  /**
+   * Версия сессий пользователя. Кладётся в JWT при входе и сверяется при
+   * каждом чтении сессии; рост счётчика (смена пароля, блокировка,
+   * «выйти со всех устройств») отзывает все выданные токены.
+   */
+  sessionVersion: integer("session_version").default(0).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).$onUpdate(() => new Date()),
 }, (t) => [
   unique("users_email").on(t.email),
@@ -547,6 +561,12 @@ export const crmReminders = pgTable("crm_reminders", {
   isCompleted: boolean("is_completed").default(false),
   /** Кому напомнить */
   assignedTo: integer("assigned_to").notNull(),
+  /**
+   * Для какого `remind_at` исполнителю уже ушло напоминание. Не флажок, а
+   * сама дата: перенесли напоминание на другой срок - значение перестало
+   * совпадать, и оно сработает снова. Пишет планировщик (api/cron/run).
+   */
+  notifiedRemindAt: timestamp("notified_remind_at", { mode: "date" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
 }, (t) => [
   index("crm_reminders_idx_remind").on(t.remindAt, t.isCompleted),
@@ -1648,6 +1668,25 @@ export const rateLimits = pgTable("rate_limits", {
   index("rate_limits_idx_cleanup").on(t.attemptedAt),
 ]);
 
+/**
+ * Разовые коды привязки телеграма. Храним только sha256-отпечаток кода
+ * (как ссылки на сброс пароля): утечка базы не выдаёт живых кодов.
+ * Код одноразовый - при использовании строка удаляется. Уборка: строки с
+ * expires_at < now() (при выдаче нового кода чистятся сразу, остальное -
+ * планировщик).
+ */
+export const telegramLinkCodes = pgTable("telegram_link_codes", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  codeHash: varchar("code_hash", { length: 64 }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true, mode: "date" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
+}, (t) => [
+  uniqueIndex("telegram_link_codes_code_hash").on(t.codeHash),
+  index("telegram_link_codes_user_id").on(t.userId),
+  index("telegram_link_codes_expires_at").on(t.expiresAt),
+]);
+
 export const reviews = pgTable("reviews", {
   id: serial("id").primaryKey(),
   userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
@@ -1667,7 +1706,7 @@ export const rolePermissions = pgTable("role_permissions", {
   id: serial("id").primaryKey(),
   /** Роль: admin, manager, user */
   role: varchar("role", { length: 30 }).notNull(),
-  /** Модуль: orders, products, materials, documents, users, finance, calculator, messaging, tasks, kanban, pricelist */
+  /** Модуль: orders, products, materials, documents, users, crm, counterparties, finance, calculator, messaging, tasks, kanban, pricelist */
   module: varchar("module", { length: 50 }).notNull(),
   /** Действие: view, create, edit, delete, manage */
   action: varchar("action", { length: 30 }).default("view").notNull(),
@@ -1760,6 +1799,8 @@ export const tasks = pgTable("tasks", {
   status: tasksStatusEnum("status").default("pending"),
   priority: tasksPriorityEnum("priority").default("medium"),
   dueDate: timestamp("due_date", { mode: "date" }),
+  /** Для какого `due_date` исполнителю уже сообщили о сроке (см. crm_reminders.notified_remind_at). */
+  notifiedDueDate: timestamp("notified_due_date", { mode: "date" }),
   relatedOrderAccountingId: integer("related_order_accounting_id").references(() => ordersAccounting.id, { onDelete: "set null", onUpdate: "cascade" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).defaultNow().notNull().$onUpdate(() => new Date()),

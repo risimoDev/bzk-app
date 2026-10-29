@@ -1,11 +1,12 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { asc, desc, eq, count, sql, inArray, and, lte, or, gte, notInArray } from "drizzle-orm";
+import { asc, desc, eq, count, sql, and, lte, or, gte, notInArray } from "drizzle-orm";
 import { BellRing, Building2, Mail, Phone, User } from "lucide-react";
 import { db } from "@/db";
 import { crmLeads, crmReminders, users } from "@/db/schema";
 import { AdminPage, AdminEmpty, AdminStat } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
+import { staffOptions as loadStaffOptions } from "@/lib/staff-db";
 import { currentUser } from "@/auth";
 import {
   leadSource,
@@ -48,7 +49,7 @@ const dtTime = new Intl.DateTimeFormat("ru-RU", {
  * ним видно, чем кончались похожие сделки.
  */
 export default async function AdminCrm() {
-  if (!(await can("users", "view"))) {
+  if (!(await can("crm", "view"))) {
     return (
       <AdminPage title="CRM">
         <AdminEmpty title="Нет доступа" text="У вашей роли нет права смотреть клиентов." />
@@ -92,11 +93,7 @@ export default async function AdminCrm() {
         ),
       )
       .orderBy(desc(crmLeads.updatedAt), desc(crmLeads.id)),
-    db
-      .select({ id: users.id, name: users.name })
-      .from(users)
-      .where(inArray(users.role, ["admin", "manager"]))
-      .orderBy(asc(users.name)),
+    loadStaffOptions(),
     db
       .select({
         status: crmLeads.status,
@@ -128,7 +125,7 @@ export default async function AdminCrm() {
       : [],
   ]);
 
-  const canEdit = await can("users", "edit");
+  const canEdit = await can("crm", "edit");
   const stats = new Map(
     byStatus.map((r) => [r.status, { n: Number(r.n), revenue: Number(r.revenue) }]),
   );

@@ -35,7 +35,7 @@ const dt = new Intl.DateTimeFormat("ru-RU", {
 export default async function AdminCounterparty({
   params,
 }: PageProps<"/admin/counterparties/[id]">) {
-  if (!(await can("users", "view"))) {
+  if (!(await can("counterparties", "view"))) {
     return (
       <AdminPage title="Контрагент">
         <AdminEmpty title="Нет доступа" text="У вашей роли нет права смотреть контрагентов." />
@@ -54,7 +54,7 @@ export default async function AdminCounterparty({
     .limit(1);
   if (!row) notFound();
 
-  const canEdit = await can("users", "edit");
+  const canEdit = await can("counterparties", "edit");
 
   const [orders, accounts, linkedAccount] = await Promise.all([
     db

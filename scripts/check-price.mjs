@@ -9,7 +9,7 @@
  * корзине не ту цену, что в карточке. Здесь стережём само правило:
  * ступени, надбавки и округление количества.
  */
-import { tierFor, unitPriceFor, normalizeQuantity } from "../src/lib/product-price.ts";
+import { tierFor, unitPriceFor, normalizeQuantity, fromUnitPrice } from "../src/lib/product-price.ts";
 
 let failed = 0;
 
@@ -63,5 +63,22 @@ check("не число - минимум", normalizeQuantity(Number.NaN, 50, 1) =
 check("дробь отбрасывается", normalizeQuantity(120.9, 100, 1) === 120);
 check("кратность 0 не ломает расчёт", normalizeQuantity(7, 1, 0) === 7);
 
-console.log(failed === 0 ? "\nВсе проверки прошли." : `\nОшибок: ${failed}`);
+// ------------------------------------------------------ цена «от»
+// Витрина показывает цену за единицу при минимальном тираже, а не базовую:
+// тот же расчёт, что у корзины на первой же строке
+
+const from = (minQuantity, multiplicity = 1, t = tiers) =>
+  fromUnitPrice({ basePrice: base, tiers: t, minQuantity, multiplicity });
+
+check("«от»: минимум совпал со ступенью - её цена", from(100) === 5, String(from(100)));
+check("«от»: минимум ниже первой ступени - базовая", from(50) === 6.5, String(from(50)));
+check("«от»: кратность поднимает тираж до ступени", from(60, 50) === 5, String(from(60, 50)));
+check("«от»: без ступеней - базовая", from(10, 1, []) === 6.5);
+check("«от»: ступени в любом порядке", from(500, 1, [...tiers].reverse()) === 4);
+check(
+  "«от» равна цене первой строки корзины",
+  from(100) === unitPriceFor({ basePrice: base, tiers, quantity: normalizeQuantity(100, 100, 1) }),
+);
+
+console.log(failed === 0 ?"\nВсе проверки прошли." : `\nОшибок: ${failed}`);
 process.exitCode = failed === 0 ? 0 : 1;

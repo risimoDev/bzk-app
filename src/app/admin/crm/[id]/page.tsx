@@ -49,7 +49,7 @@ const dtTime = new Intl.DateTimeFormat("ru-RU", {
 });
 
 export default async function AdminLead({ params }: PageProps<"/admin/crm/[id]">) {
-  if (!(await can("users", "view"))) {
+  if (!(await can("crm", "view"))) {
     return (
       <AdminPage title="Лид">
         <AdminEmpty title="Нет доступа" text="У вашей роли нет права смотреть клиентов." />
@@ -119,7 +119,7 @@ export default async function AdminLead({ params }: PageProps<"/admin/crm/[id]">
       .orderBy(asc(crmReminders.isCompleted), asc(crmReminders.remindAt)),
   ]);
 
-  const canEdit = await can("users", "edit");
+  const canEdit = await can("crm", "edit");
   const st = leadStatus(lead.status);
   const pr = leadPriority(lead.priority);
   const tags = readTags(lead.tags);

@@ -40,6 +40,8 @@ export async function selectCustomer(
     return toState(e);
   }
 
+  await audit("tochka.customer", { type: "settings" }, { customerCode: code });
+
   revalidatePath("/admin/tochka");
   return { ok: true, message: `Компания ${code} сохранена` };
 }
@@ -190,6 +192,8 @@ export async function emailInvoice(
   } catch (e) {
     return toState(e);
   }
+
+  await audit("tochka.invoice_email", { type: "tochka_invoice" }, { documentId, email });
 
   revalidatePath("/admin/tochka");
   return { ok: true, message: `Счёт отправлен на ${email}` };

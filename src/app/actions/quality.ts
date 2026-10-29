@@ -291,6 +291,8 @@ export async function updateDefectStatus(
 
   if (updated.length === 0) return { ok: false, message: "Дефект не найден" };
 
+  await audit("quality.defect_status", { type: "qc_defect", id: defectId }, { status });
+
   revalidatePath("/admin/quality");
   revalidatePath("/admin/quality/defects");
   return { ok: true, message: `Статус: ${QC_DEFECT_STATUS[status].label.toLowerCase()}` };
@@ -315,6 +317,8 @@ export async function deleteDefect(_prev: QcState, formData: FormData): Promise<
   if (row.photoPath?.startsWith("qc/")) {
     await removeUpload(row.photoPath.slice(3), "qc");
   }
+
+  await audit("quality.defect_delete", { type: "qc_defect", id: defectId });
 
   revalidatePath("/admin/quality/defects");
   return { ok: true, message: "Дефект удалён" };
@@ -348,14 +352,19 @@ export async function saveChecklistItem(
 
   if (!checklist) return { ok: false, message: "Чек-лист не найден" };
 
+  let savedItemId: number;
   if (rawId === "") {
-    await db.insert(qcChecklistItems).values({
-      checklistId,
-      text,
-      description: description || null,
-      isCritical,
-      sortOrder,
-    });
+    const [created] = await db
+      .insert(qcChecklistItems)
+      .values({
+        checklistId,
+        text,
+        description: description || null,
+        isCritical,
+        sortOrder,
+      })
+      .returning({ id: qcChecklistItems.id });
+    savedItemId = created.id;
   } else {
     const itemId = Number(rawId);
     if (!Number.isInteger(itemId)) return { ok: false, message: "Пункт не найден" };
@@ -369,7 +378,13 @@ export async function saveChecklistItem(
       .returning({ id: qcChecklistItems.id });
 
     if (updated.length === 0) return { ok: false, message: "Пункт не найден" };
+    savedItemId = itemId;
   }
+
+  await audit("quality.checklist_item_save", { type: "qc_checklist", id: checklistId }, {
+    itemId: savedItemId,
+    isCritical,
+  });
 
   revalidatePath(`/admin/quality/checklists/${checklistId}`);
   revalidatePath("/admin/quality");
@@ -404,6 +419,12 @@ export async function deleteChecklistItem(
   }
 
   await db.delete(qcChecklistItems).where(eq(qcChecklistItems.id, itemId));
+
+  await audit(
+    "quality.checklist_item_delete",
+    { type: "qc_checklist", id: Number.isInteger(checklistId) ? checklistId : null },
+    { itemId },
+  );
 
   revalidatePath(`/admin/quality/checklists/${checklistId}`);
   return { ok: true, message: "Пункт удалён" };

@@ -82,7 +82,9 @@ export default async function ClientOrderPage({ params }: PageProps<"/client/ord
       .orderBy(desc(clientUploads.createdAt)),
     buildTimeline(order),
     // Документы, заведённые менеджером на этот заказ. Черновики и
-    // отменённые клиенту показывать незачем - это внутренняя кухня
+    // отменённые клиенту показывать незачем - это внутренняя кухня; так же
+    // и внутренние, входящие и бухгалтерские: клиенту предназначены
+    // только исходящие
     db
       .select({
         id: documents.id,
@@ -95,6 +97,7 @@ export default async function ClientOrderPage({ params }: PageProps<"/client/ord
       .where(
         and(
           eq(documents.orderId, orderId),
+          eq(documents.docType, "outgoing"),
           inArray(documents.status, ["approved", "signed", "archived"]),
         ),
       )

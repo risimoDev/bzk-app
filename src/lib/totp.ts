@@ -60,10 +60,13 @@ export function generateSecret() {
   return base32Encode(randomBytes(20));
 }
 
-/** Код для конкретного окна. Смещение сдвигает окно назад или вперёд. */
-export function totpCode(secret: string, offset = 0, at = Date.now()): string {
-  const counter = Math.floor(at / 1000 / STEP) + offset;
+/** Номер тридцатисекундного окна, в которое попадает момент `at`. */
+export function totpCounter(at = Date.now()) {
+  return Math.floor(at / 1000 / STEP);
+}
 
+/** Код для конкретного номера окна (RFC 4226, HOTP). */
+function codeForCounter(secret: string, counter: number): string {
   const buf = Buffer.alloc(8);
   buf.writeBigUInt64BE(BigInt(counter));
 
@@ -81,27 +84,64 @@ export function totpCode(secret: string, offset = 0, at = Date.now()): string {
   return String(num % 10 ** DIGITS).padStart(DIGITS, "0");
 }
 
+/** Код для конкретного окна. Смещение сдвигает окно назад или вперёд. */
+export function totpCode(secret: string, offset = 0, at = Date.now()): string {
+  return codeForCounter(secret, totpCounter(at) + offset);
+}
+
 /**
- * Проверка кода.
+ * Номер окна, которому принадлежит введённый код, или null, если код не
+ * подошёл ни в одном из допустимых окон.
+ *
+ * Номер, а не просто «да/нет», нужен для защиты от повтора: код живёт до
+ * 90 секунд (окно и по соседу с каждой стороны), и подсмотренный через
+ * плечо или перехваченный код иначе можно было бы предъявить ещё раз.
+ * Принятый номер запоминается (`users.totp_last_counter`), а код с номером
+ * не больше запомненного отвергается - см. `isFreshCounter`.
  *
  * Принимаем соседние окна: часы на телефоне почти всегда чуть расходятся
  * с сервером, и без допуска половина честных попыток отвергалась бы.
- * Сравнение - постоянного времени: по скорости ответа код не подберёшь.
+ * Сравнение - постоянного времени, и перебираются все окна без раннего
+ * выхода: по скорости ответа код не подобрать.
  */
-export function verifyTotp(secret: string, code: string, window = 1): boolean {
+export function matchTotpCounter(
+  secret: string,
+  code: string,
+  window = 1,
+  at = Date.now(),
+): number | null {
   const given = code.replace(/\D/g, "");
-  if (given.length !== DIGITS) return false;
+  if (given.length !== DIGITS) return null;
 
   const givenBuf = Buffer.from(given);
+  const base = totpCounter(at);
+  let matched: number | null = null;
 
   for (let offset = -window; offset <= window; offset++) {
-    const expected = Buffer.from(totpCode(secret, offset));
+    const expected = Buffer.from(codeForCounter(secret, base + offset));
     if (expected.length === givenBuf.length && timingSafeEqual(expected, givenBuf)) {
-      return true;
+      matched = base + offset;
     }
   }
 
-  return false;
+  return matched;
+}
+
+/**
+ * Код этого окна ещё не использовался? Пусто (NULL) - второй фактор ещё
+ * ни разу не предъявляли. То же условие стоит в SQL (`consumeTotp`):
+ * здесь его можно проверить без базы.
+ */
+export function isFreshCounter(counter: number, last: number | null | undefined) {
+  return last === null || last === undefined || counter > last;
+}
+
+/**
+ * Проверка кода без учёта повтора. Для входа и подтверждений годится
+ * только `consumeTotp` (lib/totp-db.ts): он ещё и запоминает код.
+ */
+export function verifyTotp(secret: string, code: string, window = 1): boolean {
+  return matchTotpCounter(secret, code, window) !== null;
 }
 
 /** Ссылка для приложения-аутентификатора. */

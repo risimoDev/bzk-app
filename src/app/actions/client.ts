@@ -18,7 +18,7 @@ import { saveUpload, removeUpload } from "@/lib/uploads";
 import { isTicketClosed, TICKET_CATEGORIES, TICKET_PRIORITIES } from "@/lib/client-portal";
 import { localDate } from "@/lib/dates";
 import { nextTicketNumber } from "@/lib/numbering-db";
-import { notifyStaff } from "@/lib/notify";
+import { notifyClientUpload, notifyNewTicket, notifyStaff, notifyTicketReply } from "@/lib/notify";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
 
@@ -135,6 +135,15 @@ export async function uploadClientFile(
     fileSize: saved.size,
     mimeType: saved.mimeType,
     description: description || null,
+  });
+
+  // Макет, который никто не заметил, лежал бы до следующего захода
+  // менеджера в заказ - а по нему идёт срок
+  await notifyClientUpload({
+    userId,
+    clientName: user.name ?? "Клиент",
+    fileName: saved.originalName,
+    orderId,
   });
 
   revalidatePath("/client/uploads");
@@ -291,7 +300,7 @@ export async function createTicket(
   // одновременно, и второе падало ошибкой на уникальном индексе.
   const ymd = localDate().replaceAll("-", "");
 
-  const number = await db.transaction(async (tx) => {
+  const created = await db.transaction(async (tx) => {
     const ticketNumber = await nextTicketNumber(tx, ymd);
 
     const [ticket] = await tx
@@ -312,11 +321,21 @@ export async function createTicket(
       message,
     });
 
-    return ticketNumber;
+    return { id: ticket.id, number: ticketNumber };
+  });
+
+  await notifyNewTicket({
+    ticketId: created.id,
+    number: created.number,
+    subject,
+    clientName: user.name ?? "Клиент",
+    categoryLabel: TICKET_CATEGORIES[category as keyof typeof TICKET_CATEGORIES],
+    priorityLabel: TICKET_PRIORITIES[priority as keyof typeof TICKET_PRIORITIES].label,
+    preview: message,
   });
 
   revalidatePath("/client/support");
-  return { ok: true, message: `Обращение ${number} создано` };
+  return { ok: true, message: `Обращение ${created.number} создано` };
 }
 
 export async function replyToTicket(
@@ -334,7 +353,11 @@ export async function replyToTicket(
   if (message === "") return { ok: false, message: "Сообщение пустое" };
 
   const [ticket] = await db
-    .select({ id: supportTickets.id, status: supportTickets.status })
+    .select({
+      id: supportTickets.id,
+      status: supportTickets.status,
+      number: supportTickets.ticketNumber,
+    })
     .from(supportTickets)
     .where(and(eq(supportTickets.id, ticketId), eq(supportTickets.userId, userId)))
     .limit(1);
@@ -351,6 +374,13 @@ export async function replyToTicket(
       .update(supportTickets)
       .set({ status: "in_progress", updatedAt: new Date() })
       .where(eq(supportTickets.id, ticketId));
+  });
+
+  await notifyTicketReply({
+    ticketId,
+    number: ticket.number,
+    clientName: user.name ?? "Клиент",
+    preview: message,
   });
 
   revalidatePath(`/client/support/${ticketId}`);

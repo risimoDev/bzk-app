@@ -25,7 +25,9 @@ import { TapeLabel } from "@/components/ui/TapeLabel";
 import { StampBadge } from "@/components/ui/StampBadge";
 import { ClippedCard } from "@/components/ui/ClippedCard";
 import { currentUser } from "@/auth";
-import { reviews, orderItems, orders } from "@/db/schema";
+import { reviews } from "@/db/schema";
+import { hasReviewableOrder } from "@/lib/reviews-db";
+import { fromUnitPrice } from "@/lib/product-price";
 import { Star } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
@@ -186,22 +188,12 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
     .orderBy(desc(reviews.createdAt))
     .limit(20);
 
-  // Форму показываем тому, кто этот товар заказывал и ещё не высказался:
-  // сервер проверит то же самое, но пустая форма «не для вас» раздражает
+  // Форму показываем тому, кто этот товар получил (заказ отправлен или
+  // завершён) и ещё не высказался: сервер проверит то же самое, но пустая
+  // форма «не для вас» раздражает
   const canReview = user
     ? await (async () => {
-        const [ordered] = await db
-          .select({ id: orderItems.id })
-          .from(orderItems)
-          .innerJoin(orders, eq(orders.id, orderItems.orderId))
-          .where(
-            and(
-              eq(orderItems.productId, productId),
-              eq(orders.userId, Number(user.id)),
-            ),
-          )
-          .limit(1);
-        if (!ordered) return false;
+        if (!(await hasReviewableOrder(Number(user.id), productId))) return false;
 
         const [own] = await db
           .select({ id: reviews.id })
@@ -221,6 +213,15 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
 
   const { item, photos, logo, tiers, attributes } = data;
 
+  // «От» - цена за единицу при минимальном тираже, а не базовая: так же
+  // посчитает корзина
+  const fromPrice = fromUnitPrice({
+    basePrice: item.basePrice,
+    tiers: tiers.map((t) => ({ minQty: t.minQty, maxQty: t.maxQty, price: t.price })),
+    minQuantity: item.minQuantity,
+    multiplicity: item.multiplicity,
+  });
+
   const size =
     item.itemWidthMm && item.itemHeightMm
       ? `${Number(item.itemWidthMm)}×${Number(item.itemHeightMm)} мм`
@@ -237,7 +238,7 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
               name: item.name,
               description: item.description,
               imageUrl: photos[0]?.imageUrl ?? logo?.imageUrl ?? null,
-              basePrice: item.basePrice,
+              basePrice: String(fromPrice),
               tierPrices: tiers.map((t) => t.price),
               rating:
                 averageRating !== null
@@ -290,7 +291,7 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
 
               <p className="mt-5 font-mono text-3xl text-ink">
                 <span className="text-base text-ink/45">от </span>
-                {money.format(Number(item.basePrice))}
+                {money.format(fromPrice)}
                 <span className="text-base text-ink/45">
                   {" "}
                   / {item.unit ?? "шт."}

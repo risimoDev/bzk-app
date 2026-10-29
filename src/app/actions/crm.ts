@@ -4,10 +4,12 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { clients, crmLeads, crmInteractions, crmReminders, users } from "@/db/schema";
+import { clients, crmLeads, crmInteractions, crmReminders } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { isActiveStaff } from "@/lib/staff-db";
+import { parseId } from "@/lib/ids";
 import {
   LEAD_STATUS,
   LEAD_SOURCE,
@@ -25,13 +27,14 @@ export type CrmState = { ok: boolean; message?: string };
 const DENIED: CrmState = { ok: false, message: "Нет прав на CRM" };
 
 /**
- * Отдельного модуля прав у CRM нет: лид - это будущий клиент, поэтому
- * доступ привязан к правам на клиентов. Страница проверяет право сама -
- * из файла с «use server» такую проверку наружу не отдаём, иначе она
- * станет ещё одним открытым эндпоинтом.
+ * Право на CRM - свой модуль `crm`. Раньше раздел был закрыт правом на
+ * клиентов (`users`), и выдать сотруднику лиды значило пустить его к
+ * блокировке аккаунтов. Страница проверяет право сама - из файла с
+ * «use server» такую проверку наружу не отдаём, иначе она станет ещё
+ * одним открытым эндпоинтом.
  */
 async function mayEdit() {
-  return can("users", "edit");
+  return can("crm", "edit");
 }
 
 // ----------------------------------------------------------------- лиды
@@ -57,8 +60,11 @@ export async function createLead(_prev: CrmState, formData: FormData): Promise<C
   const rawCloseDate = String(formData.get("expectedCloseDate") ?? "").trim();
 
   const rawAssignee = String(formData.get("assignedTo") ?? "").trim();
-  const assignedTo = rawAssignee === "" ? null : Number(rawAssignee);
+  const assignedTo = rawAssignee === "" ? null : parseId(rawAssignee);
 
+  if (rawAssignee !== "" && assignedTo === null) {
+    return { ok: false, message: "Ответственный не найден" };
+  }
   if (name === "") return { ok: false, message: "Впишите имя или название компании" };
   if (email === "" && phone === "") {
     return { ok: false, message: "Нужен хотя бы один контакт - почта или телефон" };
@@ -80,30 +86,32 @@ export async function createLead(_prev: CrmState, formData: FormData): Promise<C
     return { ok: false, message: "Проверьте дату закрытия" };
   }
 
-  if (assignedTo !== null) {
-    const [staff] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, assignedTo))
-      .limit(1);
-    if (!staff) return { ok: false, message: "Ответственный не найден" };
+  // Ответственный - действующий сотрудник: id клиента в форму подставить
+  // можно, и лид повис бы на человеке без доступа в админку
+  if (assignedTo !== null && !(await isActiveStaff(assignedTo))) {
+    return { ok: false, message: "Ответственный не найден" };
   }
 
-  await db.insert(crmLeads).values({
-    name,
-    company: company || null,
-    email: email || null,
-    phone: phone || null,
-    source,
-    priority,
-    assignedTo,
-    expectedRevenue,
-    // Столбец календарный: строка «ГГГГ-ММ-ДД» уходит как есть
-    expectedCloseDate: rawCloseDate || null,
-    notes: notes || null,
-    tags: tags || null,
-    createdBy: Number(user.id),
-  });
+  const [createdLead] = await db
+    .insert(crmLeads)
+    .values({
+      name,
+      company: company || null,
+      email: email || null,
+      phone: phone || null,
+      source,
+      priority,
+      assignedTo,
+      expectedRevenue,
+      // Столбец календарный: строка «ГГГГ-ММ-ДД» уходит как есть
+      expectedCloseDate: rawCloseDate || null,
+      notes: notes || null,
+      tags: tags || null,
+      createdBy: Number(user.id),
+    })
+    .returning({ id: crmLeads.id });
+
+  await audit("crm.lead_create", { type: "crm_lead", id: createdLead.id }, { assignedTo });
 
   revalidatePath("/admin/crm");
   return { ok: true, message: "Лид заведён" };
@@ -141,6 +149,8 @@ export async function setLeadStatus(
     .returning({ id: crmLeads.id });
 
   if (updated.length === 0) return { ok: false, message: "Лид не найден" };
+
+  await audit("crm.lead_status", { type: "crm_lead", id: leadId }, { status });
 
   revalidatePath("/admin/crm");
   revalidatePath(`/admin/crm/${leadId}`);
@@ -307,7 +317,7 @@ export async function convertLeadToCounterparty(
   formData: FormData,
 ): Promise<CrmState> {
   const me = await currentUser();
-  if (!me || !(await can("users", "edit"))) {
+  if (!me || !(await can("crm", "edit"))) {
     return { ok: false, message: "Нет прав заводить контрагентов" };
   }
 

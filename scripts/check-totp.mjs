@@ -7,12 +7,16 @@
  * паролем, поэтому проверяем и совместимость с эталоном из RFC 6238, и
  * поведение на границах окна.
  */
+import fs from "node:fs";
 import {
   base32Decode,
   base32Encode,
   generateSecret,
+  isFreshCounter,
+  matchTotpCounter,
   otpauthUrl,
   totpCode,
+  totpCounter,
   verifyTotp,
 } from "@/lib/totp";
 
@@ -71,6 +75,73 @@ const url = otpauthUrl(secret, "lev@example.com");
 check("ссылка otpauth собрана", url.startsWith("otpauth://totp/"), url.slice(0, 40));
 check("в ссылке есть секрет", url.includes(`secret=${secret}`));
 check("в ссылке есть издатель", url.includes("issuer="));
+
+// ---- повтор кода (S7): номер окна и правило «строго позже последнего»
+const at = 1_700_000_000_000;
+const c0 = totpCounter(at);
+check("номер окна - секунды / 30", c0 === Math.floor(at / 1000 / 30), String(c0));
+check("код текущего окна даёт его номер", matchTotpCounter(secret, totpCode(secret, 0, at), 1, at) === c0);
+check("код прошлого окна даёт номер на единицу меньше", matchTotpCounter(secret, totpCode(secret, -1, at), 1, at) === c0 - 1);
+check("код следующего окна даёт номер на единицу больше", matchTotpCounter(secret, totpCode(secret, 1, at), 1, at) === c0 + 1);
+check("код через два окна номера не даёт", matchTotpCounter(secret, totpCode(secret, 2, at), 1, at) === null);
+check("мусор номера не даёт", matchTotpCounter(secret, "abc", 1, at) === null);
+
+check("первый код (счётчика ещё нет) свежий", isFreshCounter(c0, null) && isFreshCounter(c0, undefined));
+check("тот же номер уже использован", !isFreshCounter(c0, c0));
+check("более ранний номер отвергается", !isFreshCounter(c0 - 1, c0));
+check("более поздний номер свежий", isFreshCounter(c0 + 1, c0));
+
+// Сценарий: принят код окна c0+1; ни им же, ни кодом окна c0 больше не войти
+let last = null;
+const accept = (counter) => {
+  if (counter === null || !isFreshCounter(counter, last)) return false;
+  last = counter;
+  return true;
+};
+check("сценарий: первый вход проходит", accept(matchTotpCounter(secret, totpCode(secret, 1, at), 1, at)));
+check("сценарий: повтор того же кода отвергнут", !accept(matchTotpCounter(secret, totpCode(secret, 1, at), 1, at)));
+check("сценарий: код предыдущего окна отвергнут", !accept(matchTotpCounter(secret, totpCode(secret, 0, at), 1, at)));
+
+// ---- то же в базе: запись атомарна, два параллельных запроса с одним кодом
+// не проходят оба. Заводим своего пользователя и удаляем за собой.
+const env = fs.readFileSync(new URL("../.env", import.meta.url), "utf8");
+for (const line of env.split("\n")) {
+  const m = /^([A-Z_]+)=(.*)$/.exec(line.trim());
+  if (!m) continue;
+  process.env[m[1]] ??= m[2].replace(/\s+#.*$/, "").trim().replace(/^"|"$/g, "");
+}
+const { db } = await import("../src/db/index.ts");
+const { users } = await import("../src/db/schema.ts");
+const { eq } = await import("drizzle-orm");
+const { consumeTotp } = await import("../src/lib/totp-db.ts");
+
+const EMAIL = "check-totp-replay@example.invalid";
+await db.delete(users).where(eq(users.email, EMAIL));
+const dbSecret = generateSecret();
+const [row] = await db
+  .insert(users)
+  .values({ name: "Проверка TOTP", email: EMAIL, password: "не-важно", role: "admin", totpSecret: dbSecret })
+  .returning({ id: users.id });
+
+try {
+  const now = totpCode(dbSecret, 0);
+  const results = await Promise.all([
+    consumeTotp(row.id, dbSecret, now),
+    consumeTotp(row.id, dbSecret, now),
+    consumeTotp(row.id, dbSecret, now),
+  ]);
+  check("три одновременных запроса с одним кодом: прошёл ровно один", results.filter(Boolean).length === 1, JSON.stringify(results));
+  check("повтор того же кода позже отвергнут", !(await consumeTotp(row.id, dbSecret, now)));
+  check("код более раннего окна отвергнут", !(await consumeTotp(row.id, dbSecret, totpCode(dbSecret, -1))));
+
+  const [saved] = await db.select({ c: users.totpLastCounter }).from(users).where(eq(users.id, row.id));
+  check("в базе запомнено окно принятого кода", saved.c === totpCounter(), String(saved.c));
+
+  check("код следующего окна проходит", await consumeTotp(row.id, dbSecret, totpCode(dbSecret, 1)));
+  check("неверный код не проходит", !(await consumeTotp(row.id, dbSecret, "12345a")));
+} finally {
+  await db.delete(users).where(eq(users.email, EMAIL));
+}
 
 console.log(failed === 0 ? "\nВсе проверки прошли." : `\nОшибок: ${failed}`);
 process.exitCode = failed === 0 ? 0 : 1;

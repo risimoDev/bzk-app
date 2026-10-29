@@ -6,17 +6,14 @@ import { db } from "@/db";
 import { users } from "@/db/schema";
 import { Container } from "@/components/ui/Container";
 import { PageHero } from "@/components/site/PageHero";
-import {
-  isTelegramConfigured,
-  makeLinkCode,
-  getBotInfo,
-  LINK_CODE_TTL_MINUTES,
-} from "@/lib/telegram";
+import { isTelegramConfigured, getBotInfo } from "@/lib/telegram";
+import { LINK_CODE_TTL_MINUTES } from "@/lib/telegram-link";
 import { TelegramLink } from "@/components/client/TelegramLink";
 import { ProfileForm } from "./ProfileForm";
 import { NotificationsForm } from "./NotificationsForm";
 import { PasswordForm } from "./PasswordForm";
 import { TwoFactorPanel } from "@/components/client/TwoFactorPanel";
+import { SignOutEverywhere } from "@/components/client/SignOutEverywhere";
 
 export const metadata: Metadata = {
   title: "Профиль",
@@ -87,7 +84,6 @@ export default async function ClientSettingsPage() {
                 <h2 className="font-display text-xl text-ink">Телеграм</h2>
                 <div className="mt-4">
                   <TelegramLink
-                    code={makeLinkCode(row.id)}
                     ttlMinutes={LINK_CODE_TTL_MINUTES}
                     botUrl={bot?.username ? `https://t.me/${bot.username}` : null}
                     linked={Boolean(row.telegramChatId)}
@@ -110,7 +106,10 @@ export default async function ClientSettingsPage() {
             {/* Второй фактор - только сотрудникам: за админкой деньги и
                 данные клиентов, за кабинетом клиента - его собственные */}
             {user.role !== "user" && (
-              <div className="rounded-card border border-ink/10 bg-bone/85 p-6 sm:p-7">
+              <div
+                id="two-factor"
+                className="scroll-mt-24 rounded-card border border-ink/10 bg-bone/85 p-6 sm:p-7"
+              >
                 <h2 className="font-display text-xl text-ink">Двухфакторный вход</h2>
                 <div className="mt-4">
                   <TwoFactorPanel
@@ -120,6 +119,18 @@ export default async function ClientSettingsPage() {
                 </div>
               </div>
             )}
+
+            <div className="rounded-card border border-ink/10 bg-bone/85 p-6 sm:p-7">
+              <h2 className="font-display text-xl text-ink">Сессии</h2>
+              <p className="mt-2 text-sm text-ink/55">
+                Потеряли телефон или входили с чужого компьютера - закройте все
+                сессии разом. Войти придётся заново на каждом устройстве.
+                {user.role !== "user" && " Сессия сотрудника в любом случае живёт не дольше недели."}
+              </p>
+              <div className="mt-5">
+                <SignOutEverywhere />
+              </div>
+            </div>
           </div>
         </Container>
       </section>

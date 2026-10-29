@@ -7,7 +7,8 @@ import { users } from "@/db/schema";
 import { redirect } from "next/navigation";
 import { currentUser } from "@/auth";
 import { clientIp } from "@/lib/client-ip";
-import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
+import { checkRateLimit, recordAttempt, clearAttempts, retryAfterText } from "@/lib/rate-limit";
+import { bumpSessionVersion } from "@/lib/sessions-db";
 import { checkPassword } from "@/lib/password-policy";
 import { sendMail, isMailConfigured, escapeHtml } from "@/lib/mail";
 import { sendMessage, esc, isTelegramConfigured } from "@/lib/telegram";
@@ -148,7 +149,14 @@ export async function resetPassword(
   await db.transaction(async (tx) => {
     await tx
       .update(users)
-      .set({ password: hash, resetToken: null, resetTokenExpires: null, passwordChangedAt: new Date() })
+      .set({
+        password: hash,
+        resetToken: null,
+        resetTokenExpires: null,
+        passwordChangedAt: new Date(),
+        // Сброс пароля - обычно «меня взломали»: старые сессии должны умереть
+        sessionVersion: bumpSessionVersion,
+      })
       .where(eq(users.id, target.id));
   });
 
@@ -175,6 +183,15 @@ export async function changePassword(
   const problem = checkNewPassword(password, confirm);
   if (problem) return { fieldErrors: { password: problem } };
 
+  // Лимит - до bcrypt: проверка пароля дорогая, и подбор через эту форму
+  // иначе упирался бы в лимит уже после того, как сделал всю работу.
+  // Ключ свой, не от входа: попытки здесь не должны запирать вход
+  const reauthKey = `reauth:${user.id}`;
+  const limit = await checkRateLimit(reauthKey, "reauth");
+  if (!limit.ok) {
+    return { error: `Слишком много попыток. Попробуйте ${retryAfterText(limit.retryAfter)}` };
+  }
+
   const [row] = await db
     .select({ password: users.password })
     .from(users)
@@ -189,15 +206,12 @@ export async function changePassword(
    * пароль и забрать аккаунт целиком.
    */
   if (!(await bcrypt.compare(current, row.password))) {
-    // Считаем как неудачную попытку входа - подбор через эту форму такой
-    // же подбор, только с другой стороны
-    await recordAttempt(user.email, "login");
-    const limit = await checkRateLimit(user.email, "login");
-    if (!limit.ok) {
-      return { error: `Слишком много попыток. Попробуйте ${retryAfterText(limit.retryAfter)}` };
-    }
+    // Подбор через эту форму - такой же подбор, как на входе, только с
+    // другой стороны
+    await recordAttempt(reauthKey, "reauth");
     return { fieldErrors: { currentPassword: "Текущий пароль неверный" } };
   }
+  await clearAttempts(reauthKey, "reauth");
 
   if (await bcrypt.compare(password, row.password)) {
     return { fieldErrors: { password: "Новый пароль совпадает со старым" } };
@@ -206,7 +220,7 @@ export async function changePassword(
   const hash = await bcrypt.hash(password, 10);
   await db
     .update(users)
-    .set({ password: hash, passwordChangedAt: new Date() })
+    .set({ password: hash, passwordChangedAt: new Date(), sessionVersion: bumpSessionVersion })
     .where(eq(users.id, Number(user.id)));
 
   // Смена пароля отзывает все сессии, включая текущую. Отправляем на вход

@@ -388,6 +388,8 @@ export async function setMainProductImage(
     .set({ isMain: true })
     .where(eq(productImages.id, imageId));
 
+  await audit("product.image.main", { type: "product", id: image.productId }, { imageId });
+
   revalidateProduct(image.productId);
 
   return { ok: true, message: "Главное фото выбрано" };

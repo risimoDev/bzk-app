@@ -1,14 +1,27 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
 import { eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { audit } from "@/lib/audit";
-import { generateSecret, otpauthUrl, verifyTotp } from "@/lib/totp";
+import { generateSecret, otpauthUrl } from "@/lib/totp";
+import { consumeTotp } from "@/lib/totp-db";
+import { bumpSessionVersion } from "@/lib/sessions-db";
+import { checkRateLimit, recordAttempt, clearAttempts, retryAfterText } from "@/lib/rate-limit";
 import { textQrSvg } from "@/lib/payment-qr";
+
+/**
+ * Лимит на повторные подтверждения вошедшего пользователя (код, пароль).
+ * Проверяется до дорогой проверки: после неё он ничего бы не экономил.
+ */
+async function reauthBlocked(userId: number) {
+  const limit = await checkRateLimit(`reauth:${userId}`, "reauth");
+  return limit.ok ? null : `Слишком много попыток. Попробуйте ${retryAfterText(limit.retryAfter)}`;
+}
 
 export type TwoFactorState = {
   ok?: boolean;
@@ -59,7 +72,8 @@ export async function startTwoFactor(
   // прятать в скрытом поле формы, где он был бы виден в разметке
   await db
     .update(users)
-    .set({ totpSecret: secret, totpEnabledAt: null })
+    // Счётчик последнего кода сбрасываем: он относился к прежнему секрету
+    .set({ totpSecret: secret, totpEnabledAt: null, totpLastCounter: null })
     .where(eq(users.id, Number(me.id)));
 
   const qr = await textQrSvg(otpauthUrl(secret, me.email), 180);
@@ -89,10 +103,15 @@ export async function confirmTwoFactor(
   if (!row?.secret) return { error: "Сначала заведите секрет" };
   if (row.enabledAt) return { error: "Второй фактор уже включён" };
 
+  const blocked = await reauthBlocked(Number(me.id));
+  if (blocked) return { error: blocked };
+
   const code = String(formData.get("code") ?? "");
-  if (!verifyTotp(row.secret, code)) {
-    return { error: "Код не подошёл. Проверьте время на телефоне и попробуйте снова" };
+  if (!(await consumeTotp(Number(me.id), row.secret, code))) {
+    await recordAttempt(`reauth:${me.id}`, "reauth");
+    return { error: "Код не подошёл или уже использован. Проверьте время на телефоне и дождитесь нового кода" };
   }
+  await clearAttempts(`reauth:${me.id}`, "reauth");
 
   await db
     .update(users)
@@ -106,8 +125,10 @@ export async function confirmTwoFactor(
 }
 
 /**
- * Отключение. Требует пароль: иначе достаточно оставить открытой чужую
- * вкладку, чтобы снять второй фактор с чужого аккаунта.
+ * Отключение. Требует пароль и действующий код: иначе достаточно оставить
+ * открытой чужую вкладку (или знать пароль), чтобы снять второй фактор с
+ * чужого аккаунта. После отключения все сессии отзываются, включая эту:
+ * человек входит заново уже без кода.
  */
 export async function disableTwoFactor(
   _prev: TwoFactorState,
@@ -116,8 +137,15 @@ export async function disableTwoFactor(
   const me = await currentUser();
   if (!me) return { error: "Нужно войти" };
 
+  const blocked = await reauthBlocked(Number(me.id));
+  if (blocked) return { error: blocked };
+
   const [row] = await db
-    .select({ password: users.password })
+    .select({
+      password: users.password,
+      secret: users.totpSecret,
+      enabledAt: users.totpEnabledAt,
+    })
     .from(users)
     .where(eq(users.id, Number(me.id)))
     .limit(1);
@@ -125,16 +153,34 @@ export async function disableTwoFactor(
 
   const password = String(formData.get("password") ?? "");
   if (!password || !(await bcrypt.compare(password, row.password))) {
+    await recordAttempt(`reauth:${me.id}`, "reauth");
     return { error: "Неверный пароль" };
   }
 
+  if (row.enabledAt && row.secret) {
+    const code = String(formData.get("code") ?? "");
+    if (!(await consumeTotp(Number(me.id), row.secret, code))) {
+      await recordAttempt(`reauth:${me.id}`, "reauth");
+      return { error: "Код не подошёл или уже использован. Дождитесь нового кода в приложении и введите его" };
+    }
+  }
+  await clearAttempts(`reauth:${me.id}`, "reauth");
+
+  // Журнал - до отзыва сессий: audit() узнаёт автора по текущей сессии,
+  // а после отзыва её уже нет
+  await audit("user.totp_disabled", { type: "user", id: Number(me.id) });
+
   await db
     .update(users)
-    .set({ totpSecret: null, totpEnabledAt: null })
+    .set({
+      totpSecret: null,
+      totpEnabledAt: null,
+      totpLastCounter: null,
+      sessionVersion: bumpSessionVersion,
+    })
     .where(eq(users.id, Number(me.id)));
 
-  await audit("user.totp_disabled", { type: "user", id: Number(me.id) });
-  revalidatePath("/client/settings");
-
-  return { ok: true, message: "Второй фактор отключён" };
+  // redirect бросает исключение, поэтому он последний: сессия уже отозвана,
+  // и оставаться на странице, с которой выкинет при следующем переходе, нечего
+  redirect("/login?reason=two-factor-disabled");
 }

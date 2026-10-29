@@ -58,6 +58,8 @@ export async function deleteMessage(
 
   if (removed.length === 0) return { ok: false, message: "Обращение не найдено" };
 
+  await audit("message.delete", { type: "contact_message", id: messageId });
+
   revalidatePath("/admin/inbox");
   return { ok: true, message: "Удалено" };
 }
@@ -95,6 +97,8 @@ export async function setReviewStatus(
 
   if (updated.length === 0) return { ok: false, message: "Отзыв не найден" };
 
+  await audit("review.status", { type: "review", id: reviewId }, { status });
+
   revalidatePath("/admin/inbox");
   return { ok: true, message: "Сохранено" };
 }
@@ -121,6 +125,8 @@ export async function togglePromocode(
     .returning({ code: promocodes.code });
 
   if (updated.length === 0) return { ok: false, message: "Промокод не найден" };
+
+  await audit("promocode.toggle", { type: "promocode", id: promoId }, { active });
 
   revalidatePath("/admin/promocodes");
   return {

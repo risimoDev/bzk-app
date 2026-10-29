@@ -77,6 +77,9 @@ services:
       TOCHKA_API_URL: ${TOCHKA_API_URL}
       TOCHKA_TOKEN: ${TOCHKA_TOKEN}
       TOCHKA_CUSTOMER_CODE: ${TOCHKA_CUSTOMER_CODE}
+      # Секрет маршрута планировщика (POST /api/cron/run). Пустой - маршрут
+      # отвечает 404, напоминания и сроки задач не рассылаются
+      CRON_SECRET: ${CRON_SECRET:-}
       UPLOAD_DIR: /app/storage/uploads
       # Пояс компании: от него зависят календарные даты поставки и готовности
       TZ: Asia/Yekaterinburg
@@ -119,6 +122,25 @@ services:
       # Только чтение: бэкапу незачем уметь портить файлы клиентов
       - uploads:/uploads:ro
     entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+
+  # Планировщик: раз в пять минут зовёт приложение по внутренней сети
+  # (напоминания CRM, сроки задач, уборка журналов). Саму работу делает
+  # приложение, здесь только будильник - см. scripts/cron.sh. Наружу не
+  # смотрит: до app он ходит по имени сервиса, мимо Caddy
+  cron:
+    image: alpine:3.21
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      CRON_URL: http://app:3000/api/cron/run
+      CRON_INTERVAL: ${CRON_INTERVAL:-300}
+      TZ: Asia/Yekaterinburg
+    volumes:
+      - ./scripts/cron.sh:/usr/local/bin/cron.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/cron.sh"]
 
   proxy:
     image: caddy:2-alpine

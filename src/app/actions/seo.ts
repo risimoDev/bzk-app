@@ -5,6 +5,7 @@ import { sql, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { seoSettings } from "@/db/schema";
 import { can } from "@/lib/permissions";
+import { audit } from "@/lib/audit";
 import { SEO_PAGES, type SeoPage } from "@/lib/seo";
 
 export type SeoState = { ok: boolean; message?: string };
@@ -52,6 +53,8 @@ export async function saveSeo(_prev: SeoState, formData: FormData): Promise<SeoS
       },
     });
 
+  await audit("seo.save", { type: "seo_page" }, { page });
+
   revalidatePath("/admin/seo");
   revalidatePath(page);
   return { ok: true, message: `Сохранено для «${SEO_PAGES[page as SeoPage]}»` };
@@ -66,6 +69,8 @@ export async function clearSeo(_prev: SeoState, formData: FormData): Promise<Seo
   if (!(page in SEO_PAGES)) return { ok: false, message: "Неизвестная страница" };
 
   await db.delete(seoSettings).where(eq(seoSettings.page, page));
+
+  await audit("seo.clear", { type: "seo_page" }, { page });
 
   revalidatePath("/admin/seo");
   revalidatePath(page);

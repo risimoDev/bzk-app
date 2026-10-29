@@ -3,9 +3,12 @@
 import { revalidatePath } from "next/cache";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { tasks, taskComments, users } from "@/db/schema";
+import { tasks, taskComments } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
+import { audit } from "@/lib/audit";
+import { isActiveStaff } from "@/lib/staff-db";
+import { parseId } from "@/lib/ids";
 import { TASK_STATUS, TASK_PRIORITY, type TaskStatus, type TaskPriority } from "@/lib/tasks";
 
 export type TaskState = { ok: boolean; message?: string };
@@ -22,7 +25,10 @@ export async function createTask(_prev: TaskState, formData: FormData): Promise<
   const priority = (rawPriority in TASK_PRIORITY ? rawPriority : "medium") as TaskPriority;
 
   const rawAssignee = String(formData.get("assignedTo") ?? "").trim();
-  const assignedTo = rawAssignee === "" ? null : Number(rawAssignee);
+  const assignedTo = rawAssignee === "" ? null : parseId(rawAssignee);
+  if (rawAssignee !== "" && assignedTo === null) {
+    return { ok: false, message: "Исполнитель не найден" };
+  }
 
   const rawDue = String(formData.get("dueDate") ?? "").trim();
 
@@ -38,14 +44,10 @@ export async function createTask(_prev: TaskState, formData: FormData): Promise<
     return { ok: false, message: "Опишите задачу или добавьте хотя бы один пункт" };
   }
 
-  if (assignedTo !== null) {
-    if (!Number.isInteger(assignedTo)) return { ok: false, message: "Исполнитель не найден" };
-    const [staff] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, assignedTo))
-      .limit(1);
-    if (!staff) return { ok: false, message: "Исполнитель не найден" };
+  // Исполнитель - только действующий сотрудник: id клиента в форму
+  // подставить можно, и задача иначе оказалась бы у него
+  if (assignedTo !== null && !(await isActiveStaff(assignedTo))) {
+    return { ok: false, message: "Исполнитель не найден" };
   }
 
   if (rawDue !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(rawDue)) {
@@ -56,15 +58,20 @@ export async function createTask(_prev: TaskState, formData: FormData): Promise<
   // съехала при любом пересчёте часового пояса
   const dueDate = rawDue === "" ? null : new Date(`${rawDue}T12:00:00`);
 
-  await db.insert(tasks).values({
-    title,
-    description: description || null,
-    taskItems: items.length > 0 ? items : null,
-    assignedTo,
-    createdBy: Number(user.id),
-    priority,
-    dueDate,
-  });
+  const [created] = await db
+    .insert(tasks)
+    .values({
+      title,
+      description: description || null,
+      taskItems: items.length > 0 ? items : null,
+      assignedTo,
+      createdBy: Number(user.id),
+      priority,
+      dueDate,
+    })
+    .returning({ id: tasks.id });
+
+  await audit("task.create", { type: "task", id: created.id }, { assignedTo });
 
   revalidatePath("/admin/tasks");
   return { ok: true, message: "Задача создана" };
@@ -90,6 +97,8 @@ export async function setTaskStatus(
 
   if (updated.length === 0) return { ok: false, message: "Задача не найдена" };
 
+  await audit("task.status", { type: "task", id: taskId }, { status: raw });
+
   revalidatePath("/admin/tasks");
   return { ok: true, message: TASK_STATUS[raw as TaskStatus].label };
 }
@@ -99,18 +108,15 @@ export async function assignTask(_prev: TaskState, formData: FormData): Promise<
 
   const taskId = Number(formData.get("taskId"));
   const raw = String(formData.get("assignedTo") ?? "").trim();
-  const assignedTo = raw === "" ? null : Number(raw);
+  const assignedTo = raw === "" ? null : parseId(raw);
 
   if (!Number.isInteger(taskId)) return { ok: false, message: "Задача не найдена" };
+  if (raw !== "" && assignedTo === null) return { ok: false, message: "Исполнитель не найден" };
 
-  if (assignedTo !== null) {
-    if (!Number.isInteger(assignedTo)) return { ok: false, message: "Исполнитель не найден" };
-    const [staff] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, assignedTo))
-      .limit(1);
-    if (!staff) return { ok: false, message: "Исполнитель не найден" };
+  // Исполнитель - только действующий сотрудник: id клиента в форму
+  // подставить можно, и задача иначе оказалась бы у него
+  if (assignedTo !== null && !(await isActiveStaff(assignedTo))) {
+    return { ok: false, message: "Исполнитель не найден" };
   }
 
   const updated = await db
@@ -120,6 +126,8 @@ export async function assignTask(_prev: TaskState, formData: FormData): Promise<
     .returning({ id: tasks.id });
 
   if (updated.length === 0) return { ok: false, message: "Задача не найдена" };
+
+  await audit("task.assign", { type: "task", id: taskId }, { assignedTo });
 
   revalidatePath("/admin/tasks");
   return { ok: true, message: assignedTo ? "Исполнитель назначен" : "Исполнитель снят" };
@@ -167,6 +175,8 @@ export async function deleteTask(_prev: TaskState, formData: FormData): Promise<
     .returning({ id: tasks.id });
 
   if (removed.length === 0) return { ok: false, message: "Задача не найдена" };
+
+  await audit("task.delete", { type: "task", id: taskId });
 
   revalidatePath("/admin/tasks");
   return { ok: true, message: "Задача удалена" };

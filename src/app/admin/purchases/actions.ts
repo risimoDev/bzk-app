@@ -99,7 +99,7 @@ export async function setPurchaseStatus(formData: FormData) {
 
   // Уже принятую закупку не откатываем: материалы на складе, и смена
   // статуса создала бы расхождение между закупкой и остатками
-  await db
+  const changed = await db
     .update(purchaseOrders)
     .set({ status: status as PurchaseStatus })
     .where(
@@ -107,7 +107,12 @@ export async function setPurchaseStatus(formData: FormData) {
         eq(purchaseOrders.id, id),
         sql`${purchaseOrders.status} NOT IN ('received', 'partially_received')`,
       ),
-    );
+    )
+    .returning({ id: purchaseOrders.id });
+
+  if (changed.length > 0) {
+    await audit("purchase.status", { type: "purchase_order", id }, { status });
+  }
 
   revalidatePath("/admin/purchases");
 }

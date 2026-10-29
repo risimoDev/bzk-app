@@ -10,6 +10,15 @@ export function resolve(specifier, context, next) {
     // в скрипте он ничего не делает
     return { url: "data:text/javascript,export {}", shortCircuit: true };
   }
+  if (specifier === "next/server") {
+    // Голый node не находит `next/server` без расширения. В скрипте
+    // запроса нет, и настоящий `after` бросил бы то же самое исключение:
+    // lib/notify-after.ts в этом случае просто запускает задачу сразу
+    return {
+      url: "data:text/javascript,export function after(){throw new Error('after вне запроса')}",
+      shortCircuit: true,
+    };
+  }
   if (specifier.startsWith("@/")) {
     // В коде приложения импорты без расширения - их дописывает сборщик.
     // Здесь дописываем сами, иначе node не найдёт файл. Пробуем сначала

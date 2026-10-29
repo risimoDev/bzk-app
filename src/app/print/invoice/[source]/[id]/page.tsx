@@ -116,8 +116,10 @@ export default async function InvoicePrintPage({ params }: PageProps<"/print/inv
       <PrintBar
         title={`Счёт № ${doc.documentNumber}`}
         backHref={backHref}
-        warning={warnings.length > 0 ? warnings.join(" ") : undefined}
-        settingsHref="/admin/settings/company"
+        // Про пустые реквизиты и ссылку в настройки знает только сотрудник:
+        // клиенту это не нужно, а ссылка на админку выдаёт её устройство
+        warning={access.isStaff && warnings.length > 0 ? warnings.join(" ") : undefined}
+        settingsHref={access.isStaff ? "/admin/settings/company" : undefined}
       />
 
       <article className="doc doc--portrait">

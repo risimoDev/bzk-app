@@ -90,3 +90,24 @@ export function pickAttributeValues(
 
   return [...picked.values()].sort((a, b) => a - b);
 }
+
+/**
+ * Цена «от» для витрины: за единицу при минимальном тираже.
+ *
+ * Раньше витрина показывала `base_price` как есть, а реальная цена при
+ * заказе берётся из ступени тиража: у товара с базовой ценой 15 ₽ и
+ * ступенью «от 100 шт. - 4 ₽» на карточке красовалось 15, в корзине
+ * выходило 4. Считаем той же `unitPriceFor`, что и корзина, на минимальном
+ * тираже, округлённом до кратности, - тогда «от» совпадает с первой
+ * строкой корзины.
+ */
+export function fromUnitPrice(input: {
+  basePrice: string | number;
+  tiers: PriceTier[];
+  minQuantity: number;
+  multiplicity: number;
+}) {
+  const quantity = normalizeQuantity(input.minQuantity, input.minQuantity, input.multiplicity);
+  const tiers = [...input.tiers].sort((a, b) => a.minQty - b.minQty);
+  return unitPriceFor({ basePrice: input.basePrice, tiers, quantity });
+}

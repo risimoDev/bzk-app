@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { products, categories } from "@/db/schema";
 import { catalogImages } from "@/lib/product-images-db";
 import { catalogImageUrl } from "@/lib/product-images";
+import { fromPrices } from "@/lib/catalog-price-db";
 
 /**
  * Карточки товаров по списку id: GET /api/products?ids=1,2,3
@@ -35,6 +36,8 @@ export async function GET(request: Request) {
       name: products.name,
       description: products.description,
       basePrice: products.basePrice,
+      minQuantity: products.minQuantity,
+      multiplicity: products.multiplicity,
       unit: products.unit,
       categoryName: categories.name,
       logoUrl: image.logoUrl,
@@ -46,10 +49,17 @@ export async function GET(request: Request) {
     .where(and(inArray(products.id, ids), eq(products.isHidden, false)));
 
   // Наружу отдаём одну готовую ссылку: избранное на клиенте не должно
-  // знать, чем логотип отличается от фотографии
-  const items = rows.map(({ logoUrl, photoUrl, ...rest }) => ({
-    ...rest,
-    imageUrl: catalogImageUrl({ logoUrl, photoUrl }),
+  // знать, чем логотип отличается от фотографии. Цена - «от»: за единицу
+  // при минимальном тираже, как в каталоге, а не базовая
+  const prices = await fromPrices(rows);
+  const items = rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    unit: r.unit,
+    categoryName: r.categoryName,
+    fromPrice: prices.get(r.id) ?? null,
+    imageUrl: catalogImageUrl({ logoUrl: r.logoUrl, photoUrl: r.photoUrl }),
   }));
 
   return NextResponse.json({ items });

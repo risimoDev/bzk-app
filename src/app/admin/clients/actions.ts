@@ -1,10 +1,12 @@
 "use server";
 
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { can } from "@/lib/permissions";
+import { audit } from "@/lib/audit";
+import { parseId } from "@/lib/ids";
 import { currentUser } from "@/auth";
 import { sendMail, isMailConfigured, escapeHtml } from "@/lib/mail";
 import { sendMessage, esc, isTelegramConfigured } from "@/lib/telegram";
@@ -18,24 +20,71 @@ import {
 export type ClientActionState = { ok: boolean; message?: string };
 
 /**
+ * Над кем можно совершить действие.
+ *
+ * Права `users.manage` есть и у менеджера, но учётную запись
+ * администратора он трогать не должен: заблокировав или сменив ей доступ,
+ * он отрезал бы того, кто выдаёт права. Поэтому действия над админом -
+ * только у админа. Не экспортируется: из файла «use server» наружу
+ * уходят одни действия, а эта проверка стала бы ещё одним эндпоинтом.
+ */
+async function loadTarget(id: number) {
+  const me = await currentUser();
+  if (!me) return { error: "Нет прав" } as const;
+
+  const [target] = await db
+    .select({
+      id: users.id,
+      name: users.name,
+      email: users.email,
+      role: users.role,
+      chatId: users.telegramChatId,
+      isBlocked: users.isBlocked,
+    })
+    .from(users)
+    .where(eq(users.id, id))
+    .limit(1);
+
+  if (!target) return { error: "Клиент не найден" } as const;
+
+  if (target.role === "admin" && me.role !== "admin") {
+    return { error: "Действия над администратором доступны только администратору" } as const;
+  }
+
+  return { me, target, self: Number(me.id) === target.id } as const;
+}
+
+/**
  * Блокировка клиента.
  *
  * Сессия отзывается сама: колбэк session сверяется с базой при каждом
  * чтении, поэтому заблокированного выкидывает на ближайшем же запросе,
- * а не через 30 дней, когда истечёт токен.
+ * а не через 30 дней, когда истечёт токен. Счётчик версии сессии растёт в
+ * том же UPDATE: токен, выданный до блокировки, после разблокировки
+ * оживать не должен.
  */
 export async function setBlocked(formData: FormData) {
   if (!(await can("users", "manage"))) return;
 
-  const id = Number(formData.get("userId"));
+  const id = parseId(formData.get("userId"));
   const blocked = formData.get("blocked") === "1";
-  if (!Number.isInteger(id) || id <= 0) return;
+  if (id === null) return;
+
+  const t = await loadTarget(id);
+  if ("error" in t) return;
 
   // Заблокировать самого себя - верный способ потерять доступ в админку
-  const me = await currentUser();
-  if (me && Number(me.id) === id) return;
+  if (t.self) return;
 
-  await db.update(users).set({ isBlocked: blocked }).where(eq(users.id, id));
+  await db
+    .update(users)
+    .set({
+      isBlocked: blocked,
+      ...(blocked ? { sessionVersion: sql`${users.sessionVersion} + 1` } : {}),
+    })
+    .where(eq(users.id, id));
+
+  await audit(blocked ? "user.block" : "user.unblock", { type: "user", id }, { role: t.target.role });
 
   revalidatePath(`/admin/clients/${id}`);
   revalidatePath("/admin/clients");
@@ -45,14 +94,19 @@ export async function setBlocked(formData: FormData) {
 export async function setEditorAccess(formData: FormData) {
   if (!(await can("users", "manage"))) return;
 
-  const id = Number(formData.get("userId"));
+  const id = parseId(formData.get("userId"));
   const allowed = formData.get("allowed") === "1";
-  if (!Number.isInteger(id) || id <= 0) return;
+  if (id === null) return;
+
+  const t = await loadTarget(id);
+  if ("error" in t) return;
 
   await db
     .update(users)
     .set({ canUseEditor: allowed })
     .where(eq(users.id, id));
+
+  await audit("user.editor_access", { type: "user", id }, { allowed });
 
   revalidatePath(`/admin/clients/${id}`);
   revalidatePath("/admin/clients");
@@ -62,14 +116,19 @@ export async function setEditorAccess(formData: FormData) {
 export async function setWarehouseAccess(formData: FormData) {
   if (!(await can("users", "manage"))) return;
 
-  const id = Number(formData.get("userId"));
+  const id = parseId(formData.get("userId"));
   const allowed = formData.get("allowed") === "1";
-  if (!Number.isInteger(id) || id <= 0) return;
+  if (id === null) return;
+
+  const t = await loadTarget(id);
+  if ("error" in t) return;
 
   await db
     .update(users)
     .set({ miniWarehouseEnabled: allowed })
     .where(eq(users.id, id));
+
+  await audit("user.warehouse_access", { type: "user", id }, { allowed });
 
   revalidatePath(`/admin/clients/${id}`);
   revalidatePath("/admin/clients");
@@ -90,22 +149,13 @@ export async function sendResetLink(
     return { ok: false, message: "Нет прав" };
   }
 
-  const id = Number(formData.get("userId"));
-  if (!Number.isInteger(id) || id <= 0) return { ok: false, message: "Клиент не найден" };
+  const id = parseId(formData.get("userId"));
+  if (id === null) return { ok: false, message: "Клиент не найден" };
 
-  const [client] = await db
-    .select({
-      id: users.id,
-      name: users.name,
-      email: users.email,
-      chatId: users.telegramChatId,
-      isBlocked: users.isBlocked,
-    })
-    .from(users)
-    .where(eq(users.id, id))
-    .limit(1);
+  const t = await loadTarget(id);
+  if ("error" in t) return { ok: false, message: t.error };
 
-  if (!client) return { ok: false, message: "Клиент не найден" };
+  const client = t.target;
   if (client.isBlocked) {
     return { ok: false, message: "Клиент заблокирован - сначала разблокируйте" };
   }
@@ -143,6 +193,9 @@ export async function sendResetLink(
       message: "Отправить не удалось: телеграм не привязан, почта не настроена",
     };
   }
+
+  // Сам токен в журнал не пишем - только факт и способ доставки
+  await audit("user.reset_link", { type: "user", id }, { channel: sent });
 
   revalidatePath(`/admin/clients/${id}`);
   return { ok: true, message: `Ссылка отправлена ${sent}` };

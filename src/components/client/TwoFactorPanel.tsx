@@ -56,6 +56,20 @@ export function TwoFactorPanel({
               className={inputClass}
             />
           </label>
+          <label className="flex flex-col gap-1.5">
+            <span className={labelClass}>КОД ИЗ ПРИЛОЖЕНИЯ</span>
+            <input
+              name="code"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={6}
+              placeholder="123456"
+              className={cn(inputClass, "w-32 font-mono")}
+            />
+          </label>
+          <p className="text-xs text-ink/45">
+            После отключения придётся войти заново на всех устройствах.
+          </p>
           <button
             type="submit"
             disabled={disabling}

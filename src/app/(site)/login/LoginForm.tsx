@@ -27,6 +27,9 @@ export function LoginForm() {
   // После смены пароля в кабинете сессии сбрасываются, и человек попадает
   // сюда. Скажем прямо, почему пришлось войти заново.
   const passwordChanged = params.get("reason") === "password-changed";
+  const reason = params.get("reason");
+  const signedOutEverywhere = reason === "signed-out-everywhere";
+  const twoFactorDisabled = reason === "two-factor-disabled";
 
   return (
     <form
@@ -54,6 +57,17 @@ export function LoginForm() {
         >
           Пароль изменён. Войдите с новым паролем - на других устройствах вход
           тоже потребуется заново.
+        </p>
+      )}
+
+      {(signedOutEverywhere || twoFactorDisabled) && !state.error && (
+        <p
+          role="status"
+          className="rounded-xl bg-ok/10 px-4 py-3 text-sm text-ok"
+        >
+          {signedOutEverywhere
+            ? "Вы вышли со всех устройств. Чтобы продолжить, войдите снова."
+            : "Второй фактор отключён. Все сессии закрыты - войдите снова, код уже не спросим."}
         </p>
       )}
 
