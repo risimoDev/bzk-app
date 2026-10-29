@@ -16,6 +16,10 @@ services:
     build:
       context: .
       target: builder
+      args:
+        SITE_DOMAIN: ${SITE_DOMAIN:-}
+        NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
+        NODE_BUILD_MEMORY: ${NODE_BUILD_MEMORY:-2048}
     profiles: ["tools"]
     depends_on:
       db:

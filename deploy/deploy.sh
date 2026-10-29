@@ -136,9 +136,9 @@ if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
 fi
 success "База данных готова к работе."
 
-# 5. Сборка нового образа приложения
-log "Сборка Docker-образа приложения (Next.js 16 standalone)..."
-docker compose build --pull app
+# 5. Сборка образов приложения и служебного контейнера
+log "Сборка Docker-образов приложения (app) и служебного контейнера (tools)..."
+docker compose -f docker-compose.yml -f deploy/compose.tools.yml build --pull app tools
 
 # 5a. Проверка данных перед схемой: уникальный номер документа
 # push добавит уникальный индекс на documents.document_number. Если в базе
