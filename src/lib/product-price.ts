@@ -55,6 +55,27 @@ export function normalizeQuantity(raw: number, minQuantity: number, multiplicity
 export type AttributeChoice = { valueId: number; attributeId: number };
 
 /**
+ * Надбавка исполнения по умолчанию: по первому значению (с меньшим id)
+ * каждой характеристики - ровно то, что выбрано в форме товара, пока
+ * человек ничего не трогал. Карточка каталога считает цену с ней, чтобы
+ * сумма на карточке совпала с суммой в форме и в корзине.
+ */
+export function defaultSurcharge(
+  options: readonly { attributeId: number; valueId: number; priceModifier: string | number | null }[],
+): number {
+  const first = new Map<number, { valueId: number; modifier: number }>();
+  for (const o of options) {
+    const cur = first.get(o.attributeId);
+    if (!cur || o.valueId < cur.valueId) {
+      first.set(o.attributeId, { valueId: o.valueId, modifier: Number(o.priceModifier ?? 0) });
+    }
+  }
+  let sum = 0;
+  for (const f of first.values()) sum += f.modifier;
+  return Math.round(sum * 100) / 100;
+}
+
+/**
  * Набор характеристик позиции: ровно одно значение на каждую
  * характеристику товара.
  *
@@ -106,8 +127,10 @@ export function fromUnitPrice(input: {
   tiers: PriceTier[];
   minQuantity: number;
   multiplicity: number;
+  /** Надбавка исполнения по умолчанию (см. defaultSurcharge). */
+  surcharge?: number;
 }) {
   const quantity = normalizeQuantity(input.minQuantity, input.minQuantity, input.multiplicity);
   const tiers = [...input.tiers].sort((a, b) => a.minQty - b.minQty);
-  return unitPriceFor({ basePrice: input.basePrice, tiers, quantity });
+  return unitPriceFor({ basePrice: input.basePrice, tiers, quantity, surcharge: input.surcharge });
 }

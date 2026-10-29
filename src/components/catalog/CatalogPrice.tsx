@@ -33,12 +33,15 @@ export function CatalogPrice({
   tiers,
   minQuantity,
   multiplicity,
+  surcharge = 0,
 }: {
   unit: string;
   basePrice: string | null;
   tiers: PriceTier[];
   minQuantity: number;
   multiplicity: number;
+  /** Надбавка исполнения по умолчанию - та, что выбрана в форме товара. */
+  surcharge?: number;
 }) {
   const options = useMemo(
     () =>
@@ -47,9 +50,10 @@ export function CatalogPrice({
         tiers,
         minQuantity,
         multiplicity,
+        surcharge,
         limit: 3,
       }),
-    [basePrice, tiers, minQuantity, multiplicity],
+    [basePrice, tiers, minQuantity, multiplicity, surcharge],
   );
   const [index, setIndex] = useState(0);
   const current = options[Math.min(index, options.length - 1)];

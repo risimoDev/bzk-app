@@ -12,6 +12,8 @@ const money = new Intl.NumberFormat("ru-RU", {
  *
  * Только напоминание менеджеру: заказ оно не блокирует и клиенту ничего
  * не отправляет. Без `href` (нет права смотреть финансы) - просто текст.
+ * Сумма `sum` - финансовые данные: тем, у кого нет права finance.view, её
+ * не передают вовсе, и тогда показывается только факт долга.
  * Компонент без хуков: его можно ставить и в серверную страницу, и в
  * клиентскую форму.
  */
@@ -20,7 +22,7 @@ export function DebtWarning({
   href,
   className,
 }: {
-  info: { n: number; sum: number } | null | undefined;
+  info: { n: number; sum?: number } | null | undefined;
   href?: string;
   className?: string;
 }) {
@@ -33,8 +35,12 @@ export function DebtWarning({
     >
       <TriangleAlert className="mt-0.5 size-4 shrink-0 text-warn" aria-hidden />
       <p>
-        Есть неоплаченные заказы старше 15 дней на сумму{" "}
-        <b className="font-mono tabular-nums">{money.format(info.sum)}</b>
+        Есть неоплаченные заказы старше 15 дней
+        {info.sum !== undefined && (
+          <>
+            {" "}на сумму <b className="font-mono tabular-nums">{money.format(info.sum)}</b>
+          </>
+        )}
         {info.n > 1 ? ` (заказов: ${info.n})` : ""}.{" "}
         {href && (
           <Link href={href} className="text-brand underline underline-offset-2 hover:text-brand-bright">

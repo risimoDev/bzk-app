@@ -206,7 +206,9 @@ export function InnLookup({
         </button>
       </div>
 
-      <div aria-live="polite" className="contents">
+      {/* Обычный блок, а не display: contents: у такого элемента aria-live
+          теряется в части браузеров. Пустой прячем, чтобы не занимал gap. */}
+      <div aria-live="polite" className="flex flex-col gap-3 empty:hidden">
         {error && (
           <p className="flex items-start gap-2 text-sm text-danger" role="status">
             <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden />

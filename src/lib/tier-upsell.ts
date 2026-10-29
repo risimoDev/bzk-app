@@ -103,17 +103,20 @@ export type CatalogTierOption = {
  * Если вариантов больше лимита, берутся первый, последний и средний -
  * так человек видит весь размах цен.
  *
- * Цены - без надбавок характеристик: в каталоге характеристики ещё не
- * выбраны, там, как и в «от», показывается цена базового исполнения.
+ * `surcharge` - надбавка исполнения по умолчанию (первое значение каждой
+ * характеристики, `defaultSurcharge`): форма товара выбирает именно его,
+ * и сумма на карточке должна совпасть с суммой в форме и в корзине.
  */
 export function catalogTierOptions(input: {
   basePrice: string | number;
   tiers: PriceTier[];
   minQuantity: number;
   multiplicity: number;
+  surcharge?: number;
   limit?: number;
 }): CatalogTierOption[] {
   const { basePrice, minQuantity, multiplicity } = input;
+  const surcharge = input.surcharge ?? 0;
   const limit = Math.max(1, input.limit ?? 3);
   const tiers = [...input.tiers].sort((a, b) => a.minQty - b.minQty);
 
@@ -124,7 +127,7 @@ export function catalogTierOptions(input: {
 
   const kept: CatalogTierOption[] = [];
   for (const quantity of [...new Set(quantities)].sort((a, b) => a - b)) {
-    const unitPrice = unitPriceFor({ basePrice, tiers, quantity });
+    const unitPrice = unitPriceFor({ basePrice, tiers, quantity, surcharge });
     const last = kept.at(-1);
     if (last && !(unitPrice < last.unitPrice)) continue;
     kept.push({ quantity, unitPrice, total: round2(unitPrice * quantity) });

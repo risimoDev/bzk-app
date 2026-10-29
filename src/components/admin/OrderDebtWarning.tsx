@@ -8,8 +8,8 @@ import { overdueDebtOf, partyKeyForExternal, partyKeyForUser } from "@/lib/debts
  *
  * Самодостаточный серверный компонент: сам определяет плательщика (аккаунт
  * сайта, контрагент или имя из заказа менеджера), сам читает долг и сам
- * решает, давать ли ссылку на страницу долгов (нужно право смотреть
- * финансы). В карточку заказа достаточно поставить одну строку. Ничего не
+ * решает, давать ли ссылку на страницу долгов и показывать ли сумму (нужно
+ * право смотреть финансы; без него - только факт долга). В карточку заказа достаточно поставить одну строку. Ничего не
  * блокирует и клиенту ничего не отправляет.
  */
 export async function OrderDebtWarning(
@@ -29,5 +29,11 @@ export async function OrderDebtWarning(
   if (!info) return null;
 
   const canFinance = await can("finance", "view");
-  return <DebtWarning info={info} href={canFinance ? partyHref(partyKey) : undefined} className="mb-5" />;
+  return (
+    <DebtWarning
+      info={canFinance ? info : { n: info.n }}
+      href={canFinance ? partyHref(partyKey) : undefined}
+      className="mb-5"
+    />
+  );
 }

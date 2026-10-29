@@ -6,7 +6,7 @@ import { ReconciliationForm } from "@/components/admin/ReconciliationForm";
 import { can } from "@/lib/permissions";
 import { cn } from "@/lib/cn";
 import { statusOf } from "@/lib/order-status";
-import { loadDebtOrders, groupDebtors } from "@/lib/debts-db";
+import { loadDebtOrders, groupDebtors, debtsOfParty } from "@/lib/debts-db";
 import { DEBT_BUCKETS, bucketTotals, debtBucket, defaultActPeriod, parsePartyKey, type DebtBucketKey } from "@/lib/debts";
 import { REPORT_TZ } from "@/lib/analytics";
 import { round2 } from "@/lib/order-money";
@@ -56,10 +56,8 @@ export default async function AdminDebts(props: PageProps<"/admin/finance/debts"
   const partyKey = rawParty && parsePartyKey(rawParty) ? rawParty : null;
 
   const now = new Date();
-  const [all, shown] = await Promise.all([
-    loadDebtOrders({ now }),
-    partyKey ? loadDebtOrders({ now, partyKey }) : Promise.resolve(null),
-  ]);
+  const all = await loadDebtOrders({ now });
+  const shown = partyKey ? await debtsOfParty(all, partyKey) : null;
 
   // Сводка всегда по всем должникам: фильтр по одному плательщику
   // не должен выдавать его долг за общий

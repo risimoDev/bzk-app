@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useTransition } from "react";
+import { useActionState, useState, useTransition } from "react";
 import { Check, Send } from "lucide-react";
 import {
   markContractorTaskSent,
@@ -18,8 +18,11 @@ const initial: OrderFormState = {};
 
 /**
  * Статус работы подрядчика на позиции. Меняется сразу при выборе - как
- * производственный статус заказа, отдельной кнопки нет. Форму собираем
- * руками: поле не сбрасывается, а ошибка остаётся рядом со строкой.
+ * производственный статус заказа, отдельной кнопки нет. Список управляемый:
+ * выбранное значение показывается сразу, а если сервер отказал (переход
+ * не разрешён, права, сбой), возвращается прежнее - иначе на экране
+ * остался бы статус, которого в базе нет. Поле не сбрасывается, ошибка
+ * остаётся рядом со строкой.
  */
 export function ContractorStatusSelect({
   orderId,
@@ -30,24 +33,42 @@ export function ContractorStatusSelect({
   itemId: number;
   status: ContractorStatus;
 }) {
-  const [state, action] = useActionState(setContractorStatus, initial);
+  const [value, setValue] = useState<string>(status);
+  const [seenStatus, setSeenStatus] = useState(status);
+  const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
+  // Статус пришёл из базы заново (обновление страницы) - берём его
+  if (seenStatus !== status) {
+    setSeenStatus(status);
+    setValue(status);
+  }
+
   const change = (to: string) => {
+    setValue(to);
+    setError(null);
     const fd = new FormData();
     fd.set("orderId", String(orderId));
     fd.set("itemId", String(itemId));
     fd.set("contractorStatus", to);
-    startTransition(() => action(fd));
+    startTransition(async () => {
+      let result: OrderFormState;
+      try {
+        result = await setContractorStatus(initial, fd);
+      } catch {
+        result = { error: "Не удалось сохранить статус. Попробуйте ещё раз." };
+      }
+      if (result.error) {
+        setValue(status);
+        setError(result.error);
+      }
+    });
   };
 
   return (
     <span className="flex flex-col items-end gap-1">
-      {/* Список пересоздаётся при смене статуса: иначе после перезагрузки
-          данных он показывал бы прежнее значение */}
       <select
-        key={status}
-        defaultValue={status}
+        value={value}
         disabled={pending}
         onChange={(e) => change(e.target.value)}
         aria-label="Статус работы подрядчика"
@@ -60,7 +81,11 @@ export function ContractorStatusSelect({
           </option>
         ))}
       </select>
-      {state.error && <span className="text-xs text-danger">{state.error}</span>}
+      {error && (
+        <span role="alert" className="text-xs text-danger">
+          {error}
+        </span>
+      )}
     </span>
   );
 }

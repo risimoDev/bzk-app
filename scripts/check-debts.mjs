@@ -114,6 +114,9 @@ check("чужое действие и кривые данные - не стат�
 const due = (o = {}) => ({ debt: 100, ageDays: 6, approximate: false, taskAt: null, ...o });
 check("шесть дней, точная дата - задача нужна", d.isDebtTaskDue(due()));
 check("пять дней - рано", !d.isDebtTaskDue(due({ ageDays: 5 })));
+check("окно задачи - 6...14 дней", d.DEBT_TASK_MAX_AGE_DAYS === 14 && d.isDebtTaskDue(due({ ageDays: 14 })));
+check("15 дней - уже поздно, только страница долгов", !d.isDebtTaskDue(due({ ageDays: 15 })));
+check("30 дней с точной датой - задачу не заводим", !d.isDebtTaskDue(due({ ageDays: 30 })));
 check("уже заводили - второй раз нет", !d.isDebtTaskDue(due({ taskAt: new Date() })));
 check("приблизительная дата - задачу не заводим", !d.isDebtTaskDue(due({ approximate: true, ageDays: 300 })));
 check("не готов (возраста нет) - не заводим", !d.isDebtTaskDue(due({ ageDays: null })));
@@ -190,6 +193,18 @@ check("карточка заказа менеджера показывает п�
 check("форма нового заказа менеджера показывает предупреждение", read("src/app/admin/external-orders/new/OrderForm.tsx").includes("<DebtWarning"));
 check("страница долгов и акт требуют право смотреть финансы", /can\("finance", "view"\)/.test(read("src/app/admin/finance/debts/page.tsx")) && /can\("finance", "view"\)/.test(read("src/app/print/reconciliation/page.tsx")));
 check("пункт «Долги» есть в меню", read("src/components/admin/AdminNav.tsx").includes('"/admin/finance/debts"'));
+check(
+  "сумма долга в предупреждении - только с finance.view",
+  /canFinance \? info : \{ n: info\.n \}/.test(read("src/components/admin/OrderDebtWarning.tsx")),
+);
+{
+  const page = read("src/app/admin/external-orders/new/page.tsx");
+  check(
+    "в форму нового заказа суммы долгов без finance.view не передаются",
+    /canFinance\s*\?\s*allDebts[\s\S]*\{ n: w\.n \}/.test(page) && /debtWarnings=\{debtWarnings\}/.test(page),
+  );
+}
+check("страница долгов читает долги один раз", (read("src/app/admin/finance/debts/page.tsx").match(/loadDebtOrders\(/g) ?? []).length === 1);
 check("предупреждение ничего не блокирует: в действиях создания заказа долгов нет", !/debts/.test(read("src/app/actions/external-orders.ts")));
 
 // ---------------------------------------------------------- с базой

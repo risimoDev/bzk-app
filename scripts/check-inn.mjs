@@ -132,7 +132,21 @@ check("неизвестный статус не берётся из протот
 delete dead.suggestions[0].data.state;
 check("без статуса - unknown", parseParty(dead)?.status === "unknown");
 
-check("пустой список - null", parseParty({ suggestions: [] }) === null);
+// По одному ИНН приходит несколько записей: закрытая запись не должна
+// перекрыть действующую, даже если стоит первой
+const mixed = structuredClone(legal);
+mixed.suggestions[0].data.state.status = "LIQUIDATED";
+mixed.suggestions[1] = structuredClone(legal.suggestions[0]);
+mixed.suggestions[1].data.kpp = "590243001";
+check(
+  "несколько записей: берётся первая действующая, а не первая по порядку",
+  parseParty(mixed)?.status === "active" && parseParty(mixed)?.kpp === "590243001",
+);
+const allDead = structuredClone(mixed);
+allDead.suggestions[1].data.state.status = "LIQUIDATED";
+check("несколько записей, действующих нет: первая подходящая", parseParty(allDead)?.kpp === "590201001");
+
+check("пустой список - null",parseParty({ suggestions: [] }) === null);
 check("мусор вместо тела - null", [null, undefined, 5, "x", [], {}, { suggestions: "a" }].every((b) => parseParty(b) === null));
 check("запись без ИНН пропускается", parseParty({ suggestions: [{ value: "x", data: { inn: "abc", name: { short_with_opf: "x" } } }] }) === null);
 check("пропускает негодную запись и берёт следующую", parseParty({ suggestions: [{ data: null }, ...legal.suggestions] })?.inn === "5902000000");

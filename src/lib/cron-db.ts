@@ -18,6 +18,7 @@ import { LIMITS, checkRateLimit, recordAttempt } from "@/lib/rate-limit";
 import { TIMEZONE } from "@/lib/dates";
 import { DEBT_TASK_DUE_DAYS, isDebtTaskDue } from "@/lib/debts";
 import { loadDebtOrders } from "@/lib/debts-db";
+import { MONEY_EPS } from "@/lib/order-money";
 import {
   BATCH_LIMIT,
   TASK_FINISHED,
@@ -226,10 +227,11 @@ const dayFmt = new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digi
  *
  * Исполнитель - ответственный за заказ, если он действующий сотрудник
  * (назначенный в чате, запустивший в цех или последним работавший с
- * заказом). Иначе задача без исполнителя: список задач общий, и отдавать
- * её случайному человеку, который о заказе ничего не знает, не стоит.
- * Автор задачи - первый действующий администратор (`created_by`
- * обязателен). Клиенту ничего не отправляется. Уведомления при создании
+ * заказом). Если ответственного нет, исполнитель - автор задачи: задача
+ * без исполнителя не попадёт в напоминания о сроках (они выбирают только
+ * задачи с исполнителем), и о долге никто бы не узнал. Автор - первый
+ * действующий администратор (`created_by` обязателен). Клиенту ничего не
+ * отправляется. Уведомления при создании
  * задача не шлёт, как и обычная; срок в несколько дней нужен затем, чтобы
  * существующий механизм сроков задач напомнил исполнителю сам.
  *
@@ -269,6 +271,9 @@ export async function createDebtTasks(
             eq(ordersAccounting.id, d.cardId),
             isNull(ordersAccounting.debtTaskAt),
             eq(ordersAccounting.isCancelled, false),
+            // Долг перечитан в самом UPDATE: между выборкой и отметкой заказ
+            // могли успеть оплатить, и задача по закрытому долгу не нужна
+            sql`orders_accounting.income - coalesce((select sum(p.amount) from order_payments p where p.order_accounting_id = orders_accounting.id), 0) > ${MONEY_EPS}`,
           ),
         )
         .returning({ id: ordersAccounting.id });
@@ -281,7 +286,7 @@ export async function createDebtTasks(
           `(оплачено ${rubles.format(d.paid)}). Заказ готов с ${dayFmt.format(d.since as Date)}, ` +
           `${d.ageDays} дн. без полной оплаты. Свяжитесь с клиентом и уточните срок оплаты. ` +
           `Клиенту автоматически ничего не отправлялось.`,
-        assignedTo: d.responsibleId,
+        assignedTo: d.responsibleId ?? author.id,
         createdBy: author.id,
         priority: "medium",
         dueDate,

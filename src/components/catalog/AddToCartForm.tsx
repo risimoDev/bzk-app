@@ -25,6 +25,9 @@ type Option = { valueId: number; value: string; priceModifier: string | null };
 
 const initial: CartState = {};
 
+/** Через сколько гаснет «Добавлено» в плавающей панели, мс. */
+const PANEL_MESSAGE_MS = 4000;
+
 // Портал нужен только в браузере: на сервере document нет
 const subscribeNothing = () => () => {};
 
@@ -67,6 +70,9 @@ export function AddToCartForm({
   const submitRowRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const [panelVisible, setPanelVisible] = useState(false);
+  // Какой ответ сервера с «Добавлено» в панели уже погашен. Панель
+  // закрывает половину экрана телефона, и висящее «Добавлено» мешало бы.
+  const [dismissedState, setDismissedState] = useState<CartState | null>(null);
   const canPortal = useSyncExternalStore(
     subscribeNothing,
     () => true,
@@ -128,6 +134,19 @@ export function AddToCartForm({
       body.style.paddingBottom = previous;
     };
   }, [panelVisible, canPortal]);
+
+  useEffect(() => {
+    if (!state.ok || !state.message) return;
+    const timer = setTimeout(() => setDismissedState(state), PANEL_MESSAGE_MS);
+    return () => clearTimeout(timer);
+  }, [state]);
+
+  // Ошибка в панели остаётся, пока человек её не исправит; успех гаснет сам
+  const panelMessage = state.error
+    ? { text: state.error, error: true }
+    : state.ok && state.message && dismissedState !== state
+      ? { text: state.message, error: false }
+      : null;
 
   const submitLabel = pending ? "Добавляем…" : "В корзину";
 
@@ -317,11 +336,9 @@ export function AddToCartForm({
             }`}
             style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
           >
-            {(state.error || (state.ok && state.message)) && (
-              <p
-                className={`mb-2 text-sm ${state.error ? "text-danger" : "text-ok"}`}
-              >
-                {state.error ?? state.message}
+            {panelMessage && (
+              <p className={`mb-2 text-sm ${panelMessage.error ? "text-danger" : "text-ok"}`}>
+                {panelMessage.text}
               </p>
             )}
             <div className="flex items-center justify-between gap-3">

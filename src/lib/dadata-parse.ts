@@ -83,68 +83,78 @@ export function guillemets(name: string): string {
   return name.replace('"', "«").replace('"', "»");
 }
 
+/** Одна запись ответа или null, если она не того вида. */
+function parseItem(item: unknown): PartyInfo | null {
+  const data = obj(obj(item)?.data);
+  if (!data) return null;
+
+  const inn = digits(data.inn, 10) ?? digits(data.inn, 12);
+  if (!inn) return null;
+
+  const kind = data.type === "INDIVIDUAL" || inn.length === 12 ? "individual" : "legal";
+
+  const name = obj(data.name);
+  const shortRaw = text(name?.short_with_opf, 255) ?? text(obj(item)?.value, 255);
+  const fullRaw = text(name?.full_with_opf, 255) ?? shortRaw;
+  if (!shortRaw || !fullRaw) return null;
+
+  const addr = obj(data.address);
+  // unrestricted_value - с индексом, как нужно в документах
+  const addressLine = text(addr?.unrestricted_value, 1000) ?? text(addr?.value, 1000);
+  const addrData = obj(addr?.data);
+  const city =
+    text(addrData?.city, 100) ?? text(addrData?.settlement, 100) ?? text(addrData?.region, 100);
+
+  let manager = text(obj(data.management)?.name, 255);
+  if (kind === "individual") {
+    const fio = obj(data.fio);
+    const joined = [fio?.surname, fio?.name, fio?.patronymic]
+      .map((p) => text(p, 100))
+      .filter(Boolean)
+      .join(" ");
+    manager = joined || manager;
+  }
+
+  const state = obj(data.state);
+  const status =
+    typeof state?.status === "string" && Object.hasOwn(STATUS_BY_CODE, state.status)
+      ? STATUS_BY_CODE[state.status]
+      : "unknown";
+
+  return {
+    inn,
+    kpp: kind === "legal" ? digits(data.kpp, 9) : null,
+    ogrn: digits(data.ogrn, 13) ?? digits(data.ogrn, 15),
+    kind,
+    shortName: guillemets(shortRaw),
+    fullName: guillemets(fullRaw),
+    address: kind === "legal" ? addressLine : null,
+    // У предпринимателя address.value - город проживания
+    city: kind === "legal" ? city : (city ?? text(addr?.value, 100)),
+    manager,
+    status,
+  };
+}
+
 /**
- * Первая подходящая запись ответа или null, если организации нет либо
- * ответ не того вида. Никогда не бросает: тело чужого сервиса - данные,
- * а не гарантия.
+ * Подходящая запись ответа или null, если организации нет либо ответ не
+ * того вида. По одному ИНН DaData отдаёт несколько записей (головная
+ * организация, филиалы, закрытые): берём первую действующую, а если
+ * действующих нет - первую подходящую. Никогда не бросает: тело чужого
+ * сервиса - данные, а не гарантия.
  */
 export function parseParty(body: unknown): PartyInfo | null {
   const list = obj(body)?.suggestions;
   if (!Array.isArray(list)) return null;
 
+  let first: PartyInfo | null = null;
   for (const item of list) {
-    const data = obj(obj(item)?.data);
-    if (!data) continue;
-
-    const inn = digits(data.inn, 10) ?? digits(data.inn, 12);
-    if (!inn) continue;
-
-    const kind = data.type === "INDIVIDUAL" || inn.length === 12 ? "individual" : "legal";
-
-    const name = obj(data.name);
-    const shortRaw = text(name?.short_with_opf, 255) ?? text(obj(item)?.value, 255);
-    const fullRaw = text(name?.full_with_opf, 255) ?? shortRaw;
-    if (!shortRaw || !fullRaw) continue;
-
-    const addr = obj(data.address);
-    // unrestricted_value - с индексом, как нужно в документах
-    const addressLine = text(addr?.unrestricted_value, 1000) ?? text(addr?.value, 1000);
-    const addrData = obj(addr?.data);
-    const city =
-      text(addrData?.city, 100) ?? text(addrData?.settlement, 100) ?? text(addrData?.region, 100);
-
-    let manager = text(obj(data.management)?.name, 255);
-    if (kind === "individual") {
-      const fio = obj(data.fio);
-      const joined = [fio?.surname, fio?.name, fio?.patronymic]
-        .map((p) => text(p, 100))
-        .filter(Boolean)
-        .join(" ");
-      manager = joined || manager;
-    }
-
-    const state = obj(data.state);
-    const status =
-      typeof state?.status === "string" && Object.hasOwn(STATUS_BY_CODE, state.status)
-        ? STATUS_BY_CODE[state.status]
-        : "unknown";
-
-    return {
-      inn,
-      kpp: kind === "legal" ? digits(data.kpp, 9) : null,
-      ogrn: digits(data.ogrn, 13) ?? digits(data.ogrn, 15),
-      kind,
-      shortName: guillemets(shortRaw),
-      fullName: guillemets(fullRaw),
-      address: kind === "legal" ? addressLine : null,
-      // У предпринимателя address.value - город проживания
-      city: kind === "legal" ? city : (city ?? text(addr?.value, 100)),
-      manager,
-      status,
-    };
+    const parsed = parseItem(item);
+    if (!parsed) continue;
+    if (parsed.status === "active") return parsed;
+    first ??= parsed;
   }
-
-  return null;
+  return first;
 }
 
 /** Подпись для подтверждения: «ООО «Ромашка», Пермь». */

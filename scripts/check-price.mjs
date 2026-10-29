@@ -9,7 +9,7 @@
  * корзине не ту цену, что в карточке. Здесь стережём само правило:
  * ступени, надбавки и округление количества.
  */
-import { tierFor, unitPriceFor, normalizeQuantity, fromUnitPrice } from "../src/lib/product-price.ts";
+import { tierFor, unitPriceFor, normalizeQuantity, fromUnitPrice, defaultSurcharge } from "../src/lib/product-price.ts";
 import { readFileSync } from "node:fs";
 import { nextTierUpsell, catalogTierOptions } from "../src/lib/tier-upsell.ts";
 
@@ -191,6 +191,25 @@ check(
 );
 check("каталог: первый тираж равен цене «от»", opts()[0].unitPrice === from(100));
 
+// Надбавка исполнения по умолчанию: форма выбирает первое значение каждой
+// характеристики, карточка каталога обязана считать с ней
+const dsOptions = [
+  { attributeId: 1, valueId: 11, priceModifier: "20" },
+  { attributeId: 1, valueId: 10, priceModifier: "5.5" },
+  { attributeId: 2, valueId: 21, priceModifier: "-1" },
+  { attributeId: 2, valueId: 22, priceModifier: null },
+];
+check("надбавка по умолчанию: первое значение (меньший id) каждой характеристики", defaultSurcharge(dsOptions) === 4.5, String(defaultSurcharge(dsOptions)));
+check("надбавка по умолчанию: без характеристик - ноль", defaultSurcharge([]) === 0);
+const sOpts = opts({ surcharge: 4.5 });
+check("каталог: цена тиража с надбавкой как в корзине", sOpts[1].unitPrice === unitPriceFor({ basePrice: base, tiers, quantity: 500, surcharge: 4.5 }));
+check("каталог: сумма тиража с надбавкой", sOpts[1].total === sOpts[1].unitPrice * 500);
+check(
+  "каталог: первый тираж с надбавкой равен «от» с надбавкой",
+  sOpts[0].unitPrice === fromUnitPrice({ basePrice: base, tiers, minQuantity: 100, multiplicity: 1, surcharge: 4.5 }),
+);
+check("каталог: с надбавкой дороже, чем без", sOpts[0].unitPrice > opts()[0].unitPrice);
+
 // ------------------------------------------- форма на карточке (по коду)
 // Правила, которые легко сломать правкой вёрстки
 
@@ -199,6 +218,10 @@ check("форма: характеристики остались настоящ�
 check("форма: плавающая панель отправляет ту же форму", formSrc.includes("requestSubmit()"));
 check("форма: плавающая панель только на телефоне", /fixed[^"`]*md:hidden/.test(formSrc));
 check("форма: количество и шаг в форму не кладутся (берёт сервер)", !/name="(minQuantity|multiplicity)"/.test(formSrc));
+check("форма: «Добавлено» в панели гаснет по таймеру", /PANEL_MESSAGE_MS\s*=\s*4000/.test(formSrc) && formSrc.includes("clearTimeout"));
+
+const catalogSrc = readFileSync(new URL("../src/app/(site)/catalog/page.tsx", import.meta.url), "utf8");
+check("каталог: в карточку передаётся надбавка исполнения по умолчанию", /<CatalogPrice[\s\S]*?surcharge=\{/.test(catalogSrc));
 
 console.log(failed === 0 ?"\nВсе проверки прошли." : `\nОшибок: ${failed}`);
 process.exitCode = failed === 0 ? 0 : 1;

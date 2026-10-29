@@ -92,7 +92,7 @@ export function OrderForm({
   suppliers: SupplierOption[];
   defaultClientId?: number;
   /** Просроченный долг 15+ дней по контрагентам (id -> заказов, сумма). Только предупреждение. */
-  debtWarnings?: Record<number, { n: number; sum: number }>;
+  debtWarnings?: Record<number, { n: number; sum?: number }>;
   /** Ссылка на страницу долгов; нет права смотреть финансы - нет и ссылки. */
   debtHref?: string;
 }) {

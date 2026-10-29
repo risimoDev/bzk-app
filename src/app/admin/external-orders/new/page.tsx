@@ -35,7 +35,11 @@ export default async function NewExternalOrder({
     Number.isInteger(rawClient) && rawClient > 0 ? rawClient : undefined;
 
   // Контрагенты с долгом старше 15 дней: форма предупредит, когда такого выберут
-  const [debtWarnings, canFinance] = await Promise.all([overdueDebtByCounterparty(), can("finance", "view")]);
+  // Без finance.view в форму уходит только факт долга: суммы в клиентский код не попадают
+  const [allDebts, canFinance] = await Promise.all([overdueDebtByCounterparty(), can("finance", "view")]);
+  const debtWarnings: Record<number, { n: number; sum?: number }> = canFinance
+    ? allDebts
+    : Object.fromEntries(Object.entries(allDebts).map(([id, w]) => [id, { n: w.n }]));
 
   const [counterparties, productList, supplierList] = await Promise.all([
     db

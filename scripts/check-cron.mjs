@@ -278,7 +278,7 @@ try {
   // Проход сужен до своих карточек, чтобы не тронуть живые заказы dev-базы
   const debtNow = new Date();
   const ago = (days) => new Date(debtNow.getTime() - days * DAY);
-  const mkDebtOrder = async (income, readyDaysAgo) => {
+  const mkDebtOrder = async (income, readyDaysAgo, actor = userId) => {
     const [o] = await db
       .insert(externalOrders)
       .values({ clientName: DEBT_MARK, productionStatus: "completed", totalPrice: String(income), createdAt: ago(30) })
@@ -289,7 +289,7 @@ try {
       .returning({ id: ordersAccounting.id });
     if (readyDaysAgo !== null) {
       await db.insert(auditLog).values({
-        userId,
+        userId: actor,
         action: "external_order.production_status",
         entityType: "external_order",
         entityId: o.id,
@@ -324,6 +324,16 @@ try {
   await db.update(auditLog).set({ createdAt: ago(6) }).where(eq(auditLog.entityId, dFresh.orderId));
   const later = await cron.createDebtTasks(debtNow, { onlyCardIds: debtCards });
   check("перешёл порог - задача заведена, у первого заказа не удвоилась", later === 1);
+
+  // Старый долг с точной датой (журнал со старого сайта): только страница долгов
+  const dAncient = await mkDebtOrder(700, 30);
+  check("долг старше окна 6...14 дней задачу не получает", (await cron.createDebtTasks(debtNow, { onlyCardIds: [dAncient.cardId] })) === 0);
+
+  // Ответственного нет - исполнитель автор, иначе напоминание о сроке не дойдёт
+  const dNoOwner = await mkDebtOrder(400, 8, null);
+  check("без ответственного задача заведена", (await cron.createDebtTasks(debtNow, { onlyCardIds: [dNoOwner.cardId] })) === 1);
+  const [noOwnerTask] = await db.select().from(tasks).where(eq(tasks.relatedOrderAccountingId, dNoOwner.cardId));
+  check("исполнитель - автор задачи", noOwnerTask?.assignedTo !== null && noOwnerTask?.assignedTo === noOwnerTask?.createdBy);
 
   // Оплаченный заказ задачу не получает
   const dPaid = await mkDebtOrder(100, 10);

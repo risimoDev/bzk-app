@@ -503,6 +503,25 @@ export async function loadDebtOrders(
     .sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1) || b.debt - a.debt);
 }
 
+/**
+ * Долги одного плательщика из уже загруженного списка всех долгов.
+ *
+ * Тот же отбор, что у `loadDebtOrders({ partyKey })`, но без второго
+ * обхода базы: страница долгов и так читает всех должников для сводки.
+ * Аккаунт, привязанный к контрагенту, - это тот же плательщик (`c:<id>`).
+ */
+export async function debtsOfParty(all: readonly DebtOrder[], partyKey: string): Promise<DebtOrder[]> {
+  const party = parsePartyKey(partyKey);
+  if (!party) return [];
+  let wanted: string;
+  if (party.kind === "counterparty") wanted = `c:${party.id}`;
+  else if (party.kind === "user") {
+    const linked = (await counterpartyByUser()).get(party.id);
+    wanted = linked !== undefined ? `c:${linked}` : `u:${party.id}`;
+  } else wanted = `n:${party.name}`;
+  return all.filter((o) => o.partyKey === wanted);
+}
+
 export type Debtor = {
   partyKey: string;
   name: string;

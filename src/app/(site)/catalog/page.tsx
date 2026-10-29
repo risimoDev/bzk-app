@@ -95,7 +95,7 @@ export default async function CatalogPage(props: PageProps<"/catalog">) {
   const activeId = parseId(raw) ?? undefined;
 
   const [items, cats] = await Promise.all([getCatalog(activeId), getCategories()]);
-  const { from: prices, tiers: tiersByProduct } = await catalogPricing(items);
+  const { from: prices, tiers: tiersByProduct, surcharges } = await catalogPricing(items);
   const active = cats.find((c) => c.id === activeId);
 
   return (
@@ -222,6 +222,7 @@ export default async function CatalogPage(props: PageProps<"/catalog">) {
                             tiers={tiers}
                             minQuantity={item.minQuantity}
                             multiplicity={item.multiplicity}
+                            surcharge={surcharges.get(item.id) ?? 0}
                           />
                         ) : price ? (
                           <>
