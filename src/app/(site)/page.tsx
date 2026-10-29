@@ -277,7 +277,7 @@ export default function HomePage() {
                       size="sm"
                       tilt={i % 2 === 0 ? "left" : "right"}
                     >
-                      Цех #{i + 1}
+                      Этап {i + 1}
                     </TapeLabel>
                   </div>
                 </div>
@@ -317,8 +317,8 @@ export default function HomePage() {
             {ADVANTAGES.map((a, i) => (
               <ClippedCard
                 key={a.title}
-                clipType={i === 0 ? "mint" : i === 1 ? "steel" : "none"}
-                clipPosition="top-left"
+                clipType={i === 0 ? "mint" : i === 1 ? "steel" : "binder"}
+                clipPosition={i === 2 ? "top-center" : "top-left"}
                 paper="light"
                 className="hover:-translate-y-1.5 hover:shadow-lift"
               >
@@ -342,10 +342,6 @@ export default function HomePage() {
 
       {/* ---------- Призыв к действию ---------- */}
       <section className="relative overflow-hidden torn-4 bg-brand-deep pb-20 pt-28 text-bone grain sm:pb-24 sm:pt-32">
-        <Decor
-          asset={clip.binder}
-          className="absolute left-[7%] top-6 hidden w-16 -rotate-12 opacity-50 sm:block"
-        />
         <Container className="relative text-center">
           <div className="mb-4">
             <StampBadge

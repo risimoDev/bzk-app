@@ -12,6 +12,12 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
+# Точка Банк (enter.tochka.com) подписан корневым сертификатом Минцифры, а
+# Node его не знает: без этой переменной fetch к банку падает с
+# SELF_SIGNED_CERT_IN_CHAIN ещё до авторизации. Из этой стадии собран и
+# служебный контейнер tools (сверка, recalc-accounting), поэтому задаём
+# здесь тоже. Проверку TLS не отключаем - сертификат добавляется к доверенным
+ENV NODE_EXTRA_CA_CERTS=/app/deploy/certs/russian_trusted_root_ca.pem
 # Домен нужен на сборке: next.config запекает его в список разрешённых
 # источников серверных действий (allowedOrigins). Пусто - проверка идёт
 # по фактическому Host, что за Caddy тоже верно
@@ -36,6 +42,13 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
 RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
+
+# Корневой сертификат Минцифры для запросов к Точка Банку (см. комментарий в
+# стадии builder). Копия лежит вне standalone-вывода, читается пользователем
+# nextjs; NODE_EXTRA_CA_CERTS Node читает при старте, поэтому это ENV, а не
+# переменная приложения из .env
+COPY --from=builder --chmod=0644 /app/deploy/certs/russian_trusted_root_ca.pem /app/certs/russian_trusted_root_ca.pem
+ENV NODE_EXTRA_CA_CERTS=/app/certs/russian_trusted_root_ca.pem
 
 # standalone кладёт сюда минимальный набор: сервер + только нужные модули
 COPY --from=builder /app/public ./public

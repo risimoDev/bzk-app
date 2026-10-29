@@ -1,3 +1,5 @@
 # Скрипты запускаются в Linux-контейнерах и на сервере: CRLF в конце строки
 # ломает shebang и сами команды. Всегда LF, даже при checkout на Windows.
 *.sh text eol=lf
+# Сертификат читают OpenSSL и Node в Linux-контейнере: всегда LF
+deploy/certs/*.pem text eol=lf

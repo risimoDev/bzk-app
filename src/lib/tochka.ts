@@ -2,6 +2,7 @@ import "server-only";
 import { desc } from "drizzle-orm";
 import { db } from "@/db";
 import { tochkaTokens } from "@/db/schema";
+import { describeNetworkError } from "@/lib/tochka-errors";
 
 /**
  * Клиент API Точка Банка.
@@ -11,9 +12,18 @@ import { tochkaTokens } from "@/db/schema";
  * хранится в таблице tochka_tokens.
  *
  * Документация: https://developers.tochka.com/docs/tochka-api/
+ * Сверено с ней (в т.ч. со схемами методов):
+ *  - авторизация JWT - только заголовок `Authorization: Bearer <токен>`;
+ *    client_id для запросов не нужен (он нужен лишь для вебхуков);
+ *  - customerCode передаётся в теле (`Data.customerCode`) или в пути
+ *    (`/bills/{customerCode}/{documentId}/...`), заголовка нет;
+ *  - accountId - «счёт/БИК», слеш в пути остаётся слешем.
+ *
+ * Банк подписан сертификатом Минцифры: без NODE_EXTRA_CA_CERTS (Dockerfile,
+ * scripts/next-with-ca.mjs) fetch падает ещё до авторизации.
  */
 
-const API_URL = process.env.TOCHKA_API_URL?.trim() || "https://enter.tochka.com/uapi";
+const API_URL = (process.env.TOCHKA_API_URL?.trim() || "https://enter.tochka.com/uapi").replace(/\/+$/, "");
 const JWT = process.env.TOCHKA_TOKEN?.trim() ?? "";
 
 /** Ошибка стороннего API - отделяем от наших, чтобы показать текст банка. */
@@ -56,37 +66,57 @@ export async function setCustomerCode(code: string) {
 type RequestOptions = {
   method?: "GET" | "POST" | "DELETE";
   body?: unknown;
-  customerCode?: string | null;
 };
+
+/**
+ * Единственное место, где уходит запрос к банку. Сетевая ошибка получает
+ * понятную причину (см. tochka-errors.ts), токен в текст не попадает.
+ */
+async function bankFetch(endpoint: string, init: RequestInit & { json?: boolean }) {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${JWT}`,
+    Accept: init.json === false ? "*/*" : "application/json",
+  };
+  if (init.body !== undefined) headers["Content-Type"] = "application/json";
+
+  try {
+    return await fetch(API_URL + endpoint, {
+      method: init.method ?? "GET",
+      headers,
+      body: init.body,
+      // Банковские данные не кэшируем ни на секунду
+      cache: "no-store",
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (e) {
+    throw new TochkaError(`Не удалось связаться с банком: ${describeNetworkError(e)}`);
+  }
+}
+
+/** Текст ошибки из тела ответа банка: `message` и подробности из `Errors[]`. */
+function bankErrorMessage(parsed: unknown, status: number) {
+  const p = parsed as Record<string, unknown> | null;
+  const first = Array.isArray(p?.Errors) ? (p.Errors[0] as Record<string, unknown> | undefined) : undefined;
+  const detail = typeof first?.message === "string" ? first.message : "";
+  const main =
+    (typeof p?.error_description === "string" && p.error_description) ||
+    (typeof p?.error === "string" && p.error) ||
+    (typeof p?.message === "string" && p.message) ||
+    "";
+
+  if (main && detail && detail !== main) return `${main}: ${detail}`;
+  return main || detail || `Банк ответил ошибкой ${status}`;
+}
 
 async function request<T>(endpoint: string, opts: RequestOptions = {}): Promise<T> {
   if (!isTochkaConfigured()) {
     throw new TochkaError("JWT-токен не настроен: задайте TOCHKA_TOKEN в окружении");
   }
 
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${JWT}`,
-    Accept: "application/json",
-  };
-  if (opts.body !== undefined) headers["Content-Type"] = "application/json";
-
-  const code = opts.customerCode ?? (await getCustomerCode());
-  if (code) headers["X-Customer-Code"] = code;
-
-  let res: Response;
-  try {
-    res = await fetch(API_URL + endpoint, {
-      method: opts.method ?? "GET",
-      headers,
-      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-      // Банковские данные не кэшируем ни на секунду
-      cache: "no-store",
-      signal: AbortSignal.timeout(30_000),
-    });
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    throw new TochkaError(`Не удалось связаться с банком: ${reason}`);
-  }
+  const res = await bankFetch(endpoint, {
+    method: opts.method,
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+  });
 
   const text = await res.text();
   let parsed: unknown = null;
@@ -96,15 +126,7 @@ async function request<T>(endpoint: string, opts: RequestOptions = {}): Promise<
     // Ответ не JSON - разберём ниже по коду статуса
   }
 
-  if (!res.ok) {
-    const p = parsed as Record<string, unknown> | null;
-    const message =
-      (typeof p?.error_description === "string" && p.error_description) ||
-      (typeof p?.error === "string" && p.error) ||
-      (typeof p?.message === "string" && p.message) ||
-      `Банк ответил ошибкой ${res.status}`;
-    throw new TochkaError(message, res.status);
-  }
+  if (!res.ok) throw new TochkaError(bankErrorMessage(parsed, res.status), res.status);
 
   return (parsed ?? {}) as T;
 }
@@ -115,17 +137,20 @@ async function requestBinary(endpoint: string): Promise<Uint8Array> {
     throw new TochkaError("JWT-токен не настроен: задайте TOCHKA_TOKEN в окружении");
   }
 
-  const code = await getCustomerCode();
-  const res = await fetch(API_URL + endpoint, {
-    headers: {
-      Authorization: `Bearer ${JWT}`,
-      ...(code ? { "X-Customer-Code": code } : {}),
-    },
-    cache: "no-store",
-    signal: AbortSignal.timeout(30_000),
-  });
+  const res = await bankFetch(endpoint, { json: false });
 
-  if (!res.ok) throw new TochkaError(`Не удалось получить файл: ${res.status}`, res.status);
+  if (!res.ok) {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(await res.text());
+    } catch {
+      // Тело не JSON - достаточно кода статуса
+    }
+    throw new TochkaError(
+      `Не удалось получить файл: ${bankErrorMessage(parsed, res.status)}`,
+      res.status,
+    );
+  }
   return new Uint8Array(await res.arrayBuffer());
 }
 
@@ -150,6 +175,7 @@ export async function getCustomers() {
 
 export type TochkaAccount = {
   accountId: string;
+  customerCode?: string;
   accountType?: string;
   currency?: string;
   accountDetails?: { identification?: string }[];
@@ -159,7 +185,23 @@ export async function getAccounts() {
   const r = await request<{ Data?: { Account?: TochkaAccount[] } }>(
     "/open-banking/v1.0/accounts",
   );
-  return r.Data?.Account ?? [];
+  const all = r.Data?.Account ?? [];
+
+  // Ключ может видеть несколько компаний; счета чужой компании нам не нужны
+  // ни в остатке, ни при выставлении счёта. Не нашлось ни одного - отдаём
+  // всё как есть, чтобы пустой фильтр не прятал настоящую картину
+  const code = await getCustomerCode();
+  const own = code ? all.filter((a) => a.customerCode === code) : all;
+  return own.length > 0 ? own : all;
+}
+
+/**
+ * accountId - «номер счёта/БИК». В пути запроса слеш остаётся слешем (так
+ * банк показывает адрес метода и так он собран в его коллекции Postman),
+ * остальное кодируем.
+ */
+function accountPath(accountId: string) {
+  return accountId.split("/").map(encodeURIComponent).join("/");
 }
 
 /** Номер счёта прячется внутри идентификатора вида «счёт/БИК». */
@@ -189,6 +231,7 @@ type BalanceResponse = {
   Data?: {
     Balance?: {
       Amount?: { amount?: string | number; currency?: string };
+      /** OpeningAvailable - начальный, ClosingAvailable - доступный, Expected - заблокированный */
       type?: string;
     }[];
   };
@@ -196,7 +239,7 @@ type BalanceResponse = {
 
 export async function getBalance(accountId: string) {
   return request<BalanceResponse>(
-    `/open-banking/v1.0/accounts/${encodeURIComponent(accountId)}/balances`,
+    `/open-banking/v1.0/accounts/${accountPath(accountId)}/balances`,
   );
 }
 
@@ -220,12 +263,17 @@ export async function getTotalBalance(targetAccountId?: string): Promise<TotalBa
 
   let total = 0;
   const rows: TotalBalance["accounts"] = [];
+  let firstError: unknown = null;
 
   for (const account of wanted) {
     try {
       const r = await getBalance(account.accountId);
-      const balance = r.Data?.Balance?.[0];
-      const amount = Number(balance?.Amount?.amount ?? 0);
+      // В ответе несколько видов остатка; «сколько денег на счёте сейчас» -
+      // ClosingAvailable. Первый элемент массива мог оказаться начальным
+      // остатком (OpeningAvailable) или суммой блокировок (Expected)
+      const balance = r.Data?.Balance?.find((b) => b.type === "ClosingAvailable");
+      if (!balance) continue;
+      const amount = Number(balance.Amount?.amount ?? 0);
       if (!Number.isFinite(amount)) continue;
 
       total += amount;
@@ -233,12 +281,15 @@ export async function getTotalBalance(targetAccountId?: string): Promise<TotalBa
         accountId: account.accountId,
         accountNumber: accountNumberOf(account),
         balance: amount,
-        currency: balance?.Amount?.currency ?? account.currency ?? "RUB",
+        currency: balance.Amount?.currency ?? account.currency ?? "RUB",
       });
-    } catch {
-      continue;
+    } catch (e) {
+      firstError ??= e;
     }
   }
+
+  // Если не отдал остаток ни один счёт - это сбой, а не нулевой баланс
+  if (rows.length === 0 && firstError) throw firstError;
 
   return { total, currency: rows[0]?.currency ?? "RUB", accounts: rows };
 }
@@ -304,18 +355,26 @@ export function tochkaUnit(unit: string) {
   return UNITS[unit.trim().toLowerCase()] ?? "шт.";
 }
 
+/**
+ * Допустимые банку ставки: nds_0, nds_5, nds_7, nds_10, nds_22, without_nds.
+ * Ставки 20% у банка нет (с 2026 года - 22%), поэтому «nds_20» не
+ * пересчитывается молча: другая ставка меняет сумму НДС в документе.
+ */
 const NDS: Record<string, string> = {
   nds_no: "without_nds",
+  without_nds: "without_nds",
   nds_0: "nds_0",
   nds_5: "nds_5",
   nds_7: "nds_7",
   nds_10: "nds_10",
-  nds_20: "nds_20",
   nds_22: "nds_22",
 };
 
 export function tochkaNds(nds: string) {
-  return NDS[nds] ?? "without_nds";
+  if (!Object.hasOwn(NDS, nds)) {
+    throw new TochkaError(`Банк не принимает ставку НДС «${nds}»: допустимы 0, 5, 7, 10, 22 % и без НДС`);
+  }
+  return NDS[nds];
 }
 
 // ------------------------------------------------------------- позиции
@@ -331,7 +390,7 @@ export type DocumentItem = {
 };
 
 type TochkaPosition = {
-  name: string;
+  positionName: string;
   quantity: number;
   unitCode: string;
   price: number;
@@ -350,7 +409,7 @@ function buildPositions(items: DocumentItem[]) {
     totalAmount += amount;
 
     positions.push({
-      name: item.name || "Услуга",
+      positionName: item.name || "Услуга",
       quantity,
       unitCode: tochkaUnit(item.unit ?? "шт"),
       price,
@@ -367,11 +426,11 @@ export function counterpartyType(inn: string) {
   return inn.replace(/\D/g, "").length === 12 ? "ip" : "company";
 }
 
-type SecondSide = { type: string; taxCode: string; name: string; kpp?: string };
+type SecondSide = { type: string; taxCode: string; secondSideName: string; kpp?: string };
 
 function buildSecondSide(clientInn: string, clientName: string, clientKpp?: string) {
   const type = counterpartyType(clientInn);
-  const side: SecondSide = { type, taxCode: clientInn, name: clientName };
+  const side: SecondSide = { type, taxCode: clientInn, secondSideName: clientName };
   // КПП есть только у юрлиц
   if (clientKpp && type === "company") side.kpp = clientKpp;
   return side;
@@ -397,32 +456,38 @@ export async function createInvoice(input: InvoiceInput) {
   const customerCode = await getCustomerCode();
   if (!customerCode) throw new TochkaError("Не выбрана компания в настройках интеграции");
 
+  // Срок оплаты - поле самого счёта (Content.Invoice), не верхнего уровня
+  const invoice: Record<string, unknown> = {
+    number: input.invoiceNumber,
+    totalAmount,
+    Positions: positions,
+  };
+  if (input.paymentExpiryDate) invoice.paymentExpiryDate = input.paymentExpiryDate;
+
   const body: Record<string, unknown> = {
     customerCode,
     accountId: input.accountId || (await getDefaultAccountId()),
     SecondSide: buildSecondSide(input.clientInn, input.clientName, input.clientKpp),
-    Content: {
-      Invoice: {
-        number: input.invoiceNumber,
-        totalAmount,
-        positions,
-      },
-    },
+    Content: { Invoice: invoice },
   };
-  if (input.paymentExpiryDate) body.paymentExpiryDate = input.paymentExpiryDate;
 
   const r = await request<CreatedDocument>("/invoice/v1.0/bills", {
     method: "POST",
     body: { Data: body },
-    customerCode,
   });
 
   return { documentId: r.Data?.documentId ?? "", totalAmount };
 }
 
+/** Код компании для пути запроса; без выбранной компании пути не собрать. */
+function customerPath(code: string | null) {
+  if (!code) throw new TochkaError("Не выбрана компания в настройках интеграции");
+  return encodeURIComponent(code);
+}
+
 export async function getInvoicePdf(documentId: string) {
   const code = await getCustomerCode();
-  return requestBinary(`/invoice/v1.0/bills/${code}/${encodeURIComponent(documentId)}/file`);
+  return requestBinary(`/invoice/v1.0/bills/${customerPath(code)}/${encodeURIComponent(documentId)}/file`);
 }
 
 /** Значения paymentStatus и их смысл - в lib/tochka-status.ts. */
@@ -433,13 +498,13 @@ export type PaymentStatus = {
 export async function getInvoicePaymentStatus(documentId: string) {
   const code = await getCustomerCode();
   return request<PaymentStatus>(
-    `/invoice/v1.0/bills/${code}/${encodeURIComponent(documentId)}/payment-status`,
+    `/invoice/v1.0/bills/${customerPath(code)}/${encodeURIComponent(documentId)}/payment-status`,
   );
 }
 
 export async function sendInvoiceToEmail(documentId: string, email: string) {
   const code = await getCustomerCode();
-  return request(`/invoice/v1.0/bills/${code}/${encodeURIComponent(documentId)}/email`, {
+  return request(`/invoice/v1.0/bills/${customerPath(code)}/${encodeURIComponent(documentId)}/email`, {
     method: "POST",
     body: { Data: { email } },
   });
@@ -447,7 +512,7 @@ export async function sendInvoiceToEmail(documentId: string, email: string) {
 
 export async function deleteInvoice(documentId: string) {
   const code = await getCustomerCode();
-  return request(`/invoice/v1.0/bills/${code}/${encodeURIComponent(documentId)}`, {
+  return request(`/invoice/v1.0/bills/${customerPath(code)}/${encodeURIComponent(documentId)}`, {
     method: "DELETE",
   });
 }
@@ -456,13 +521,20 @@ export async function deleteInvoice(documentId: string) {
 
 export type ClosingDocumentType = "act" | "upd" | "invoice" | "waybill";
 
-/** Наши типы → типы банка. Накладная у них называется torg12. */
-const API_DOC_TYPES: Record<ClosingDocumentType, string> = {
-  act: "act",
-  upd: "upd",
-  invoice: "invoice",
-  waybill: "torg12",
+/**
+ * Наши типы → ключ объекта в Content. Вид документа банк определяет именно
+ * по нему: Act - акт, PackingList - накладная ТОРГ-12, Invoicef -
+ * счёт-фактура, Upd - УПД. Отдельного поля documentType у метода нет.
+ */
+const CONTENT_KEYS: Record<ClosingDocumentType, string> = {
+  act: "Act",
+  upd: "Upd",
+  invoice: "Invoicef",
+  waybill: "PackingList",
 };
+
+/** Вид УПД: schfdop - с выделенным НДС (заменяет счёт-фактуру), dop - без НДС. */
+export type UpdFunction = "schfdop" | "dop";
 
 export type ClosingDocumentInput = {
   items: DocumentItem[];
@@ -471,8 +543,10 @@ export type ClosingDocumentInput = {
   clientKpp?: string;
   documentNumber: string;
   accountId?: string;
-  /** Счёт, к которому привязывается документ */
+  /** documentId счёта в банке, к которому привязывается документ */
   linkedInvoiceId?: string;
+  /** Только для УПД. Не задан - schfdop, если в позициях есть НДС, иначе dop */
+  updFunction?: UpdFunction;
 };
 
 export async function createClosingDocument(
@@ -483,29 +557,30 @@ export async function createClosingDocument(
   const customerCode = await getCustomerCode();
   if (!customerCode) throw new TochkaError("Не выбрана компания в настройках интеграции");
 
-  const apiType = API_DOC_TYPES[type];
-  // Ключ содержимого - тип документа с заглавной буквы: Act, Upd, Torg12
-  const contentKey = apiType.charAt(0).toUpperCase() + apiType.slice(1);
+  const content: Record<string, unknown> = {
+    number: input.documentNumber,
+    totalAmount,
+    Positions: positions,
+  };
+  // У УПД вид (function) обязателен
+  if (type === "upd") {
+    content.function =
+      input.updFunction ??
+      (positions.some((p) => p.ndsKind !== "without_nds") ? "schfdop" : "dop");
+  }
 
   const body: Record<string, unknown> = {
     customerCode,
     accountId: input.accountId || (await getDefaultAccountId()),
-    documentType: apiType,
     SecondSide: buildSecondSide(input.clientInn, input.clientName, input.clientKpp),
-    Content: {
-      [contentKey]: {
-        number: input.documentNumber,
-        totalAmount,
-        positions,
-      },
-    },
+    Content: { [CONTENT_KEYS[type]]: content },
   };
-  if (input.linkedInvoiceId) body.linkedDocumentId = input.linkedInvoiceId;
+  // Родительский документ (счёт) - Data.documentId
+  if (input.linkedInvoiceId) body.documentId = input.linkedInvoiceId;
 
   const r = await request<CreatedDocument>("/invoice/v1.0/closing-documents", {
     method: "POST",
     body: { Data: body },
-    customerCode,
   });
 
   return { documentId: r.Data?.documentId ?? "", totalAmount };
@@ -514,14 +589,14 @@ export async function createClosingDocument(
 export async function getClosingDocumentPdf(documentId: string) {
   const code = await getCustomerCode();
   return requestBinary(
-    `/invoice/v1.0/closing-documents/${code}/${encodeURIComponent(documentId)}/file`,
+    `/invoice/v1.0/closing-documents/${customerPath(code)}/${encodeURIComponent(documentId)}/file`,
   );
 }
 
 export async function sendClosingDocumentToEmail(documentId: string, email: string) {
   const code = await getCustomerCode();
   return request(
-    `/invoice/v1.0/closing-documents/${code}/${encodeURIComponent(documentId)}/email`,
+    `/invoice/v1.0/closing-documents/${customerPath(code)}/${encodeURIComponent(documentId)}/email`,
     { method: "POST", body: { Data: { email } } },
   );
 }
