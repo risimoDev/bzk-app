@@ -6,6 +6,8 @@ import { db } from "@/db";
 import { contactMessages, reviews, promocodes } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
 export type InboxState = { ok: boolean; message?: string };
 
@@ -58,6 +60,8 @@ export async function deleteMessage(
 
   if (removed.length === 0) return { ok: false, message: "Обращение не найдено" };
 
+  await audit("message.delete", { type: "contact_message", id: messageId });
+
   revalidatePath("/admin/inbox");
   return { ok: true, message: "Удалено" };
 }
@@ -68,6 +72,9 @@ export async function setReviewStatus(
   _prev: InboxState,
   formData: FormData,
 ): Promise<InboxState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("messaging", "edit"))) return DENIED;
 
   const reviewId = Number(formData.get("reviewId"));
@@ -94,6 +101,8 @@ export async function setReviewStatus(
     .returning({ id: reviews.id });
 
   if (updated.length === 0) return { ok: false, message: "Отзыв не найден" };
+
+  await audit("review.status", { type: "review", id: reviewId }, { status });
 
   revalidatePath("/admin/inbox");
   return { ok: true, message: "Сохранено" };
@@ -122,6 +131,8 @@ export async function togglePromocode(
 
   if (updated.length === 0) return { ok: false, message: "Промокод не найден" };
 
+  await audit("promocode.toggle", { type: "promocode", id: promoId }, { active });
+
   revalidatePath("/admin/promocodes");
   return {
     ok: true,
@@ -149,6 +160,9 @@ export async function savePromocode(
   _prev: PromocodeState,
   formData: FormData,
 ): Promise<PromocodeState> {
+  const tooLong = rejectOverlong(formData, { code: 50 });
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;
@@ -199,11 +213,19 @@ export async function savePromocode(
     return { fieldErrors: { usageLimit: "Лимит - целое число больше нуля" } };
   }
 
+  // Пусто - без границы; выдуманное число (31 февраля) - ошибка, а не
+  // молчаливое «без границы». Полдень по местному: иначе календарный день
+  // съезжает при пересчёте часового пояса
+  const dateErrors: Record<string, string> = {};
   const parseDate = (name: string) => {
     const raw = String(formData.get(name) ?? "").trim();
-    // Полдень по местному: иначе календарный день съезжает при пересчёте
-    // часового пояса
-    return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? new Date(`${raw}T12:00:00`) : null;
+    if (raw === "") return null;
+    const day = parseCalendarDate(raw);
+    if (!day) {
+      dateErrors[name] = "Такой даты нет в календаре";
+      return null;
+    }
+    return calendarDateAtNoon(day);
   };
 
   const values = {
@@ -219,6 +241,10 @@ export async function savePromocode(
     isSingleUse: formData.get("isSingleUse") === "on",
     isActive: formData.get("isActive") === "on",
   };
+
+  if (Object.keys(dateErrors).length > 0) return { fieldErrors: dateErrors };
+
+  if (Object.keys(dateErrors).length > 0) return { fieldErrors: dateErrors };
 
   try {
     if (isNew) {

@@ -8,8 +8,10 @@
  * генератором, не перенеся правки.
  */
 import {
+  bigint,
   boolean,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -21,8 +23,10 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   varchar,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 // ============================== Перечисления ==============================
 
@@ -41,7 +45,7 @@ export const documentsStatusEnum = pgEnum("documents_status", ["draft", "pending
 export const documentsDocTypeEnum = pgEnum("documents_doc_type", ["incoming", "internal", "outgoing", "accounting"]);
 export const export1cLogExportTypeEnum = pgEnum("export_1c_log_export_type", ["orders", "products", "clients", "payments"]);
 export const externalOrdersStatusEnum = pgEnum("external_orders_status", ["unpaid", "partial", "paid"]);
-export const externalOrdersProductionStatusEnum = pgEnum("external_orders_production_status", ["pending", "processing", "in_work", "delayed", "shipped", "delivered", "cancelled", "completed"]);
+export const externalOrdersProductionStatusEnum = pgEnum("external_orders_production_status", ["pending", "processing", "in_work", "ready", "delayed", "shipped", "delivered", "cancelled", "completed"]);
 export const externalOrderReadyHistoryChangeTypeEnum = pgEnum("external_order_ready_history_change_type", ["set", "prolong", "edit"]);
 export const massMessagesMessageTypeEnum = pgEnum("mass_messages_message_type", ["email", "telegram", "both"]);
 export const massMessagesTargetAudienceEnum = pgEnum("mass_messages_target_audience", ["all", "customers", "admins", "managers", "specific"]);
@@ -52,7 +56,7 @@ export const materialsCategoryEnum = pgEnum("materials_category", ["paper", "vin
 export const materialsMaterialTypeEnum = pgEnum("materials_material_type", ["sheet", "roll", "piece", "liquid"]);
 export const materialsBatchesStatusEnum = pgEnum("materials_batches_status", ["active", "depleted", "expired", "returned"]);
 export const materialsMovementsTypeEnum = pgEnum("materials_movements_type", ["in", "out"]);
-export const materialsMovementsReferenceTypeEnum = pgEnum("materials_movements_reference_type", ["order", "manual"]);
+export const materialsMovementsReferenceTypeEnum = pgEnum("materials_movements_reference_type", ["order", "manual", "purchase", "site_order"]);
 export const miniWarehouseItemsStatusEnum = pgEnum("mini_warehouse_items_status", ["in_stock", "in_production", "shipped", "returned"]);
 export const notificationsTypeEnum = pgEnum("notifications_type", ["info", "success", "warning", "error"]);
 export const notificationsTargetAudienceEnum = pgEnum("notifications_target_audience", ["all", "clients", "admins", "managers"]);
@@ -61,7 +65,7 @@ export const notificationLogChannelEnum = pgEnum("notification_log_channel", ["e
 export const notificationLogStatusEnum = pgEnum("notification_log_status", ["sent", "failed", "queued"]);
 export const notificationPrefsPrefChannelEnum = pgEnum("notification_prefs_pref_channel", ["telegram", "email", "both"]);
 export const notificationSubscriptionsChannelEnum = pgEnum("notification_subscriptions_channel", ["email", "telegram", "flash"]);
-export const ordersStatusEnum = pgEnum("orders_status", ["pending", "processing", "in_work", "delayed", "shipped", "delivered", "cancelled", "completed"]);
+export const ordersStatusEnum = pgEnum("orders_status", ["pending", "processing", "in_work", "ready", "delayed", "shipped", "delivered", "cancelled", "completed"]);
 export const ordersAccountingSourceEnum = pgEnum("orders_accounting_source", ["site", "external"]);
 export const ordersAccountingStatusEnum = pgEnum("orders_accounting_status", ["unpaid", "partial", "paid"]);
 export const ordersAccountingOldSourceEnum = pgEnum("orders_accounting_old_source", ["site", "external"]);
@@ -146,6 +150,19 @@ export const users = pgTable("users", {
    * добавить код в приложение, запер бы себя сам.
    */
   totpEnabledAt: timestamp("totp_enabled_at", { withTimezone: true, mode: "date" }),
+  /**
+   * Номер последнего принятого тридцатисекундного окна одноразового кода.
+   * Код принимается, только если его окно строго позже этого номера, и
+   * запись обновляется одним UPDATE ... WHERE: так подсмотренный код
+   * нельзя предъявить второй раз, даже двумя запросами одновременно.
+   */
+  totpLastCounter: bigint("totp_last_counter", { mode: "number" }),
+  /**
+   * Версия сессий пользователя. Кладётся в JWT при входе и сверяется при
+   * каждом чтении сессии; рост счётчика (смена пароля, блокировка,
+   * «выйти со всех устройств») отзывает все выданные токены.
+   */
+  sessionVersion: integer("session_version").default(0).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).$onUpdate(() => new Date()),
 }, (t) => [
   unique("users_email").on(t.email),
@@ -257,7 +274,9 @@ export const categories = pgTable("categories", {
 
 export const orders = pgTable("orders", {
   id: serial("id").primaryKey(),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // restrict: клиента с заказами удалить нельзя - вместе с ним пропали бы
+  // заказы, а с ними выручка и история. Человека убирают отключением входа
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
   totalPrice: numeric("total_price", { precision: 10, scale: 2 }).notNull(),
   isUrgent: boolean("is_urgent").default(false).notNull(),
   status: ordersStatusEnum("status").default("pending"),
@@ -274,8 +293,16 @@ export const orders = pgTable("orders", {
    * платить не ту сумму.
    */
   documentsVisible: boolean("documents_visible").default(false).notNull(),
+  /**
+   * Одноразовый ключ оформления (uuid из скрытого поля формы). Двойной
+   * щелчок или повтор запроса приходят с тем же ключом, и вместо второго
+   * заказа клиента отправляют на уже созданный. У перенесённых и
+   * заведённых иначе заказов пусто.
+   */
+  checkoutToken: varchar("checkout_token", { length: 36 }),
 }, (t) => [
   index("orders_user_id").on(t.userId),
+  uniqueIndex("orders_checkout_token_unique").on(t.checkoutToken),
   index("orders_idx_orders_status").on(t.status),
   index("orders_idx_orders_is_urgent").on(t.isUrgent),
   index("orders_idx_orders_created_at").on(t.createdAt),
@@ -297,7 +324,10 @@ export const orderChats = pgTable("order_chats", {
 export const chatMessages = pgTable("chat_messages", {
   id: serial("id").primaryKey(),
   chatId: integer("chat_id").notNull().references(() => orderChats.id, { onDelete: "cascade" }),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // no action, а не restrict: проверка в конце оператора. Удаляя клиента,
+  // каскад сначала уберёт его чаты (а с ними и сообщения), а сообщения
+  // сотрудника в чужих чатах по-прежнему не дадут его удалить
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "no action" }),
   message: text("message").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
 }, (t) => [
@@ -362,10 +392,16 @@ export const commercialOffers = pgTable("commercial_offers", {
   status: commercialOffersStatusEnum("status").default("draft"),
   totalAmount: numeric("total_amount", { precision: 12, scale: 2 }).default("0.00"),
   createdBy: integer("created_by"),
+  /**
+   * Заказ, созданный из этого КП. По нему повторное нажатие «создать
+   * заказ» отправляет на уже созданный, а не заводит второй.
+   */
+  externalOrderId: integer("external_order_id").references(() => externalOrders.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).defaultNow().$onUpdate(() => new Date()),
 }, (t) => [
   unique("commercial_offers_idx_number").on(t.number),
+  index("commercial_offers_external_order_id").on(t.externalOrderId),
   index("commercial_offers_idx_status").on(t.status),
   index("commercial_offers_idx_created_by").on(t.createdBy),
 ]);
@@ -525,6 +561,12 @@ export const crmReminders = pgTable("crm_reminders", {
   isCompleted: boolean("is_completed").default(false),
   /** Кому напомнить */
   assignedTo: integer("assigned_to").notNull(),
+  /**
+   * Для какого `remind_at` исполнителю уже ушло напоминание. Не флажок, а
+   * сама дата: перенесли напоминание на другой срок - значение перестало
+   * совпадать, и оно сработает снова. Пишет планировщик (api/cron/run).
+   */
+  notifiedRemindAt: timestamp("notified_remind_at", { mode: "date" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
 }, (t) => [
   index("crm_reminders_idx_remind").on(t.remindAt, t.isCompleted),
@@ -626,6 +668,10 @@ export const documents = pgTable("documents", {
   index("documents_idx_doc_type").on(t.docType),
   index("documents_idx_document_date").on(t.documentDate),
   index("documents_idx_created_at").on(t.createdAt),
+  // Частичный: у документов без номера (шаблон «не нумеровать») он пуст
+  uniqueIndex("documents_document_number_unique")
+    .on(t.documentNumber)
+    .where(sql`${t.documentNumber} is not null`),
 ]);
 
 export const documentHistory = pgTable("document_history", {
@@ -644,6 +690,19 @@ export const documentHistory = pgTable("document_history", {
   index("document_history_idx_document").on(t.documentId),
   index("document_history_idx_created_at").on(t.createdAt),
 ]);
+
+/**
+ * Атомарные счётчики номеров: закупки, КП, обращения, документы.
+ * Ключ вида `purchase:2026`, `offer:2026`, `ticket:20261028`,
+ * `doc:СЧ-2026`. Выдаёт номера nextNumber (lib/numbering-db.ts) - одним
+ * INSERT … ON CONFLICT DO UPDATE, поэтому два одновременных запроса
+ * не получают один номер. Прежний `count(*) + 1` давал совпадения и
+ * ошибку 500 на уникальном индексе.
+ */
+export const counters = pgTable("counters", {
+  key: varchar("key", { length: 120 }).primaryKey(),
+  value: integer("value").notNull().default(0),
+});
 
 export const documentNumberCounters = pgTable("document_number_counters", {
   id: serial("id").primaryKey(),
@@ -737,7 +796,20 @@ export const externalOrders = pgTable("external_orders", {
   description: text("description"),
   status: externalOrdersStatusEnum("status").default("unpaid"),
   productionStatus: externalOrdersProductionStatusEnum("production_status").default("pending").notNull(),
+  /**
+   * Итог заказа. Руками не вписывается: его считает recalcOrderMoney как
+   * сумму позиций плюс корректировка (adjustment). Раньше итог правили
+   * отдельно от позиций, и после правки состава он молча расходился.
+   */
   totalPrice: numeric("total_price", { precision: 10, scale: 2 }).default("0.00").notNull(),
+  /**
+   * Скидка (со знаком минус) или наценка на заказ целиком. Явная строка
+   * вместо «итога, который отличается от суммы позиций»: так видно, откуда
+   * взялась разница, и она переживает правку позиций.
+   */
+  adjustment: numeric("adjustment", { precision: 10, scale: 2 }).default("0.00").notNull(),
+  /** За что корректировка - «скидка 10 % по КП», «доставка». */
+  adjustmentNote: varchar("adjustment_note", { length: 255 }),
   estimatedReadyDate: timestamp("estimated_ready_date", { mode: "date" }),
   /** Показывать ли клиенту счёт и УПД - см. orders.documentsVisible. */
   documentsVisible: boolean("documents_visible").default(false).notNull(),
@@ -752,7 +824,8 @@ export const externalOrders = pgTable("external_orders", {
 export const externalOrderItems = pgTable("external_order_items", {
   id: serial("id").primaryKey(),
   externalOrderId: integer("external_order_id").notNull().references(() => externalOrders.id, { onDelete: "cascade" }),
-  productId: integer("product_id").references(() => products.id, { onDelete: "cascade" }),
+  // set null: позиция остаётся с названием (item_name), даже если товар удалили
+  productId: integer("product_id").references(() => products.id, { onDelete: "set null" }),
   isCustom: boolean("is_custom").default(false).notNull(),
   itemName: varchar("item_name", { length: 255 }),
   itemDescription: text("item_description"),
@@ -794,10 +867,18 @@ export const generalExpenses = pgTable("general_expenses", {
   categoryId: integer("category_id"),
   amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
   description: text("description"),
+  /**
+   * Оплата закупки: расход заведён отметкой «Оплачено» на закупке. По этим
+   * строкам считается purchase_orders.paid_amount, поэтому такой расход
+   * нельзя удалить из бухгалтерии отдельно - только отменой оплаты.
+   * set null: удалённая закупка не должна утащить за собой расход.
+   */
+  purchaseOrderId: integer("purchase_order_id").references(() => purchaseOrders.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   expenseDate: timestamp("expense_date", { mode: "date" }).defaultNow().notNull(),
 }, (t) => [
   index("general_expenses_category_id").on(t.categoryId),
+  index("general_expenses_purchase_order_id").on(t.purchaseOrderId),
 ]);
 
 export const massMessages = pgTable("mass_messages", {
@@ -810,7 +891,7 @@ export const massMessages = pgTable("mass_messages", {
   specificUserIds: jsonb("specific_user_ids"),
   status: massMessagesStatusEnum("status").default("draft").notNull(),
   scheduledAt: timestamp("scheduled_at", { mode: "date" }),
-  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "restrict" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   sentAt: timestamp("sent_at", { withTimezone: true, mode: "date" }),
   totalRecipients: integer("total_recipients").default(0),
@@ -896,9 +977,23 @@ export const materialsMovements = pgTable("materials_movements", {
   referenceType: materialsMovementsReferenceTypeEnum("reference_type").notNull(),
   referenceId: integer("reference_id"),
   comment: text("comment"),
+  /**
+   * Приход, которым отменено списание: ссылка на отменяемое движение.
+   * Уникальный индекс - одно списание вернуть на склад дважды нельзя,
+   * даже если нажали «Вернуть» в двух вкладках.
+   */
+  reversesMovementId: integer("reverses_movement_id"),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
 }, (t) => [
   index("materials_movements_material_id").on(t.materialId),
+  uniqueIndex("materials_movements_reverses_unique").on(t.reversesMovementId),
+  // Имя задано явно: сгенерированное длиннее 63 знаков, Postgres его обрезает
+  // и push потом вечно предлагает пересоздать ключ (HANDOFF, п. 12)
+  foreignKey({
+    columns: [t.reversesMovementId],
+    foreignColumns: [t.id],
+    name: "materials_movements_reverses_fk",
+  }).onDelete("set null"),
 ]);
 
 export const materialsStock = pgTable("materials_stock", {
@@ -1034,12 +1129,18 @@ export const orderDocuments = pgTable("order_documents", {
 export const ordersAccounting = pgTable("orders_accounting", {
   id: serial("id").primaryKey(),
   source: ordersAccountingSourceEnum("source").default("site").notNull(),
-  orderId: integer("order_id").references(() => orders.id, { onDelete: "cascade" }),
   /**
-   * Заказ менеджера. В отличие от orderId удаление заказа карточку не
-   * уносит: деньги по нему уже прошли, и в отчёте за месяц они должны
-   * остаться. Имя заказчика лежит рядом строкой, так что карточка
-   * читается и без заказа.
+   * restrict: бухгалтерия не исчезает вместе с заказом, а заказ, у
+   * которого есть карточка, удалить нельзя - его отменяют. Если заказ всё
+   * же нужно стереть (например тестовый), карточку удаляют явно перед ним.
+   */
+  orderId: integer("order_id").references(() => orders.id, { onDelete: "restrict" }),
+  /**
+   * Заказ менеджера. Удалить можно только заказ без платежей и списаний,
+   * и тогда карточку удаляют вместе с ним (deleteExternalOrderChecked).
+   * set null остался для старых карточек, чей заказ удалили раньше: они
+   * помечены is_cancelled и в выручку не входят. Имя заказчика лежит
+   * рядом строкой, так что карточка читается и без заказа.
    */
   externalOrderId: integer("external_order_id").references(() => externalOrders.id, { onDelete: "set null" }),
   clientName: varchar("client_name", { length: 255 }),
@@ -1048,19 +1149,37 @@ export const ordersAccounting = pgTable("orders_accounting", {
   estimatedExpense: numeric("estimated_expense", { precision: 10, scale: 2 }).default("0.00").notNull(),
   taxAmount: numeric("tax_amount", { precision: 10, scale: 2 }).default("0.00").notNull(),
   status: ordersAccountingStatusEnum("status").default("unpaid").notNull(),
+  /**
+   * Заказ отменён (или удалён, а карточка осталась). Карточка остаётся
+   * для истории, но в выручку, долги и аналитику не входит. Ставит
+   * recalcOrderMoney по статусу самого заказа.
+   */
+  isCancelled: boolean("is_cancelled").default(false).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).defaultNow().$onUpdate(() => new Date()),
 }, (t) => [
   index("orders_accounting_order_id").on(t.orderId),
+  index("orders_accounting_external_order_id").on(t.externalOrderId),
 ]);
 
 export const orderItems = pgTable("order_items", {
   id: serial("id").primaryKey(),
   orderId: integer("order_id").notNull().references(() => orders.id, { onDelete: "cascade" }),
-  productId: integer("product_id").references(() => products.id, { onDelete: "cascade" }),
+  // set null: товар убрали из каталога, а позиция заказа остаётся -
+  // название и характеристики лежат в item_name на момент заказа
+  productId: integer("product_id").references(() => products.id, { onDelete: "set null" }),
   isCustom: boolean("is_custom").default(false).notNull(),
   itemName: varchar("item_name", { length: 255 }),
+  /**
+   * Чистое название товара на момент заказа, без характеристик. В
+   * item_name лежит «Название, Характеристика: значение», и группировать
+   * по нему аналитику нельзя - продажи одного товара раздробились бы по
+   * вариантам. Пусто у старых заказов и у своих позиций.
+   */
+  productName: varchar("product_name", { length: 255 }),
   itemNote: text("item_note"),
+  /** Единица измерения на момент заказа. Пусто у старых заказов - тогда берётся из товара. */
+  unit: varchar("unit", { length: 50 }),
   quantity: integer("quantity").notNull(),
   unitPrice: numeric("unit_price", { precision: 10, scale: 2 }),
   price: numeric("price", { precision: 10, scale: 2 }).notNull(),
@@ -1073,7 +1192,9 @@ export const orderItems = pgTable("order_items", {
 export const orderExpenses = pgTable("order_expenses", {
   id: serial("id").primaryKey(),
   orderAccountingId: integer("order_accounting_id").notNull().references(() => ordersAccounting.id, { onDelete: "cascade" }),
-  orderItemId: integer("order_item_id").references(() => orderItems.id, { onDelete: "cascade" }),
+  // set null: расход принадлежит заказу, а не позиции - удалили позицию,
+  // а затраты на неё остались в карточке
+  orderItemId: integer("order_item_id").references(() => orderItems.id, { onDelete: "set null" }),
   materialName: varchar("material_name", { length: 255 }),
   quantity: numeric("quantity", { precision: 10, scale: 4 }),
   unit: varchar("unit", { length: 50 }),
@@ -1082,12 +1203,29 @@ export const orderExpenses = pgTable("order_expenses", {
   categoryId: integer("category_id").references(() => expensesCategories.id, { onDelete: "set null" }),
   amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
   description: text("description"),
+  /**
+   * Фактическое списание материала со склада на этот заказ.
+   *
+   * Отдельный признак, а не «material_name не пуст»: название материала
+   * может оказаться и в строке, вписанной руками, а правило «факт
+   * вытесняет оценку» должно срабатывать только на настоящее списание.
+   * Пока у карточки есть хоть одно списание, строка расчётной
+   * себестоимости в total_expense не входит - иначе материал считался бы
+   * дважды: по рецептуре и по факту.
+   */
+  isWriteOff: boolean("is_write_off").default(false).notNull(),
+  /**
+   * Движение склада, которым материал списан. По нему «вернуть на склад»
+   * знает материал и количество, не гадая по названию.
+   */
+  materialMovementId: integer("material_movement_id").references(() => materialsMovements.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   expenseDate: timestamp("expense_date", { mode: "date" }).defaultNow().notNull(),
 }, (t) => [
   index("order_expenses_ibfk_2").on(t.categoryId),
   index("order_expenses_fk_order_expenses_accounting").on(t.orderAccountingId),
   index("order_expenses_idx_order_item_id").on(t.orderItemId),
+  index("order_expenses_material_movement_id").on(t.materialMovementId),
 ]);
 
 export const orderPayments = pgTable("order_payments", {
@@ -1097,8 +1235,15 @@ export const orderPayments = pgTable("order_payments", {
   paidAt: timestamp("paid_at", { mode: "date" }).defaultNow(),
   note: text("note"),
   paymentDate: timestamp("payment_date", { mode: "date" }).defaultNow().notNull(),
+  /**
+   * Счёт Точки, по которому пришли деньги. Уникален: сверку с банком
+   * запускают сколько угодно раз, а платёж по одному счёту должен
+   * завестись ровно один.
+   */
+  tochkaInvoiceId: integer("tochka_invoice_id").references(() => tochkaInvoices.id, { onDelete: "set null" }),
 }, (t) => [
   index("order_payments_order_accounting_id").on(t.orderAccountingId),
+  unique("order_payments_tochka_invoice_id").on(t.tochkaInvoiceId),
 ]);
 
 export const orderPromocodes = pgTable("order_promocodes", {
@@ -1459,7 +1604,7 @@ export const qcInspections = pgTable("qc_inspections", {
   /** По какому чек-листу */
   checklistId: integer("checklist_id").references(() => qcChecklists.id, { onDelete: "set null" }),
   /** Кто проверял */
-  inspectorId: integer("inspector_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  inspectorId: integer("inspector_id").notNull().references(() => users.id, { onDelete: "restrict" }),
   result: qcInspectionsResultEnum("result").default("passed").notNull(),
   /** Общее заключение */
   summary: text("summary"),
@@ -1485,7 +1630,7 @@ export const qcDefects = pgTable("qc_defects", {
   /** Фотоотчёт */
   photoPath: varchar("photo_path", { length: 255 }),
   status: qcDefectsStatusEnum("status").default("open").notNull(),
-  reportedBy: integer("reported_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  reportedBy: integer("reported_by").notNull().references(() => users.id, { onDelete: "restrict" }),
   fixedBy: integer("fixed_by").references(() => users.id, { onDelete: "set null" }),
   fixedAt: timestamp("fixed_at", { mode: "date" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
@@ -1523,6 +1668,25 @@ export const rateLimits = pgTable("rate_limits", {
   index("rate_limits_idx_cleanup").on(t.attemptedAt),
 ]);
 
+/**
+ * Разовые коды привязки телеграма. Храним только sha256-отпечаток кода
+ * (как ссылки на сброс пароля): утечка базы не выдаёт живых кодов.
+ * Код одноразовый - при использовании строка удаляется. Уборка: строки с
+ * expires_at < now() (при выдаче нового кода чистятся сразу, остальное -
+ * планировщик).
+ */
+export const telegramLinkCodes = pgTable("telegram_link_codes", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  codeHash: varchar("code_hash", { length: 64 }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true, mode: "date" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
+}, (t) => [
+  uniqueIndex("telegram_link_codes_code_hash").on(t.codeHash),
+  index("telegram_link_codes_user_id").on(t.userId),
+  index("telegram_link_codes_expires_at").on(t.expiresAt),
+]);
+
 export const reviews = pgTable("reviews", {
   id: serial("id").primaryKey(),
   userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
@@ -1542,7 +1706,7 @@ export const rolePermissions = pgTable("role_permissions", {
   id: serial("id").primaryKey(),
   /** Роль: admin, manager, user */
   role: varchar("role", { length: 30 }).notNull(),
-  /** Модуль: orders, products, materials, documents, users, finance, calculator, messaging, tasks, kanban, pricelist */
+  /** Модуль: orders, products, materials, documents, users, crm, counterparties, finance, calculator, messaging, tasks, kanban, pricelist */
   module: varchar("module", { length: 50 }).notNull(),
   /** Действие: view, create, edit, delete, manage */
   action: varchar("action", { length: 30 }).default("view").notNull(),
@@ -1615,7 +1779,8 @@ export const supportTickets = pgTable("support_tickets", {
 export const supportTicketMessages = pgTable("support_ticket_messages", {
   id: serial("id").primaryKey(),
   ticketId: integer("ticket_id").notNull().references(() => supportTickets.id, { onDelete: "cascade" }),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // no action: см. chat_messages.user_id
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "no action" }),
   message: text("message").notNull(),
   isInternal: boolean("is_internal").default(false),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
@@ -1630,10 +1795,12 @@ export const tasks = pgTable("tasks", {
   description: text("description"),
   taskItems: jsonb("task_items"),
   assignedTo: integer("assigned_to").references(() => users.id, { onDelete: "set null" }),
-  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+  createdBy: integer("created_by").notNull().references(() => users.id, { onDelete: "restrict" }),
   status: tasksStatusEnum("status").default("pending"),
   priority: tasksPriorityEnum("priority").default("medium"),
   dueDate: timestamp("due_date", { mode: "date" }),
+  /** Для какого `due_date` исполнителю уже сообщили о сроке (см. crm_reminders.notified_remind_at). */
+  notifiedDueDate: timestamp("notified_due_date", { mode: "date" }),
   relatedOrderAccountingId: integer("related_order_accounting_id").references(() => ordersAccounting.id, { onDelete: "set null", onUpdate: "cascade" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).defaultNow().notNull().$onUpdate(() => new Date()),
@@ -1648,7 +1815,8 @@ export const tasks = pgTable("tasks", {
 export const taskComments = pgTable("task_comments", {
   id: serial("id").primaryKey(),
   taskId: integer("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
-  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // no action: см. chat_messages.user_id
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "no action" }),
   comment: text("comment").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow().notNull(),
 }, (t) => [

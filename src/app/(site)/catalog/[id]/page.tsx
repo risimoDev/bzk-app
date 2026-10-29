@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { cache } from "react";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { eq, and, asc, desc } from "drizzle-orm";
@@ -24,9 +25,12 @@ import { TapeLabel } from "@/components/ui/TapeLabel";
 import { StampBadge } from "@/components/ui/StampBadge";
 import { ClippedCard } from "@/components/ui/ClippedCard";
 import { currentUser } from "@/auth";
-import { reviews, orderItems, orders } from "@/db/schema";
+import { reviews } from "@/db/schema";
+import { hasReviewableOrder } from "@/lib/reviews-db";
+import { fromUnitPrice } from "@/lib/product-price";
 import { Star } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 const money = new Intl.NumberFormat("ru-RU", {
   style: "currency",
@@ -39,7 +43,7 @@ const reviewDate = new Intl.DateTimeFormat("ru-RU", {
   year: "numeric",
 });
 
-async function getProduct(id: number) {
+const getProduct = cache(async (id: number) => {
   const [item] = await db
     .select({
       id: products.id,
@@ -121,13 +125,18 @@ async function getProduct(id: number) {
   const logo = images.find((i) => i.kind === "logo") ?? null;
 
   return { item, photos, logo, tiers, attributes };
-}
+});
 
 export async function generateMetadata(
   props: PageProps<"/catalog/[id]">,
 ): Promise<Metadata> {
   const { id } = await props.params;
-  const data = /^\d+$/.test(id) ? await getProduct(Number(id)) : null;
+  // Не «только цифры», а id в пределах integer: /catalog/99999999999
+  // проходил проверку цифрами и ронял запрос переполнением
+  const productId = parseId(id);
+  const data = productId === null ? null : await getProduct(productId);
+  // Статус 404 для несуществующего товара отдаёт proxy.ts: отсюда и из
+  // страницы notFound() приходит уже после loading.tsx, когда ответ начат
   if (!data) return { title: "Товар не найден" };
 
   const description =
@@ -156,12 +165,12 @@ export async function generateMetadata(
 
 export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const productId = parseId(id);
+  if (productId === null) notFound();
 
-  const data = await getProduct(Number(id));
+  const data = await getProduct(productId);
   if (!data) notFound();
 
-  const productId = Number(id);
   const user = await currentUser();
 
   // Отзыв показываем только одобренный: очередь модерации живёт в
@@ -179,22 +188,12 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
     .orderBy(desc(reviews.createdAt))
     .limit(20);
 
-  // Форму показываем тому, кто этот товар заказывал и ещё не высказался:
-  // сервер проверит то же самое, но пустая форма «не для вас» раздражает
+  // Форму показываем тому, кто этот товар получил (заказ отправлен или
+  // завершён) и ещё не высказался: сервер проверит то же самое, но пустая
+  // форма «не для вас» раздражает
   const canReview = user
     ? await (async () => {
-        const [ordered] = await db
-          .select({ id: orderItems.id })
-          .from(orderItems)
-          .innerJoin(orders, eq(orders.id, orderItems.orderId))
-          .where(
-            and(
-              eq(orderItems.productId, productId),
-              eq(orders.userId, Number(user.id)),
-            ),
-          )
-          .limit(1);
-        if (!ordered) return false;
+        if (!(await hasReviewableOrder(Number(user.id), productId))) return false;
 
         const [own] = await db
           .select({ id: reviews.id })
@@ -214,6 +213,15 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
 
   const { item, photos, logo, tiers, attributes } = data;
 
+  // «От» - цена за единицу при минимальном тираже, а не базовая: так же
+  // посчитает корзина
+  const fromPrice = fromUnitPrice({
+    basePrice: item.basePrice,
+    tiers: tiers.map((t) => ({ minQty: t.minQty, maxQty: t.maxQty, price: t.price })),
+    minQuantity: item.minQuantity,
+    multiplicity: item.multiplicity,
+  });
+
   const size =
     item.itemWidthMm && item.itemHeightMm
       ? `${Number(item.itemWidthMm)}×${Number(item.itemHeightMm)} мм`
@@ -230,7 +238,7 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
               name: item.name,
               description: item.description,
               imageUrl: photos[0]?.imageUrl ?? logo?.imageUrl ?? null,
-              basePrice: item.basePrice,
+              basePrice: String(fromPrice),
               tierPrices: tiers.map((t) => t.price),
               rating:
                 averageRating !== null
@@ -283,7 +291,7 @@ export default async function ProductPage(props: PageProps<"/catalog/[id]">) {
 
               <p className="mt-5 font-mono text-3xl text-ink">
                 <span className="text-base text-ink/45">от </span>
-                {money.format(Number(item.basePrice))}
+                {money.format(fromPrice)}
                 <span className="text-base text-ink/45">
                   {" "}
                   / {item.unit ?? "шт."}

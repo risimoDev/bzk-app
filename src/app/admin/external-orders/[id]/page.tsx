@@ -2,11 +2,10 @@ import type { Metadata } from "next";
 import { Fragment } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { asc, desc, eq, sql } from "drizzle-orm";
 import {
   ArrowLeft,
   ExternalLink,
-  Factory,
   Mail,
   MapPin,
   Phone,
@@ -19,14 +18,13 @@ import {
   externalOrders,
   externalOrderItems,
   externalOrderReadyHistory,
-  materials,
-  materialsMovements,
-  materialsStock,
   products,
   suppliers,
   users,
   qcDefects,
   productionOrders,
+  ordersAccounting,
+  orderPayments,
 } from "@/db/schema";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
@@ -40,15 +38,18 @@ import {
   CounterpartyPicker,
   DeleteOrderButton,
   OrderHeaderForm,
-  PaymentControls,
   ProductionControls,
   ReadyDateForm,
 } from "./OrderControls";
 import { DeleteItemButton, ItemForm } from "./ItemForm";
-import { startProduction } from "@/app/admin/production/actions";
-import { WriteOffForm } from "./WriteOffForm";
+import { StartProductionForm } from "@/app/admin/production/ProductionForms";
+import { ReturnWriteOffButton, WriteOffForm } from "@/app/admin/materials/WriteOffForm";
+import { activeMaterialOptions, listWriteOffs } from "@/lib/write-off-db";
+import { PaymentForm } from "@/app/admin/finance/FinanceForms";
+import { debtOf, externalOrderTotal } from "@/lib/order-money";
 import { DocumentsToggle } from "@/app/admin/orders/DocumentsToggle";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Внешний заказ · Админка",
@@ -95,8 +96,8 @@ export default async function AdminExternalOrder({
   }
 
   const { id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   const [order] = await db
     .select()
@@ -192,40 +193,31 @@ export default async function AdminExternalOrder({
     ]);
 
   const canStock = await can("materials", "edit");
+  const [canFinance, canPay] = await Promise.all([
+    can("finance", "view"),
+    can("finance", "create"),
+  ]);
+
+  // Оплата - из бухгалтерской карточки: статус заказа лишь её копия, а
+  // сумму платежей и остаток знает только карточка
+  const [card] = await db
+    .select({ id: ordersAccounting.id, income: ordersAccounting.income })
+    .from(ordersAccounting)
+    .where(eq(ordersAccounting.externalOrderId, orderId))
+    .orderBy(asc(ordersAccounting.id))
+    .limit(1);
+  const [paidRow] = card
+    ? await db
+        .select({ paid: sql<string>`coalesce(sum(${orderPayments.amount}), 0)` })
+        .from(orderPayments)
+        .where(eq(orderPayments.orderAccountingId, card.id))
+    : [{ paid: "0" }];
+  const paidSum = Number(paidRow?.paid ?? 0);
 
   const [materialList, writeOffs] = await Promise.all([
-    canStock
-      ? db
-          .select({
-            id: materials.id,
-            name: materials.name,
-            unit: materials.unit,
-            quantity: materialsStock.quantity,
-          })
-          .from(materials)
-          .leftJoin(materialsStock, eq(materialsStock.materialId, materials.id))
-          .orderBy(asc(materials.name))
-      : Promise.resolve([]),
+    canStock ? activeMaterialOptions(db) : Promise.resolve([]),
     // Списания по этому заказу: движение помечено ссылкой на него
-    db
-      .select({
-        id: materialsMovements.id,
-        quantity: materialsMovements.quantity,
-        createdAt: materialsMovements.createdAt,
-        name: materials.name,
-        unit: materials.unit,
-        cost: materials.costPerUnit,
-      })
-      .from(materialsMovements)
-      .innerJoin(materials, eq(materials.id, materialsMovements.materialId))
-      .where(
-        and(
-          eq(materialsMovements.referenceType, "order"),
-          eq(materialsMovements.referenceId, orderId),
-          eq(materialsMovements.type, "out"),
-        ),
-      )
-      .orderBy(desc(materialsMovements.createdAt)),
+    listWriteOffs(db, { source: "external", id: orderId }),
   ]);
 
   const defects = production[0]
@@ -248,9 +240,12 @@ export default async function AdminExternalOrder({
     .filter((i) => i.isOutsourced)
     .reduce((s, i) => s + Number(i.price), 0);
 
-  // Сумма позиций и записанный итог могут разойтись: менеджер правит итог
-  // руками - например, когда даёт скидку целиком на заказ
-  const mismatch = items.length > 0 && Math.abs(itemsSum - total) > 0.01;
+  const adjustment = Number(order.adjustment);
+  const debt = debtOf(total, paidSum);
+
+  // Итог пересчитывается из позиций и корректировки. Если он всё же
+  // разошёлся (правили базу в обход приложения), это надо увидеть
+  const mismatch = Math.abs(externalOrderTotal(itemsSum, adjustment) - total) > 0.01;
 
   return (
     <AdminPage
@@ -411,13 +406,22 @@ export default async function AdminExternalOrder({
                   )}
                 </>
               )}
+              {adjustment !== 0 && (
+                <Row
+                  label={
+                    (adjustment < 0 ? "Скидка" : "Наценка") +
+                    (order.adjustmentNote ? ` (${order.adjustmentNote})` : "")
+                  }
+                  value={(adjustment < 0 ? "−" : "+") + money.format(Math.abs(adjustment))}
+                />
+              )}
               <Row label="Итог заказа" value={money.format(total)} strong />
               <Row label="Маржа" value={money.format(total - expenses)} />
 
               {mismatch && (
-                <p className="mt-1 max-w-md text-right text-xs text-ink/45">
-                  Итог отличается от суммы позиций на{" "}
-                  {money.format(Math.abs(total - itemsSum))} - так его записал менеджер.
+                <p className="mt-1 max-w-md text-right text-xs text-warn">
+                  Итог не сходится с суммой позиций и корректировкой - сохраните данные
+                  заказа, чтобы пересчитать.
                 </p>
               )}
             </footer>
@@ -453,7 +457,9 @@ export default async function AdminExternalOrder({
                     email: order.email,
                     address: order.address,
                     description: order.description,
-                    totalPrice: order.totalPrice,
+                    itemsSum,
+                    adjustment: order.adjustment,
+                    adjustmentNote: order.adjustmentNote,
                   }}
                 />
               </div>
@@ -592,10 +598,37 @@ export default async function AdminExternalOrder({
             >
               {pay.label}
             </span>
-            {canEdit && (
-              <div className="mt-3">
-                <PaymentControls orderId={order.id} status={order.status} />
+            {/* Статус оплаты считается из платежей - руками его не выбирают.
+                Платёж вносит тот, у кого есть право на бухгалтерию: менеджер
+                видит итог, но деньги в учёт не записывает */}
+            <dl className="mt-3 flex flex-col gap-1 text-sm">
+              <div className="flex justify-between gap-3">
+                <dt className="text-ink/55">Оплачено</dt>
+                <dd className="font-mono tabular-nums text-ink">{money.format(paidSum)}</dd>
               </div>
+              {debt > 0 && order.productionStatus !== "cancelled" && (
+                <div className="flex justify-between gap-3">
+                  <dt className="text-ink/55">Остаток</dt>
+                  <dd className="font-mono tabular-nums text-warn">{money.format(debt)}</dd>
+                </div>
+              )}
+            </dl>
+            {card && canPay ? (
+              <div className="mt-3">
+                <PaymentForm cardId={card.id} />
+              </div>
+            ) : (
+              <p className="mt-3 text-xs text-ink/45">
+                Статус меняется сам, когда бухгалтерия вносит платёж.
+              </p>
+            )}
+            {card && canFinance && (
+              <Link
+                href={`/admin/finance/${card.id}`}
+                className="mt-2 inline-block text-xs text-brand hover:text-brand-bright"
+              >
+                Платежи и расходы заказа
+              </Link>
             )}
           </div>
 
@@ -631,16 +664,7 @@ export default async function AdminExternalOrder({
               </Link>
             ) : (
               canStartProduction && (
-                <form action={startProduction} className="mt-3">
-                  <input type="hidden" name="externalOrderId" value={order.id} />
-                  <button
-                    type="submit"
-                    className="flex w-full items-center justify-center gap-2 rounded-lg bg-brand px-4 py-2 font-display text-xs tracking-wider text-bone hover:bg-brand-bright"
-                  >
-                    <Factory className="size-3.5" aria-hidden />
-                    ЗАПУСТИТЬ В ПРОИЗВОДСТВО
-                  </button>
-                </form>
+                <StartProductionForm field="externalOrderId" orderId={order.id} />
               )
             )}
           </div>
@@ -702,12 +726,22 @@ export default async function AdminExternalOrder({
               {writeOffs.length > 0 && (
                 <ul className="mt-3 flex flex-col gap-1.5 border-b border-ink/10 pb-3 text-sm">
                   {writeOffs.map((w) => (
-                    <li key={w.id} className="flex justify-between gap-3">
-                      <span className="text-ink/75">{w.name}</span>
-                      <span className="whitespace-nowrap font-mono text-xs text-ink/50">
+                    <li key={w.id} className="flex items-center justify-between gap-3">
+                      <span className={cn("text-ink/75", w.returned && "text-ink/40 line-through")}>
+                        {w.name}
+                      </span>
+                      <span className="flex items-center gap-2 whitespace-nowrap font-mono text-xs text-ink/50">
                         {Number(w.quantity)} {w.unit}
-                        {w.cost &&
-                          ` · ${money.format(Number(w.quantity) * Number(w.cost))}`}
+                        {w.amount && ` · ${money.format(Number(w.amount))}`}
+                        {w.returned ? (
+                          <span className="font-sans text-ok">возвращено</span>
+                        ) : (
+                          <ReturnWriteOffButton
+                            source="external"
+                            orderId={order.id}
+                            movementId={w.id}
+                          />
+                        )}
                       </span>
                     </li>
                   ))}
@@ -716,7 +750,8 @@ export default async function AdminExternalOrder({
 
               <div className="mt-3">
                 <WriteOffForm
-                  externalOrderId={order.id}
+                  source="external"
+                  orderId={order.id}
                   materials={materialList}
                 />
               </div>

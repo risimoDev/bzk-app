@@ -18,6 +18,7 @@ import {
 } from "@/lib/client-portal";
 import { TicketReply } from "./TicketReply";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Обращение",
@@ -39,8 +40,8 @@ export default async function ClientTicketPage({
   if (!user) redirect("/login?from=/client/support");
 
   const { id } = await params;
-  const ticketId = Number(id);
-  if (!Number.isInteger(ticketId) || ticketId <= 0) notFound();
+  const ticketId = parseId(id);
+  if (ticketId === null) notFound();
 
   const userId = Number(user.id);
 

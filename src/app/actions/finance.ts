@@ -1,11 +1,10 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
 import {
   expensesCategories,
-  externalOrders,
   generalExpenses,
   orderExpenses,
   orderPayments,
@@ -13,6 +12,16 @@ import {
 } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { PurchaseRuleError, deleteGeneralExpenseRow } from "@/lib/purchases-db";
+import {
+  MoneyRuleError,
+  addOrderPayment,
+  deleteExpenseRow,
+  recalcCard,
+  type MoneySummary,
+} from "@/lib/order-money-db";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
 export type FinanceState = {
   ok?: boolean;
@@ -31,13 +40,17 @@ function parseMoney(raw: FormDataEntryValue | null) {
   return Number.isFinite(n) && n > 0 ? n : NaN;
 }
 
-/** Дата из формы. Пусто - сегодня: чаще всего вносят день в день. */
-function parseDate(raw: FormDataEntryValue | null) {
+/**
+ * Дата из формы. Пусто - сегодня: чаще всего вносят день в день. Число,
+ * которого нет в календаре (31 февраля), - null, а не молчаливая замена.
+ */
+function parseDate(raw: FormDataEntryValue | null): Date | null {
   const text = String(raw ?? "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return new Date();
+  if (text === "") return new Date();
+  const day = parseCalendarDate(text);
   // Полдень по местному, иначе календарный день съезжает при пересчёте
   // часового пояса
-  return new Date(`${text}T12:00:00`);
+  return day ? calendarDateAtNoon(day) : null;
 }
 
 async function categoryOrNull(raw: FormDataEntryValue | null) {
@@ -54,57 +67,24 @@ async function categoryOrNull(raw: FormDataEntryValue | null) {
 }
 
 /**
- * Пересчитывает карточку по её строкам.
- *
- * Поле total_expense в базе хранится отдельно от строк расходов, а
- * статус оплаты - отдельно от платежей. Оба легко разъезжаются, поэтому
- * после каждой правки считаем их заново из документов.
+ * Сбросить кеш страниц, где видны деньги карточки: сама карточка,
+ * бухгалтерия, аналитика и заказ, к которому она привязана.
  */
-async function recalc(cardId: number) {
-  const [{ expense }] = await db
-    .select({ expense: sql<string>`coalesce(sum(${orderExpenses.amount}), 0)` })
-    .from(orderExpenses)
-    .where(eq(orderExpenses.orderAccountingId, cardId));
-
-  const [{ paid }] = await db
-    .select({ paid: sql<string>`coalesce(sum(${orderPayments.amount}), 0)` })
-    .from(orderPayments)
-    .where(eq(orderPayments.orderAccountingId, cardId));
-
-  const [card] = await db
-    .select({
-      income: ordersAccounting.income,
-      externalOrderId: ordersAccounting.externalOrderId,
-    })
-    .from(ordersAccounting)
-    .where(eq(ordersAccounting.id, cardId))
-    .limit(1);
-  if (!card) return;
-
-  const income = Number(card.income);
-  const paidSum = Number(paid);
-  // Копейка туда-сюда при сложении numeric - не повод считать заказ
-  // недоплаченным
-  const status =
-    paidSum <= 0.005 ? "unpaid" : paidSum + 0.005 >= income ? "paid" : "partial";
-
-  await db
-    .update(ordersAccounting)
-    .set({ totalExpense: Number(expense).toFixed(2), status })
-    .where(eq(ordersAccounting.id, cardId));
-
-  // Оплата заказа хранится дважды: в карточке и в самом заказе. Не
-  // перенести её сюда - и менеджер увидит «не оплачен» на заказе, по
-  // которому бухгалтер уже провёл деньги
-  if (card.externalOrderId !== null) {
-    await db
-      .update(externalOrders)
-      .set({ status })
-      .where(eq(externalOrders.id, card.externalOrderId));
-
-    revalidatePath(`/admin/external-orders/${card.externalOrderId}`);
+function revalidateMoney(cardId: number, summary: MoneySummary | null) {
+  revalidatePath(`/admin/finance/${cardId}`);
+  revalidatePath("/admin/finance");
+  revalidatePath("/admin/analytics");
+  revalidatePath("/admin");
+  const ref = summary?.ref;
+  if (ref?.source === "external") {
+    revalidatePath(`/admin/external-orders/${ref.id}`);
     revalidatePath("/admin/external-orders");
+    revalidatePath(`/client/orders/external/${ref.id}`);
+  } else if (ref?.source === "site") {
+    revalidatePath(`/admin/orders/${ref.id}`);
+    revalidatePath(`/client/orders/${ref.id}`);
   }
+  revalidatePath("/client/orders");
 }
 
 /** Расход по заказу: материал, работа подрядчика, доставка. */
@@ -112,6 +92,9 @@ export async function addExpense(
   _prev: FinanceState,
   formData: FormData,
 ): Promise<FinanceState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("finance", "create"))) return DENIED;
 
   const cardId = Number(formData.get("cardId"));
@@ -134,21 +117,28 @@ export async function addExpense(
     .limit(1);
   if (!card) return { error: "Запись не найдена" };
 
-  await db.insert(orderExpenses).values({
-    orderAccountingId: cardId,
-    amount: amount.toFixed(2),
-    description,
-    categoryId: await categoryOrNull(formData.get("categoryId")),
-    expenseDate: parseDate(formData.get("expenseDate")),
+  const categoryId = await categoryOrNull(formData.get("categoryId"));
+  const expenseDate = parseDate(formData.get("expenseDate"));
+  if (!expenseDate) return { fieldErrors: { expenseDate: "Такой даты нет в календаре" } };
+
+  // Строка и пересчёт - одной транзакцией: иначе между ними итог карточки
+  // уже не совпадает со строками
+  const summary = await db.transaction(async (tx) => {
+    await tx.insert(orderExpenses).values({
+      orderAccountingId: cardId,
+      amount: amount.toFixed(2),
+      description,
+      categoryId,
+      expenseDate,
+    });
+    return recalcCard(tx, cardId);
   });
 
-  await recalc(cardId);
   await audit("finance.expense_add", { type: "orders_accounting", id: cardId }, {
     amount: amount.toFixed(2),
   });
 
-  revalidatePath(`/admin/finance/${cardId}`);
-  revalidatePath("/admin/finance");
+  revalidateMoney(cardId, summary);
   return { ok: true, message: "Расход записан" };
 }
 
@@ -166,27 +156,22 @@ export async function deleteExpense(
     return { error: "Расход не найден" };
   }
 
-  const removed = await db
-    .delete(orderExpenses)
-    .where(
-      and(
-        eq(orderExpenses.id, expenseId),
-        // Номер приходит из формы: без привязки к карточке можно было бы
-        // удалить чужую строку
-        eq(orderExpenses.orderAccountingId, cardId),
-      ),
-    )
-    .returning({ id: orderExpenses.id });
+  let result: Awaited<ReturnType<typeof deleteExpenseRow>>;
+  try {
+    result = await db.transaction((tx) => deleteExpenseRow(tx, cardId, expenseId));
+  } catch (e) {
+    // Списание материала удалять нельзя - только вернуть на склад
+    if (e instanceof MoneyRuleError) return { error: e.message };
+    throw e;
+  }
+  if (!result) return { error: "Расход не найден" };
 
-  if (removed.length === 0) return { error: "Расход не найден" };
-
-  await recalc(cardId);
   await audit("finance.expense_delete", { type: "orders_accounting", id: cardId }, {
     expenseId,
+    amount: result.amount,
   });
 
-  revalidatePath(`/admin/finance/${cardId}`);
-  revalidatePath("/admin/finance");
+  revalidateMoney(cardId, result.summary);
   return { ok: true, message: "Расход удалён" };
 }
 
@@ -200,6 +185,9 @@ export async function addPayment(
   _prev: FinanceState,
   formData: FormData,
 ): Promise<FinanceState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("finance", "create"))) return DENIED;
 
   const cardId = Number(formData.get("cardId"));
@@ -218,22 +206,22 @@ export async function addPayment(
   if (!card) return { error: "Запись не найдена" };
 
   const paidAt = parseDate(formData.get("paymentDate"));
+  if (!paidAt) return { fieldErrors: { paymentDate: "Такой даты нет в календаре" } };
 
-  await db.insert(orderPayments).values({
-    orderAccountingId: cardId,
-    amount: amount.toFixed(2),
-    note: String(formData.get("note") ?? "").trim().slice(0, 1000) || null,
-    paidAt,
-    paymentDate: paidAt,
-  });
+  const { summary } = await db.transaction((tx) =>
+    addOrderPayment(tx, cardId, {
+      amount,
+      paidAt,
+      note: String(formData.get("note") ?? "").trim().slice(0, 1000) || null,
+    }),
+  );
 
-  await recalc(cardId);
   await audit("finance.payment_add", { type: "orders_accounting", id: cardId }, {
     amount: amount.toFixed(2),
+    status: summary?.status ?? null,
   });
 
-  revalidatePath(`/admin/finance/${cardId}`);
-  revalidatePath("/admin/finance");
+  revalidateMoney(cardId, summary);
   return { ok: true, message: "Платёж записан" };
 }
 
@@ -251,25 +239,29 @@ export async function deletePayment(
     return { error: "Платёж не найден" };
   }
 
-  const removed = await db
-    .delete(orderPayments)
-    .where(
-      and(
-        eq(orderPayments.id, paymentId),
-        eq(orderPayments.orderAccountingId, cardId),
-      ),
-    )
-    .returning({ id: orderPayments.id });
-
-  if (removed.length === 0) return { error: "Платёж не найден" };
-
-  await recalc(cardId);
-  await audit("finance.payment_delete", { type: "orders_accounting", id: cardId }, {
-    paymentId,
+  const result = await db.transaction(async (tx) => {
+    const removed = await tx
+      .delete(orderPayments)
+      .where(
+        and(
+          eq(orderPayments.id, paymentId),
+          eq(orderPayments.orderAccountingId, cardId),
+        ),
+      )
+      .returning({ id: orderPayments.id, amount: orderPayments.amount });
+    if (removed.length === 0) return null;
+    return { amount: removed[0].amount, summary: await recalcCard(tx, cardId) };
   });
 
-  revalidatePath(`/admin/finance/${cardId}`);
-  revalidatePath("/admin/finance");
+  if (!result) return { error: "Платёж не найден" };
+
+  await audit("finance.payment_delete", { type: "orders_accounting", id: cardId }, {
+    paymentId,
+    amount: result.amount,
+    status: result.summary?.status ?? null,
+  });
+
+  revalidateMoney(cardId, result.summary);
   return { ok: true, message: "Платёж удалён" };
 }
 
@@ -283,6 +275,9 @@ export async function addGeneralExpense(
   _prev: FinanceState,
   formData: FormData,
 ): Promise<FinanceState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("finance", "create"))) return DENIED;
 
   const amount = parseMoney(formData.get("amount"));
@@ -295,13 +290,16 @@ export async function addGeneralExpense(
     return { fieldErrors: { description: "Напишите, за что расход" } };
   }
 
+  const expenseDate = parseDate(formData.get("expenseDate"));
+  if (!expenseDate) return { fieldErrors: { expenseDate: "Такой даты нет в календаре" } };
+
   const [created] = await db
     .insert(generalExpenses)
     .values({
       amount: amount.toFixed(2),
       description,
       categoryId: await categoryOrNull(formData.get("categoryId")),
-      expenseDate: parseDate(formData.get("expenseDate")),
+      expenseDate,
     })
     .returning({ id: generalExpenses.id });
 
@@ -325,11 +323,14 @@ export async function deleteGeneralExpense(
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id) || id <= 0) return { error: "Расход не найден" };
 
-  const removed = await db
-    .delete(generalExpenses)
-    .where(eq(generalExpenses.id, id))
-    .returning({ id: generalExpenses.id });
-  if (removed.length === 0) return { error: "Расход не найден" };
+  let removed: Awaited<ReturnType<typeof deleteGeneralExpenseRow>>;
+  try {
+    removed = await db.transaction((tx) => deleteGeneralExpenseRow(tx, id));
+  } catch (e) {
+    if (e instanceof PurchaseRuleError) return { error: e.message };
+    throw e;
+  }
+  if (!removed) return { error: "Расход не найден" };
 
   await audit("finance.general_expense_delete", { type: "general_expense", id });
   revalidatePath("/admin/finance");

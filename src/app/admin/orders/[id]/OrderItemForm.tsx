@@ -1,6 +1,7 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { useState } from "react";
+import { useLatestActionState } from "@/components/admin/useLatestActionState";
 import { Check, Trash2, TriangleAlert } from "lucide-react";
 import { ConfirmButton } from "@/components/ui/ConfirmButton";
 import { deleteOrderItem, saveOrderItem, type OrderItemState } from "../actions";
@@ -51,7 +52,7 @@ export function OrderItemForm({
   value?: OrderItemValues;
   productList: ProductOption[];
 }) {
-  const [state, action, pending] = useActionState(saveOrderItem, initial);
+  const [state, action, pending] = useLatestActionState(saveOrderItem, initial);
 
   const [productId, setProductId] = useState(value?.productId ? String(value.productId) : "");
   const [name, setName] = useState(value?.itemName ?? "");
@@ -182,7 +183,7 @@ export function DeleteOrderItemButton({
   orderId: number;
   itemId: number;
 }) {
-  const [state, action, pending] = useActionState(deleteOrderItem, initial);
+  const [state, action, pending] = useLatestActionState(deleteOrderItem, initial);
 
   return (
     <form action={action} className="flex items-center gap-2">

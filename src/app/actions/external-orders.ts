@@ -9,58 +9,56 @@ import {
   externalOrderItems,
   externalOrders,
   externalOrderReadyHistory,
-  ordersAccounting,
   products,
 } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import {
-  createAccountingForExternalOrder,
-  syncAccountingForExternalOrder,
-} from "@/lib/accounting-db";
+  MoneyRuleError,
+  addOrderPayment,
+  changeOrderStatus,
+  deleteExternalOrderChecked,
+  recalcOrderMoney,
+  type MoneySummary,
+  type Tx,
+} from "@/lib/order-money-db";
+import { externalOrderTotal } from "@/lib/order-money";
 import { notifyStaff } from "@/lib/notify";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
-import {
-  EXTERNAL_PAYMENT_STATUS,
-  EXTERNAL_PRODUCTION_STATUS,
-  type ExternalPaymentStatus,
-  type ExternalProductionStatus,
-} from "@/lib/external-orders";
+import { EXTERNAL_PRODUCTION_STATUS } from "@/lib/external-orders";
+import { isOrderStatus } from "@/lib/order-status";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
 export type ExternalState = { ok: boolean; message?: string };
 
 const DENIED: ExternalState = { ok: false, message: "Нет прав на изменение заказов" };
 
-export async function setPaymentStatus(
-  _prev: ExternalState,
-  formData: FormData,
-): Promise<ExternalState> {
-  if (!(await can("orders", "edit"))) return DENIED;
-
-  const orderId = Number(formData.get("orderId"));
-  const raw = String(formData.get("status") ?? "");
-
-  if (!Number.isInteger(orderId)) return { ok: false, message: "Заказ не найден" };
-  if (!(raw in EXTERNAL_PAYMENT_STATUS)) return { ok: false, message: "Неизвестный статус" };
-
-  const updated = await db
-    .update(externalOrders)
-    .set({ status: raw as ExternalPaymentStatus })
-    .where(eq(externalOrders.id, orderId))
-    .returning({ id: externalOrders.id });
-
-  if (updated.length === 0) return { ok: false, message: "Заказ не найден" };
-
+/** Деньги заказа поменялись - сбросить страницы, где они видны. */
+function revalidateOrderMoney(orderId: number) {
   revalidatePath("/admin/external-orders");
   revalidatePath(`/admin/external-orders/${orderId}`);
-  return {
-    ok: true,
-    message: `Оплата: ${EXTERNAL_PAYMENT_STATUS[raw as ExternalPaymentStatus].label.toLowerCase()}`,
-  };
+  revalidatePath(`/client/orders/external/${orderId}`);
+  revalidatePath("/client/orders");
+  revalidatePath("/admin/finance");
+  revalidatePath("/admin/analytics");
+  revalidatePath("/admin");
 }
 
+/*
+ * Статуса оплаты, выбираемого руками, больше нет: он считается из
+ * платежей (recalcOrderMoney). Ручной выбор расходился с бухгалтерией -
+ * менеджер ставил «оплачен», а платежа нет, и наоборот.
+ */
+
+/**
+ * Производственный статус заказа менеджера.
+ *
+ * Переходы - по той же таблице, что у сайтовых заказов. Отмена гасит
+ * производство и выводит заказ из выручки; это делает changeOrderStatus.
+ */
 export async function setProductionStatus(
   _prev: ExternalState,
   formData: FormData,
@@ -70,24 +68,31 @@ export async function setProductionStatus(
   const orderId = Number(formData.get("orderId"));
   const raw = String(formData.get("productionStatus") ?? "");
 
-  if (!Number.isInteger(orderId)) return { ok: false, message: "Заказ не найден" };
-  if (!(raw in EXTERNAL_PRODUCTION_STATUS)) {
-    return { ok: false, message: "Неизвестный статус" };
+  if (!Number.isInteger(orderId) || orderId <= 0) return { ok: false, message: "Заказ не найден" };
+  if (!isOrderStatus(raw)) return { ok: false, message: "Неизвестный статус" };
+
+  let result: Awaited<ReturnType<typeof changeOrderStatus>>;
+  try {
+    result = await db.transaction((tx) =>
+      changeOrderStatus(tx, { source: "external", id: orderId }, raw),
+    );
+  } catch (e) {
+    if (e instanceof MoneyRuleError) return { ok: false, message: e.message };
+    throw e;
   }
 
-  const updated = await db
-    .update(externalOrders)
-    .set({ productionStatus: raw as ExternalProductionStatus })
-    .where(eq(externalOrders.id, orderId))
-    .returning({ id: externalOrders.id });
+  if (!result.changed) return { ok: true, message: "Статус не изменился" };
 
-  if (updated.length === 0) return { ok: false, message: "Заказ не найден" };
+  await audit("external_order.production_status", { type: "external_order", id: orderId }, {
+    from: result.from,
+    to: raw,
+  });
 
-  revalidatePath("/admin/external-orders");
-  revalidatePath(`/admin/external-orders/${orderId}`);
+  revalidateOrderMoney(orderId);
+  revalidatePath("/admin/production");
   return {
     ok: true,
-    message: `Производство: ${EXTERNAL_PRODUCTION_STATUS[raw as ExternalProductionStatus].label.toLowerCase()}`,
+    message: `Производство: ${EXTERNAL_PRODUCTION_STATUS[raw].label.toLowerCase()}`,
   };
 }
 
@@ -101,6 +106,9 @@ export async function setReadyDate(
   _prev: ExternalState,
   formData: FormData,
 ): Promise<ExternalState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await can("orders", "edit"))) return DENIED;
 
@@ -109,8 +117,9 @@ export async function setReadyDate(
   const reason = String(formData.get("reason") ?? "").trim();
 
   if (!Number.isInteger(orderId)) return { ok: false, message: "Заказ не найден" };
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return { ok: false, message: "Укажите дату" };
+  const readyDay = parseCalendarDate(raw);
+  if (!readyDay) {
+    return { ok: false, message: raw === "" ? "Укажите дату" : "Такой даты нет в календаре" };
   }
 
   const [order] = await db
@@ -127,7 +136,7 @@ export async function setReadyDate(
   // Колонка хранит момент времени, а срок - календарный день. Берём
   // полдень по местному: так дата не съедет ни в одну сторону при любом
   // пересчёте часового пояса
-  const newDate = new Date(`${raw}T12:00:00`);
+  const newDate = calendarDateAtNoon(readyDay);
 
   const previous = order.current;
   const changeType = !previous
@@ -179,6 +188,37 @@ function parseMoney(raw: FormDataEntryValue | null) {
   if (text === "") return 0;
   const n = Number(text);
   return Number.isFinite(n) && n >= 0 ? n : NaN;
+}
+
+/**
+ * Корректировка итога: скидка со знаком минус, наценка - плюсом.
+ * Минус принимаем и «длинный» (−), его подставляют телефоны.
+ */
+function parseAdjustment(raw: FormDataEntryValue | null) {
+  const text = String(raw ?? "")
+    .replace(/\s/g, "")
+    .replace(",", ".")
+    .replace(/^[\u2212\u2013]/, "-");
+  if (text === "") return 0;
+  if (!/^[-+]?\d{1,8}(\.\d{1,2})?$/.test(text)) return NaN;
+  return Number(text);
+}
+
+const NEGATIVE_TOTAL = "Скидка больше суммы позиций - сначала уменьшите корректировку";
+
+/**
+ * Пересчёт после правки состава или корректировки - в той же транзакции.
+ * Если скидка оказалась больше суммы позиций, отказываем (транзакция
+ * откатывается), а не записываем молча нулевой итог.
+ */
+async function recalcComposition(tx: Tx, orderId: number) {
+  const summary = await recalcOrderMoney(
+    tx,
+    { source: "external", id: orderId },
+    { rebuildTotal: true, refreshEstimate: true },
+  );
+  if (summary?.totalClamped) throw new MoneyRuleError(NEGATIVE_TOTAL);
+  return summary;
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -292,6 +332,9 @@ export async function createExternalOrder(
   _prev: OrderFormState,
   formData: FormData,
 ): Promise<OrderFormState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await can("orders", "create"))) {
     return { error: "Нет прав на заведение заказов" };
@@ -305,11 +348,20 @@ export async function createExternalOrder(
   const address = String(formData.get("address") ?? "").trim().slice(0, 1000);
   const description = String(formData.get("description") ?? "").trim().slice(0, 5000);
   const readyDate = String(formData.get("readyDate") ?? "").trim();
-  const rawStatus = String(formData.get("status") ?? "unpaid");
+  const readyDay = readyDate === "" ? null : parseCalendarDate(readyDate);
+  if (readyDate !== "" && !readyDay) {
+    return { fieldErrors: { readyDate: "Такой даты нет в календаре" } };
+  }
+  const adjustmentNote =
+    String(formData.get("adjustmentNote") ?? "").trim().slice(0, 255) || null;
 
-  const status = rawStatus in EXTERNAL_PAYMENT_STATUS
-    ? (rawStatus as ExternalPaymentStatus)
-    : "unpaid";
+  // Оплата при оформлении - не статус, а платёж: статус потом считается
+  // из платежей. «Частично» без суммы не принимаем - иначе непонятно,
+  // сколько заплатили
+  const paidNow = String(formData.get("paidNow") ?? "none");
+  if (paidNow !== "none" && paidNow !== "full" && paidNow !== "partial") {
+    return { fieldErrors: { paidNow: "Выберите, оплачен ли заказ" } };
+  }
 
   const { items, error } = parseItems(formData);
   if (error) return { error };
@@ -319,9 +371,26 @@ export async function createExternalOrder(
   if (!(await assertProductsExist(items))) return { error: "Товар из позиции не найден" };
 
   const itemsSum = round2(items.reduce((s, i) => s + Number(i.price), 0));
-  const rawTotal = String(formData.get("totalPrice") ?? "").trim();
-  const total = rawTotal === "" ? itemsSum : parseMoney(rawTotal);
-  if (Number.isNaN(total)) return { fieldErrors: { totalPrice: "Сумма вида 1234.56" } };
+  const adjustment = parseAdjustment(formData.get("adjustment"));
+  if (Number.isNaN(adjustment)) {
+    return { fieldErrors: { adjustment: "Сумма вида -500 или 1200.50" } };
+  }
+  if (itemsSum + adjustment < 0) {
+    return { fieldErrors: { adjustment: "Скидка больше суммы позиций" } };
+  }
+  const total = externalOrderTotal(itemsSum, adjustment);
+
+  let paidAmount = 0;
+  if (paidNow === "full") paidAmount = total;
+  if (paidNow === "partial") {
+    paidAmount = parseMoney(formData.get("paidAmount"));
+    if (Number.isNaN(paidAmount) || paidAmount <= 0) {
+      return { fieldErrors: { paidAmount: "Сколько заплатили - сумма больше нуля" } };
+    }
+    if (paidAmount > total + 0.005) {
+      return { fieldErrors: { paidAmount: "Оплата больше итога заказа" } };
+    }
+  }
 
   // Контрагент: либо выбранный, либо заводим нового прямо отсюда
   let clientId: number | null = null;
@@ -355,7 +424,7 @@ export async function createExternalOrder(
     }
   }
 
-  const newOrderId = await db.transaction(async (tx) => {
+  const { newOrderId, payment } = await db.transaction(async (tx) => {
     if (mode !== "existing") {
       const [created] = await tx
         .insert(clients)
@@ -378,13 +447,13 @@ export async function createExternalOrder(
         email: email || null,
         address: address || null,
         description: description || null,
-        status,
+        adjustment: adjustment.toFixed(2),
+        adjustmentNote: adjustment !== 0 ? adjustmentNote : null,
+        // Итог и статус оплаты допишет пересчёт ниже
         totalPrice: total.toFixed(2),
         // Полдень по местному: иначе календарный день съезжает при
         // пересчёте часового пояса
-        estimatedReadyDate: /^\d{4}-\d{2}-\d{2}$/.test(readyDate)
-          ? new Date(`${readyDate}T12:00:00`)
-          : null,
+        estimatedReadyDate: readyDay ? calendarDateAtNoon(readyDay) : null,
       })
       .returning({ id: externalOrders.id });
 
@@ -392,21 +461,41 @@ export async function createExternalOrder(
       .insert(externalOrderItems)
       .values(items.map((i) => ({ ...i, externalOrderId: order.id })));
 
-    await createAccountingForExternalOrder(tx, {
-      id: order.id,
-      clientName,
-      income: total.toFixed(2),
-      status,
-    });
+    // Карточка бухгалтерии - той же транзакцией: заказ без неё не виден
+    // ни в бухгалтерии, ни в аналитике
+    const card = await recalcOrderMoney(
+      tx,
+      { source: "external", id: order.id },
+      { rebuildTotal: true, refreshEstimate: true },
+    );
 
-    return order.id;
+    let paid: MoneySummary | null = null;
+    if (card && paidAmount > 0) {
+      paid = (
+        await addOrderPayment(tx, card.cardId, {
+          amount: paidAmount,
+          paidAt: new Date(),
+          note: "Оплата при оформлении заказа",
+        })
+      ).summary;
+    }
+
+    return { newOrderId: order.id, payment: paid };
   });
 
   await audit(
     "external_order.create",
     { type: "external_order", id: newOrderId },
-    { clientId, total: total.toFixed(2), items: items.length },
+    { clientId, total: total.toFixed(2), adjustment: adjustment.toFixed(2), items: items.length },
   );
+  if (payment) {
+    await audit("finance.payment_add", { type: "orders_accounting", id: payment.cardId }, {
+      amount: paidAmount.toFixed(2),
+      status: payment.status,
+      externalOrderId: newOrderId,
+      atCreation: true,
+    });
+  }
 
   await notifyStaff(
     "external_order_created",
@@ -424,11 +513,17 @@ export async function createExternalOrder(
   redirect(`/admin/external-orders/${newOrderId}`);
 }
 
-/** Правка шапки заказа: заказчик, контакты, описание, итог. */
+/**
+ * Правка шапки заказа: заказчик, контакты, описание и корректировка итога.
+ * Сам итог руками не вписывается - он сумма позиций плюс корректировка.
+ */
 export async function updateExternalOrder(
   _prev: OrderFormState,
   formData: FormData,
 ): Promise<OrderFormState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("orders", "edit"))) return EDIT_DENIED;
 
   const orderId = Number(formData.get("orderId"));
@@ -439,39 +534,51 @@ export async function updateExternalOrder(
     return { fieldErrors: { clientName: "Впишите, на кого заказ" } };
   }
 
-  const rawTotal = String(formData.get("totalPrice") ?? "").trim();
-  const total = parseMoney(rawTotal);
-  if (Number.isNaN(total)) return { fieldErrors: { totalPrice: "Сумма вида 1234.56" } };
+  const adjustment = parseAdjustment(formData.get("adjustment"));
+  if (Number.isNaN(adjustment)) {
+    return { fieldErrors: { adjustment: "Сумма вида -500 или 1200.50" } };
+  }
+  const adjustmentNote =
+    String(formData.get("adjustmentNote") ?? "").trim().slice(0, 255) || null;
 
   // Срок готовности здесь не трогаем: он меняется отдельной формой,
-  // которая пишет историю переносов
-  const updated = await db.transaction(async (tx) => {
-    const rows = await tx
-      .update(externalOrders)
-      .set({
-        clientName,
-        phone: String(formData.get("phone") ?? "").trim().slice(0, 50) || null,
-        email: String(formData.get("email") ?? "").trim().slice(0, 255) || null,
-        address: String(formData.get("address") ?? "").trim().slice(0, 1000) || null,
-        description: String(formData.get("description") ?? "").trim().slice(0, 5000) || null,
-        totalPrice: total.toFixed(2),
-      })
-      .where(eq(externalOrders.id, orderId))
-      .returning({ id: externalOrders.id });
+  // которая пишет историю переносов. Сумму позиций проверяет пересчёт
+  // внутри транзакции - параллельная правка позиций не проскочит между
+  // проверкой и записью
+  let summary: MoneySummary | null;
+  try {
+    summary = await db.transaction(async (tx) => {
+      const rows = await tx
+        .update(externalOrders)
+        .set({
+          clientName,
+          phone: String(formData.get("phone") ?? "").trim().slice(0, 50) || null,
+          email: String(formData.get("email") ?? "").trim().slice(0, 255) || null,
+          address: String(formData.get("address") ?? "").trim().slice(0, 1000) || null,
+          description: String(formData.get("description") ?? "").trim().slice(0, 5000) || null,
+          adjustment: adjustment.toFixed(2),
+          adjustmentNote: adjustment !== 0 ? adjustmentNote : null,
+        })
+        .where(eq(externalOrders.id, orderId))
+        .returning({ id: externalOrders.id });
 
-    if (rows.length > 0) await syncAccountingForExternalOrder(tx, orderId);
-    return rows.length;
-  });
+      if (rows.length === 0) return null;
+      return recalcComposition(tx, orderId);
+    });
+  } catch (e) {
+    if (e instanceof MoneyRuleError) return { fieldErrors: { adjustment: e.message } };
+    throw e;
+  }
 
-  if (updated === 0) return { error: "Заказ не найден" };
+  if (!summary) return { error: "Заказ не найден" };
 
   await audit("external_order.update", { type: "external_order", id: orderId }, {
-    total: total.toFixed(2),
+    adjustment: adjustment.toFixed(2),
+    total: summary.income.toFixed(2),
+    paymentStatus: summary.status,
   });
 
-  revalidatePath("/admin/external-orders");
-  revalidatePath(`/admin/external-orders/${orderId}`);
-  revalidatePath("/admin/finance");
+  revalidateOrderMoney(orderId);
   return { ok: true, message: "Сохранено" };
 }
 
@@ -502,46 +609,58 @@ export async function saveExternalOrderItem(
   if (!item) return { error: "Заполните позицию" };
   if (!(await assertProductsExist(items))) return { error: "Товар из позиции не найден" };
 
-  const done = await db.transaction(async (tx) => {
-    const [order] = await tx
-      .select({ id: externalOrders.id })
-      .from(externalOrders)
-      .where(eq(externalOrders.id, orderId))
-      .limit(1);
-    if (!order) return false;
+  let done: MoneySummary | null;
+  try {
+    done = await db.transaction(async (tx) => {
+      const [order] = await tx
+        .select({ id: externalOrders.id })
+        .from(externalOrders)
+        .where(eq(externalOrders.id, orderId))
+        .limit(1);
+      if (!order) return null;
 
-    if (itemId === null) {
-      await tx.insert(externalOrderItems).values({ ...item, externalOrderId: orderId });
-    } else {
-      const rows = await tx
-        .update(externalOrderItems)
-        .set(item)
-        .where(
-          and(
-            eq(externalOrderItems.id, itemId),
-            // Номер позиции приходит из формы: без проверки заказа можно
-            // было бы отредактировать чужую строку
-            eq(externalOrderItems.externalOrderId, orderId),
-          ),
-        )
-        .returning({ id: externalOrderItems.id });
-      if (rows.length === 0) return false;
-    }
+      if (itemId === null) {
+        await tx.insert(externalOrderItems).values({ ...item, externalOrderId: orderId });
+      } else {
+        const rows = await tx
+          .update(externalOrderItems)
+          .set(item)
+          .where(
+            and(
+              eq(externalOrderItems.id, itemId),
+              // Номер позиции приходит из формы: без проверки заказа можно
+              // было бы отредактировать чужую строку
+              eq(externalOrderItems.externalOrderId, orderId),
+            ),
+          )
+          .returning({ id: externalOrderItems.id });
+        if (rows.length === 0) return null;
+      }
 
-    await syncAccountingForExternalOrder(tx, orderId);
-    return true;
-  });
+      // Итог, себестоимость и статус оплаты - заново: оплаченный заказ после
+      // новой позиции становится оплаченным частично
+      return recalcComposition(tx, orderId);
+    });
+  } catch (e) {
+    if (e instanceof MoneyRuleError) return { error: e.message };
+    throw e;
+  }
 
   if (!done) return { error: "Заказ или позиция не найдены" };
 
   await audit(
     itemId === null ? "external_order.item_add" : "external_order.item_update",
     { type: "external_order", id: orderId },
-    { itemId, price: item.price, outsourced: item.isOutsourced },
+    {
+      itemId,
+      price: item.price,
+      outsourced: item.isOutsourced,
+      total: done.income.toFixed(2),
+      paymentStatus: done.status,
+    },
   );
 
-  revalidatePath(`/admin/external-orders/${orderId}`);
-  revalidatePath("/admin/finance");
+  revalidateOrderMoney(orderId);
   return { ok: true, message: itemId === null ? "Позиция добавлена" : "Позиция сохранена" };
 }
 
@@ -557,33 +676,43 @@ export async function deleteExternalOrderItem(
     return { error: "Позиция не найдена" };
   }
 
-  const removed = await db.transaction(async (tx) => {
-    const rows = await tx
-      .delete(externalOrderItems)
-      .where(
-        and(
-          eq(externalOrderItems.id, itemId),
-          eq(externalOrderItems.externalOrderId, orderId),
-        ),
-      )
-      .returning({ id: externalOrderItems.id });
+  let removed: MoneySummary | null;
+  try {
+    removed = await db.transaction(async (tx) => {
+      const rows = await tx
+        .delete(externalOrderItems)
+        .where(
+          and(
+            eq(externalOrderItems.id, itemId),
+            eq(externalOrderItems.externalOrderId, orderId),
+          ),
+        )
+        .returning({ id: externalOrderItems.id });
 
-    if (rows.length > 0) await syncAccountingForExternalOrder(tx, orderId);
-    return rows.length;
+      if (rows.length === 0) return null;
+      return recalcComposition(tx, orderId);
+    });
+  } catch (e) {
+    if (e instanceof MoneyRuleError) return { error: e.message };
+    throw e;
+  }
+
+  if (!removed) return { error: "Позиция не найдена" };
+
+  await audit("external_order.item_delete", { type: "external_order", id: orderId }, {
+    itemId,
+    total: removed.income.toFixed(2),
+    paymentStatus: removed.status,
   });
-
-  if (removed === 0) return { error: "Позиция не найдена" };
-
-  await audit("external_order.item_delete", { type: "external_order", id: orderId }, { itemId });
-  revalidatePath(`/admin/external-orders/${orderId}`);
-  revalidatePath("/admin/finance");
+  revalidateOrderMoney(orderId);
   return { ok: true, message: "Позиция удалена" };
 }
 
 /**
- * Удаление заказа. Право есть только у администратора: вместе с заказом
- * уходят его позиции, а бухгалтерская карточка остаётся - деньги по нему
- * могли уже пройти.
+ * Удаление заказа - только администратору и только «пустого»: без
+ * платежей и списаний со склада. Такой заказ удаляется вместе с
+ * бухгалтерской карточкой - раньше она оставалась сиротой и продолжала
+ * считаться в выручке. Заказ, по которому прошли деньги, отменяют.
  */
 export async function deleteExternalOrder(
   _prev: OrderFormState,
@@ -596,24 +725,21 @@ export async function deleteExternalOrder(
   const orderId = Number(formData.get("orderId"));
   if (!Number.isInteger(orderId) || orderId <= 0) return { error: "Заказ не найден" };
 
-  const [card] = await db
-    .select({ id: ordersAccounting.id })
-    .from(ordersAccounting)
-    .where(eq(ordersAccounting.externalOrderId, orderId))
-    .limit(1);
-
-  const rows = await db
-    .delete(externalOrders)
-    .where(eq(externalOrders.id, orderId))
-    .returning({ id: externalOrders.id });
-
-  if (rows.length === 0) return { error: "Заказ не найден" };
+  let removed: { cardIds: number[] };
+  try {
+    removed = await db.transaction((tx) => deleteExternalOrderChecked(tx, orderId));
+  } catch (e) {
+    if (e instanceof MoneyRuleError) return { error: e.message };
+    throw e;
+  }
 
   await audit("external_order.delete", { type: "external_order", id: orderId }, {
-    accountingKept: card?.id ?? null,
+    accountingDeleted: removed.cardIds,
   });
 
   revalidatePath("/admin/external-orders");
   revalidatePath("/admin/finance");
+  revalidatePath("/admin/analytics");
+  revalidatePath("/admin");
   redirect("/admin/external-orders");
 }

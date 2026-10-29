@@ -8,6 +8,30 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-bzk}
       # Русская сортировка и регистронезависимый поиск по каталогу
       LANG: ru_RU.utf8
+      # Пояс компании для всего, что смотрит человек: время в логах
+      # Postgres (log_timezone ниже), `date` в контейнере и вывод psql
+      # (`docker compose exec db psql`) - libpq берёт пояс сеанса из PGTZ,
+      # и timestamptz показываются по Екатеринбургу, а не по UTC.
+      # Приложение это не затрагивает: оно ходит драйвером node-postgres,
+      # который PGTZ не читает, и его сеансы живут в поясе сервера (UTC,
+      # см. command). Обратная сторона: ручной INSERT через psql в
+      # контейнере в колонку timestamp без пояса с DEFAULT now() запишет
+      # местное время - вставляя руками, задавайте дату явно
+      TZ: Asia/Yekaterinburg
+      PGTZ: Asia/Yekaterinburg
+    # Пояс сервера закреплён в UTC явно, и это намеренно. Почти все даты в
+    # схеме - timestamptz: момент хранится абсолютно, пояс влияет только
+    # на показ. Но почти сорок колонок - timestamp БЕЗ пояса (expense_date,
+    # payment_date, paid_at, created_at у части таблиц, сроки задач и др.),
+    # а Drizzle читает и пишет их как UTC. Их `DEFAULT now()` превращает
+    # момент в «настенное» время пояса сеанса - смени пояс сервера на
+    # Екатеринбург, и новые строки уедут на 5 часов относительно старых.
+    # Без флага initdb на новом сервере взял бы пояс из TZ выше и записал
+    # его в postgresql.conf, а на старом томе остался бы UTC - две базы
+    # вели бы себя по-разному. Группировка отчётов по местным суткам и
+    # месяцам - дело запросов (`AT TIME ZONE 'Asia/Yekaterinburg'`), а не
+    # пояса сервера
+    command: ["postgres", "-c", "timezone=UTC", "-c", "log_timezone=Asia/Yekaterinburg"]
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./backups:/backups
@@ -53,6 +77,9 @@ services:
       TOCHKA_API_URL: ${TOCHKA_API_URL}
       TOCHKA_TOKEN: ${TOCHKA_TOKEN}
       TOCHKA_CUSTOMER_CODE: ${TOCHKA_CUSTOMER_CODE}
+      # Секрет маршрута планировщика (POST /api/cron/run). Пустой - маршрут
+      # отвечает 404, напоминания и сроки задач не рассылаются
+      CRON_SECRET: ${CRON_SECRET:-}
       UPLOAD_DIR: /app/storage/uploads
       # Пояс компании: от него зависят календарные даты поставки и готовности
       TZ: Asia/Yekaterinburg
@@ -61,6 +88,16 @@ services:
       - uploads:/app/storage/uploads
     expose:
       - "3000"
+    # «Запущен» ещё не значит «работает»: сервер Next может подняться и
+    # отвечать 503, если не достучался до базы. /api/health ходит в базу,
+    # и proxy ниже ждёт именно здоровья, а deploy/deploy.sh читает тот же
+    # статус. wget - из busybox образа node:*-alpine, curl там нет
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
   # Ночные дампы базы и архивы файлов в ./backups. Отдельным контейнером, а не задачей
   # внутри приложения: приложение может лежать как раз тогда, когда
@@ -86,11 +123,32 @@ services:
       - uploads:/uploads:ro
     entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
 
+  # Планировщик: раз в пять минут зовёт приложение по внутренней сети
+  # (напоминания CRM, сроки задач, уборка журналов). Саму работу делает
+  # приложение, здесь только будильник - см. scripts/cron.sh. Наружу не
+  # смотрит: до app он ходит по имени сервиса, мимо Caddy
+  cron:
+    image: alpine:3.21
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      CRON_URL: http://app:3000/api/cron/run
+      CRON_INTERVAL: ${CRON_INTERVAL:-300}
+      TZ: Asia/Yekaterinburg
+    volumes:
+      - ./scripts/cron.sh:/usr/local/bin/cron.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/cron.sh"]
+
   proxy:
     image: caddy:2-alpine
     restart: unless-stopped
+    # Пока приложение не здорово, прокси отдавал бы посетителям 502
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     environment:
       # Без домена Caddyfile берёт запасной `localhost`, выдаёт локальный
       # сертификат, и на боевом адресе браузер получает ERR_SSL_PROTOCOL_ERROR.

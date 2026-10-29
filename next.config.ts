@@ -23,17 +23,19 @@ const nextConfig: NextConfig = {
 
   experimental: {
     serverActions: {
-      // Клиент грузит макеты до 50 МБ через серверное действие. По
-      // умолчанию тело действия ограничено одним мегабайтом - с ним
-      // загрузка молча обрывалась бы. Оставляем запас на служебные байты
-      // multipart-формы
-      bodySizeLimit: "55mb",
+      // Серверные действия принимают только текст и админские картинки:
+      // самая тяжёлая - фото брака до 8 МБ или пачка картинок товара до
+      // 9 МБ вместе (MAX_QC_PHOTO_SIZE, MAX_PRODUCT_BATCH_SIZE), плюс
+      // 10-20 КБ служебных байтов multipart. Макеты клиентов до 50 МБ идут
+      // не сюда, а потоком в /api/client-uploads
+      bodySizeLimit: "10mb",
       ...(allowedOrigins.length > 0 ? { allowedOrigins } : {}),
     },
     // Proxy (бывший middleware) буферизует тело запроса, чтобы прочитать
-    // его и там, и в обработчике. Предел по умолчанию - 10 МБ, и большой
-    // макет обрезался бы на нём ещё до серверного действия. Держим вровень
-    proxyClientMaxBodySize: "55mb",
+    // его и там, и в обработчике. Держим вровень с лимитом действий, чтобы
+    // тело админской картинки не обрезалось раньше времени. Загрузка
+    // макетов исключена из proxy (src/proxy.ts) и сюда не попадает
+    proxyClientMaxBodySize: "10mb",
   },
 
   // В корне репозитория лежит package-lock.json старого PHP-сайта.
@@ -46,7 +48,11 @@ const nextConfig: NextConfig = {
 
   // Адреса старого сайта. Список и объяснения - в src/lib/redirects.ts
   async redirects() {
-    return legacyRedirects;
+    // /client без раздела раньше вёл в 404: корень кабинета - обзор
+    return [
+      ...legacyRedirects,
+      { source: "/client", destination: "/client/dashboard", permanent: false },
+    ];
   },
 
   async rewrites() {
@@ -60,7 +66,11 @@ const nextConfig: NextConfig = {
         source: "/:path*",
         headers: [
           { key: "X-Content-Type-Options", value: "nosniff" },
-          { key: "X-Frame-Options", value: "SAMEORIGIN" },
+          // DENY, а не SAMEORIGIN - вровень с CSP `frame-ancestors 'none'`
+          // из src/proxy.ts. Свои страницы мы во фреймы не вставляем, а
+          // заголовок нужен старым браузерам, которые CSP не понимают.
+          // HSTS ставит Caddy - здесь его не дублируем
+          { key: "X-Frame-Options", value: "DENY" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           {
             key: "Permissions-Policy",

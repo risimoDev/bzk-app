@@ -43,7 +43,7 @@ for (const id of [2, 14]) {
 
 // ---- заказ
 const orderRow = tuples("orders").find((t) => t.startsWith("(17,"));
-const status = orderRow?.match(/'(pending|processing|in_work|delayed|shipped|delivered|cancelled|completed)'/)?.[1];
+const status = orderRow?.match(/'(pending|processing|in_work|ready|delayed|shipped|delivered|cancelled|completed)'/)?.[1];
 const dbStatus = q("SELECT status FROM orders WHERE id=17");
 report("статус заказа 17", status === dbStatus, `${dbStatus} (в дампе ${status})`);
 

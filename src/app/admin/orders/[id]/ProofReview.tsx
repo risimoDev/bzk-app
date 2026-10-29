@@ -1,6 +1,7 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { useState } from "react";
+import { useLatestActionState } from "@/components/admin/useLatestActionState";
 import { Check, Download, RotateCcw, TriangleAlert, X } from "lucide-react";
 import { reviewClientUpload } from "../actions";
 import { uploadStatus } from "@/lib/client-portal";
@@ -65,7 +66,7 @@ export function ProofReview({
 }
 
 function ProofRow({ file, canReview }: { file: ProofFile; canReview: boolean }) {
-  const [state, action, pending] = useActionState(reviewClientUpload, initial);
+  const [state, action, pending] = useLatestActionState(reviewClientUpload, initial);
   // Какой вердикт сейчас оформляем: у «правок» и «отказа» открывается поле
   const [mode, setMode] = useState<"revision" | "rejected" | null>(null);
   const st = uploadStatus(file.status);

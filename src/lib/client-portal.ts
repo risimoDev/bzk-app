@@ -115,3 +115,10 @@ export function formatFileSize(bytes: number) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} КБ`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
 }
+
+/**
+ * Квота хранилища на одного клиента: суммарный размер его файлов в
+ * client_uploads. Без неё один зарегистрированный пользователь мог бы
+ * забить диск сервера пятидесятимегабайтными файлами.
+ */
+export const CLIENT_UPLOAD_QUOTA = 1024 * 1024 * 1024;

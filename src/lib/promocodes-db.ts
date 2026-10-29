@@ -1,7 +1,7 @@
 import "server-only";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { db, type Db } from "@/db";
-import { promocodes } from "@/db/schema";
+import { orderPromocodes, orders, promocodes } from "@/db/schema";
 import { discountFor, type PromoRule } from "@/lib/promocodes";
 
 /** Внутри транзакции у Drizzle свой объект - принимаем и его, и обычный db. */
@@ -10,6 +10,46 @@ type Tx = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 export type PromoCheck =
   | { ok: true; rule: PromoRule; discount: number }
   | { ok: false; message: string };
+
+export const PROMO_EXHAUSTED_MESSAGE = "Промокод уже использован";
+export const PROMO_ALREADY_USED_BY_YOU_MESSAGE = "Вы уже воспользовались этим промокодом";
+
+/**
+ * Код нельзя списать: лимит выбран, пока оформлялся заказ, или одноразовый
+ * код этот клиент уже применял. Бросается внутри транзакции заказа, чтобы
+ * она откатилась целиком; оформление ловит именно эту ошибку и показывает
+ * текст у поля промокода. Отдельный класс - чтобы не глотать заодно
+ * настоящие сбои базы.
+ */
+export class PromoUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PromoUnavailableError";
+  }
+}
+
+/**
+ * Есть ли у клиента живой заказ с этим кодом. Отменённые не считаем:
+ * заказ не состоялся, и скидка клиенту не досталась.
+ */
+async function usedByUser(tx: Tx, code: string, userId: number, exceptOrderId?: number) {
+  const [row] = await tx
+    .select({ id: orders.id })
+    .from(orderPromocodes)
+    .innerJoin(orders, eq(orders.id, orderPromocodes.orderId))
+    .where(
+      and(
+        eq(sql`upper(${orderPromocodes.promoCode})`, code.toUpperCase()),
+        eq(orders.userId, userId),
+        // status допускает NULL, а `<>` с NULL даёт NULL - такой заказ
+        // выпал бы из подсчёта и код можно было бы применить ещё раз
+        sql`${orders.status} is distinct from 'cancelled'`,
+        exceptOrderId === undefined ? undefined : ne(orders.id, exceptOrderId),
+      ),
+    )
+    .limit(1);
+  return Boolean(row);
+}
 
 /**
  * Проверяет код и считает скидку.
@@ -22,8 +62,9 @@ export type PromoCheck =
 export async function checkPromocode(
   raw: string,
   subtotal: number,
-  tx: Tx = db,
+  opts: { userId?: number; tx?: Tx } = {},
 ): Promise<PromoCheck> {
+  const tx = opts.tx ?? db;
   const code = raw.trim().toUpperCase().slice(0, 50);
   if (code === "") return { ok: false, message: "Введите код" };
 
@@ -51,7 +92,15 @@ export async function checkPromocode(
     return { ok: false, message: "Срок промокода вышел" };
   }
   if (row.usageLimit !== null && (row.usedCount ?? 0) >= row.usageLimit) {
-    return { ok: false, message: "Промокод уже использован" };
+    return { ok: false, message: PROMO_EXHAUSTED_MESSAGE };
+  }
+  // Одноразовый - один раз на клиента. Гостю (корзина без входа) сказать
+  // заранее нечего: окончательно это решится при оформлении, а оно
+  // требует входа
+  if (row.isSingleUse && opts.userId !== undefined) {
+    if (await usedByUser(tx, row.code, opts.userId)) {
+      return { ok: false, message: PROMO_ALREADY_USED_BY_YOU_MESSAGE };
+    }
   }
 
   const min = Number(row.minOrderAmount ?? 0);
@@ -76,10 +125,43 @@ export async function checkPromocode(
   return { ok: true, rule, discount };
 }
 
-/** Отмечает использование кода. Зовётся той же транзакцией, что и заказ. */
-export async function consumePromocode(tx: Tx, code: string) {
-  await tx
+/**
+ * Отмечает использование кода. Зовётся той же транзакцией, что и заказ,
+ * после записи order_promocodes.
+ *
+ * checkPromocode смотрит лимит до транзакции, и два заказа, оформленные
+ * одновременно, оба видели «осталось одно использование». Поэтому лимит
+ * проверяет сам UPDATE: условие и прибавка - одна операция, а строку
+ * кода Postgres держит под блокировкой до конца транзакции. Не
+ * обновилось ни строки - код выбран, бросаем PromoUnavailableError, и
+ * заказ откатывается.
+ *
+ * Одноразовость проверяем после UPDATE и по той же причине: второй
+ * заказ того же клиента ждёт на блокировке строки кода, пока первый не
+ * завершится, и затем уже видит его в order_promocodes.
+ */
+export async function consumePromocode(
+  tx: Tx,
+  code: string,
+  opts: { userId?: number; orderId?: number } = {},
+) {
+  const updated = await tx
     .update(promocodes)
-    .set({ usedCount: sql`${promocodes.usedCount} + 1` })
-    .where(eq(sql`upper(${promocodes.code})`, code.toUpperCase()));
+    .set({ usedCount: sql`coalesce(${promocodes.usedCount}, 0) + 1` })
+    .where(
+      and(
+        eq(sql`upper(${promocodes.code})`, code.toUpperCase()),
+        eq(promocodes.isActive, true),
+        sql`(${promocodes.usageLimit} is null or coalesce(${promocodes.usedCount}, 0) < ${promocodes.usageLimit})`,
+      ),
+    )
+    .returning({ id: promocodes.id, isSingleUse: promocodes.isSingleUse });
+
+  if (updated.length === 0) throw new PromoUnavailableError(PROMO_EXHAUSTED_MESSAGE);
+
+  if (opts.userId !== undefined && updated.some((r) => r.isSingleUse)) {
+    if (await usedByUser(tx, code, opts.userId, opts.orderId)) {
+      throw new PromoUnavailableError(PROMO_ALREADY_USED_BY_YOU_MESSAGE);
+    }
+  }
 }

@@ -14,6 +14,7 @@ import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import { ChecklistItemForm } from "./ChecklistItemForm";
 import { ChecklistItemRow } from "./ChecklistItemRow";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Чек-лист · Админка",
@@ -32,8 +33,8 @@ export default async function AdminChecklist({
   }
 
   const { id } = await params;
-  const checklistId = Number(id);
-  if (!Number.isInteger(checklistId) || checklistId <= 0) notFound();
+  const checklistId = parseId(id);
+  if (checklistId === null) notFound();
 
   const [checklist] = await db
     .select({

@@ -10,6 +10,7 @@ import { registerSchema } from "@/lib/validation";
 import { clientIp } from "@/lib/client-ip";
 import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
 import { verifyTurnstile, TURNSTILE_FAILED_MESSAGE } from "@/lib/turnstile";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type RegisterState = {
   error?: string;
@@ -20,6 +21,9 @@ export async function register(
   _prev: RegisterState,
   formData: FormData,
 ): Promise<RegisterState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const parsed = registerSchema.safeParse({
     name: formData.get("name"),
     email: formData.get("email"),
@@ -54,12 +58,17 @@ export async function register(
    */
   const ip = await clientIp();
   const limit = await checkRateLimit(ip, "register");
-  if (!limit.ok) {
+  const daily = await checkRateLimit(ip, "registerDay");
+  if (!limit.ok || !daily.ok) {
     return {
-      error: `Слишком много регистраций с этого адреса. Попробуйте ${retryAfterText(limit.retryAfter)}`,
+      error: `Слишком много регистраций с этого адреса. Попробуйте ${retryAfterText(Math.max(limit.retryAfter, daily.retryAfter))}`,
     };
   }
+  // Считаем и попытки на занятый адрес: ответ ниже честно говорит «адрес
+  // уже зарегистрирован», и без потолка по адресу так можно проверять, кто
+  // у нас клиент
   await recordAttempt(ip, "register");
+  await recordAttempt(ip, "registerDay");
 
   const [existing] = await db
     .select({ id: users.id })
@@ -67,6 +76,11 @@ export async function register(
     .where(eq(users.email, email))
     .limit(1);
 
+  // Одинаковый ответ для занятого и свободного адреса тут невозможен:
+  // регистрация сразу входит в только что созданный аккаунт, а для
+  // чужого адреса войти нельзя. Не ломаем поток (подтверждение почты
+  // перед входом - отдельное продуктовое решение), а ограничиваем
+  // перебор лимитами выше
   if (existing) {
     return { fieldErrors: { email: "Этот адрес уже зарегистрирован" } };
   }

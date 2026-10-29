@@ -3,7 +3,7 @@ import Link from "next/link";
 import { desc, eq, count, sql, and, or, ilike, inArray, type SQL } from "drizzle-orm";
 import { ChevronRight, Plus, Search } from "lucide-react";
 import { db } from "@/db";
-import { externalOrders, externalOrderItems } from "@/db/schema";
+import { externalOrders, externalOrderItems, orderPayments, ordersAccounting } from "@/db/schema";
 import { AdminPage, AdminEmpty, AdminStat } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import {
@@ -62,10 +62,12 @@ export default async function AdminExternalOrders({
 
   // Значения фильтров принимаем только из словарей: чужая строка из
   // адреса иначе ушла бы прямо в запрос
-  const status =
-    rawStatus in EXTERNAL_PAYMENT_STATUS ? (rawStatus as ExternalPaymentStatus) : null;
+  // Object.hasOwn, а не `in`: "constructor" из адреса - не статус
+  const status = Object.hasOwn(EXTERNAL_PAYMENT_STATUS, rawStatus)
+    ? (rawStatus as ExternalPaymentStatus)
+    : null;
   const production =
-    rawProduction in EXTERNAL_PRODUCTION_STATUS
+    Object.hasOwn(EXTERNAL_PRODUCTION_STATUS, rawProduction)
       ? (rawProduction as ExternalProductionStatus)
       : null;
 
@@ -90,6 +92,16 @@ export default async function AdminExternalOrders({
 
   const where = conditions.length > 0 ? and(...conditions) : undefined;
 
+  const orderPaid = db
+    .select({
+      externalOrderId: ordersAccounting.externalOrderId,
+      paid: sql<string>`sum(${orderPayments.amount})`.as("paid"),
+    })
+    .from(orderPayments)
+    .innerJoin(ordersAccounting, eq(ordersAccounting.id, orderPayments.orderAccountingId))
+    .groupBy(ordersAccounting.externalOrderId)
+    .as("order_paid");
+
   const [rows, [totals], byPayment, byProduction] = await Promise.all([
     db
       .select({
@@ -108,14 +120,20 @@ export default async function AdminExternalOrders({
       .orderBy(desc(externalOrders.createdAt), desc(externalOrders.id))
       .limit(PER_PAGE)
       .offset((page - 1) * PER_PAGE),
+    // «Оплачено» и «ждём» - из платежей карточки, а не из статуса: у
+    // частично оплаченного заказа раньше вся сумма числилась долгом.
+    // Отменённые заказы долгом не считаются. Колонки в списке выборки
+    // пишем с таблицей сами: Drizzle выводит их там без имени таблицы, а
+    // в соединении это неоднозначно
     db
       .select({
         n: count(),
-        total: sql<string>`coalesce(sum(${externalOrders.totalPrice}), 0)`,
-        paid: sql<string>`coalesce(sum(${externalOrders.totalPrice}) filter (where ${externalOrders.status} = 'paid'), 0)`,
-        unpaid: sql<string>`coalesce(sum(${externalOrders.totalPrice}) filter (where ${externalOrders.status} <> 'paid'), 0)`,
+        total: sql<string>`coalesce(sum(external_orders.total_price), 0)`,
+        paid: sql<string>`coalesce(sum(order_paid.paid), 0)`,
+        unpaid: sql<string>`coalesce(sum(greatest(external_orders.total_price - coalesce(order_paid.paid, 0), 0)) filter (where external_orders.production_status <> 'cancelled'), 0)`,
       })
       .from(externalOrders)
+      .leftJoin(orderPaid, eq(orderPaid.externalOrderId, externalOrders.id))
       .where(where),
     db
       .select({ status: externalOrders.status, n: count() })

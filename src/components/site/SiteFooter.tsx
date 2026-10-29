@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Container } from "@/components/ui/Container";
 import { Decor, scribble } from "@/components/ui/Collage";
 import { site } from "@/lib/site";
+import { currentUser } from "@/auth";
 import { Logo } from "@/components/brand/Logo";
 
 const NAV = [
@@ -12,14 +13,22 @@ const NAV = [
   { href: "/faq", label: "FAQ" },
 ];
 
-const ACCOUNT = [
-  { href: "/client/dashboard", label: "Профиль" },
+const ACCOUNT_TAIL = [
   { href: "/cart", label: "Корзина" },
   { href: "/favorites", label: "Избранное" },
-  { href: "/login", label: "Войти" },
 ];
 
-export function SiteFooter() {
+export async function SiteFooter() {
+  // Вошедшему «Войти» ни к чему - вместо неё ссылка в кабинет
+  const user = await currentUser();
+  const account = user
+    ? [{ href: "/client/dashboard", label: "Кабинет" }, ...ACCOUNT_TAIL]
+    : [
+        { href: "/client/dashboard", label: "Профиль" },
+        ...ACCOUNT_TAIL,
+        { href: "/login", label: "Войти" },
+      ];
+
   return (
     <footer className="relative mt-auto overflow-hidden bg-ink text-ice grain">
       <Decor
@@ -51,7 +60,7 @@ export function SiteFooter() {
           </div>
 
           <FooterColumn title="Навигация" links={NAV} />
-          <FooterColumn title="Кабинет" links={ACCOUNT} />
+          <FooterColumn title="Кабинет" links={account} />
 
           <div>
             <h3 className="font-display text-sm tracking-[0.18em] text-ice/50">

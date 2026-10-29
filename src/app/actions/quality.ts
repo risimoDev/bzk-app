@@ -15,6 +15,8 @@ import {
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { saveQcPhoto, removeUpload } from "@/lib/uploads";
+import { QualityRuleError, checkDefectRefs, handleFailedInspection } from "@/lib/quality-db";
+import { audit } from "@/lib/audit";
 import {
   overallResult,
   isDefectClosed,
@@ -25,6 +27,8 @@ import {
   type QcSeverity,
   type QcDefectStatus,
 } from "@/lib/quality";
+import { isKeyOf } from "@/lib/guards";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type QcState = { ok: boolean; message?: string };
 
@@ -44,6 +48,9 @@ export async function createInspection(
   _prev: QcState,
   formData: FormData,
 ): Promise<QcState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayInspect())) return DENIED;
 
@@ -104,7 +111,7 @@ export async function createInspection(
   // что пришло из формы: подменённый номер иначе попал бы в результаты
   const marks = items.map((item) => {
     const raw = String(formData.get(`status-${item.id}`) ?? "ok");
-    const status = (raw in QC_ITEM_STATUS ? raw : "ok") as QcItemStatus;
+    const status = (isKeyOf(QC_ITEM_STATUS, raw) ? raw : "ok") as QcItemStatus;
     return {
       itemId: item.id,
       status,
@@ -115,6 +122,9 @@ export async function createInspection(
 
   const result = overallResult(marks);
 
+  // Брак: пауза в цехе и задача - в той же транзакции, что и сама
+  // проверка. Иначе при сбое проверка записалась бы, а заказ пошёл дальше
+  let paused = false;
   const inspectionId = await db.transaction(async (tx) => {
     const [inspection] = await tx
       .insert(qcInspections)
@@ -137,11 +147,30 @@ export async function createInspection(
       })),
     );
 
+    if (result === "failed") {
+      const handled = await handleFailedInspection(tx, {
+        productionOrderId,
+        inspectionId: inspection.id,
+        inspectorId: Number(user.id),
+      });
+      paused = handled.paused;
+    }
+
     return inspection.id;
+  });
+
+  await audit("quality.inspection", { type: "qc_inspection", id: inspectionId }, {
+    productionOrderId,
+    result,
+    paused,
   });
 
   revalidatePath("/admin/quality");
   revalidatePath(`/admin/quality/inspections/${inspectionId}`);
+  if (result === "failed") {
+    revalidatePath("/admin/production");
+    revalidatePath("/admin/tasks");
+  }
 
   const failed = marks.filter((m) => m.status === "fail").length;
   return {
@@ -149,7 +178,9 @@ export async function createInspection(
     message:
       result === "passed"
         ? "Проверка пройдена"
-        : `Отмечено несоответствий: ${failed}. Итог - «${result === "failed" ? "брак" : "с замечаниями"}»`,
+        : result === "failed"
+          ? `Отмечено несоответствий: ${failed}. Итог - «брак»${paused ? ": производство приостановлено" : ""}, заведена задача на разбор`
+          : `Отмечено несоответствий: ${failed}. Итог - «с замечаниями»`,
   };
 }
 
@@ -159,6 +190,9 @@ export async function createDefect(
   _prev: QcState,
   formData: FormData,
 ): Promise<QcState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayInspect())) return DENIED;
 
@@ -169,19 +203,33 @@ export async function createDefect(
   const title = String(formData.get("title") ?? "").trim().slice(0, 255);
   const description = String(formData.get("description") ?? "").trim();
   const rawSeverity = String(formData.get("severity") ?? "major");
-  const severity = (rawSeverity in QC_SEVERITY ? rawSeverity : "major") as QcSeverity;
+  const severity = (isKeyOf(QC_SEVERITY, rawSeverity) ? rawSeverity : "major") as QcSeverity;
 
-  if (!Number.isInteger(productionOrderId)) {
+  if (!Number.isInteger(productionOrderId) || productionOrderId <= 0) {
     return { ok: false, message: "Не указан производственный заказ" };
+  }
+  if (inspectionId !== null && (!Number.isInteger(inspectionId) || inspectionId <= 0)) {
+    return { ok: false, message: "Проверка указана неверно" };
   }
   if (title === "") return { ok: false, message: "Опишите дефект в одну строку" };
 
+  // Ссылки проверяем до загрузки снимка: файл не должен лечь на диск, если
+  // дефект всё равно не запишется
+  try {
+    await checkDefectRefs(db, productionOrderId, inspectionId);
+  } catch (e) {
+    if (e instanceof QualityRuleError) return { ok: false, message: e.message };
+    throw e;
+  }
+
   const photo = formData.get("photo");
   let photoPath: string | null = null;
+  let savedName: string | null = null;
 
   if (photo instanceof File && photo.size > 0) {
     try {
       const saved = await saveQcPhoto(photo);
+      savedName = saved.filename;
       // В базе лежит путь относительно хранилища: так по нему сразу видно,
       // из какой он папки
       photoPath = `qc/${saved.filename}`;
@@ -190,14 +238,30 @@ export async function createDefect(
     }
   }
 
-  await db.insert(qcDefects).values({
-    inspectionId,
+  let defectId: number;
+  try {
+    const [created] = await db
+      .insert(qcDefects)
+      .values({
+        inspectionId,
+        productionOrderId,
+        severity,
+        title,
+        description: description || null,
+        photoPath,
+        reportedBy: Number(user.id),
+      })
+      .returning({ id: qcDefects.id });
+    defectId = created.id;
+  } catch {
+    // Запись не легла - снимок остался бы сиротой в хранилище
+    if (savedName) await removeUpload(savedName, "qc");
+    return { ok: false, message: "Не удалось записать дефект. Попробуйте ещё раз" };
+  }
+
+  await audit("quality.defect", { type: "qc_defect", id: defectId }, {
     productionOrderId,
     severity,
-    title,
-    description: description || null,
-    photoPath,
-    reportedBy: Number(user.id),
   });
 
   revalidatePath("/admin/quality");
@@ -216,7 +280,7 @@ export async function updateDefectStatus(
   const raw = String(formData.get("status") ?? "");
 
   if (!Number.isInteger(defectId)) return { ok: false, message: "Дефект не найден" };
-  if (!(raw in QC_DEFECT_STATUS)) return { ok: false, message: "Неизвестный статус" };
+  if (!isKeyOf(QC_DEFECT_STATUS, raw)) return { ok: false, message: "Неизвестный статус" };
 
   const status = raw as QcDefectStatus;
   const closing = isDefectClosed(status);
@@ -234,6 +298,8 @@ export async function updateDefectStatus(
     .returning({ id: qcDefects.id });
 
   if (updated.length === 0) return { ok: false, message: "Дефект не найден" };
+
+  await audit("quality.defect_status", { type: "qc_defect", id: defectId }, { status });
 
   revalidatePath("/admin/quality");
   revalidatePath("/admin/quality/defects");
@@ -260,6 +326,8 @@ export async function deleteDefect(_prev: QcState, formData: FormData): Promise<
     await removeUpload(row.photoPath.slice(3), "qc");
   }
 
+  await audit("quality.defect_delete", { type: "qc_defect", id: defectId });
+
   revalidatePath("/admin/quality/defects");
   return { ok: true, message: "Дефект удалён" };
 }
@@ -270,6 +338,9 @@ export async function saveChecklistItem(
   _prev: QcState,
   formData: FormData,
 ): Promise<QcState> {
+  const tooLong = rejectOverlong(formData, { text: 500 });
+  if (tooLong) return tooLong;
+
   if (!(await can("settings", "edit"))) {
     return { ok: false, message: "Менять чек-листы может администратор" };
   }
@@ -292,14 +363,19 @@ export async function saveChecklistItem(
 
   if (!checklist) return { ok: false, message: "Чек-лист не найден" };
 
+  let savedItemId: number;
   if (rawId === "") {
-    await db.insert(qcChecklistItems).values({
-      checklistId,
-      text,
-      description: description || null,
-      isCritical,
-      sortOrder,
-    });
+    const [created] = await db
+      .insert(qcChecklistItems)
+      .values({
+        checklistId,
+        text,
+        description: description || null,
+        isCritical,
+        sortOrder,
+      })
+      .returning({ id: qcChecklistItems.id });
+    savedItemId = created.id;
   } else {
     const itemId = Number(rawId);
     if (!Number.isInteger(itemId)) return { ok: false, message: "Пункт не найден" };
@@ -313,7 +389,13 @@ export async function saveChecklistItem(
       .returning({ id: qcChecklistItems.id });
 
     if (updated.length === 0) return { ok: false, message: "Пункт не найден" };
+    savedItemId = itemId;
   }
+
+  await audit("quality.checklist_item_save", { type: "qc_checklist", id: checklistId }, {
+    itemId: savedItemId,
+    isCritical,
+  });
 
   revalidatePath(`/admin/quality/checklists/${checklistId}`);
   revalidatePath("/admin/quality");
@@ -348,6 +430,12 @@ export async function deleteChecklistItem(
   }
 
   await db.delete(qcChecklistItems).where(eq(qcChecklistItems.id, itemId));
+
+  await audit(
+    "quality.checklist_item_delete",
+    { type: "qc_checklist", id: Number.isInteger(checklistId) ? checklistId : null },
+    { itemId },
+  );
 
   revalidatePath(`/admin/quality/checklists/${checklistId}`);
   return { ok: true, message: "Пункт удалён" };

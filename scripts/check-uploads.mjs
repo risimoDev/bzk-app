@@ -8,15 +8,15 @@
  * не зависит от присланного, выход из папки вверх невозможен, а формат и
  * размер отсекаются до записи.
  */
-import { rm, stat } from "node:fs/promises";
+import { readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import {
-  saveUpload,
+  saveUploadStream,
+  cleanOriginalName,
   removeUpload,
   uploadExists,
   uploadPath,
 } from "../src/lib/uploads.ts";
-import { MAX_UPLOAD_SIZE } from "../src/lib/client-portal.ts";
 
 let failed = 0;
 
@@ -42,15 +42,15 @@ const clientsExisted = await stat(path.join(ROOT, "clients")).then(() => true, (
 
 // ---------------------------------------------------------- запись
 
-const file = new File([new Uint8Array([0x25, 0x50, 0x44, 0x46])], "макет заказа.pdf", {
-  type: "application/pdf",
-});
+/** Тело запроса из байтов: ровно то, что приходит в маршрут загрузки. */
+const stream = (bytes) => new Response(bytes).body;
+const save = (bytes, name) => saveUploadStream(stream(bytes), name, "application/pdf");
 
-const saved = await saveUpload(file);
+const saved = await save(new Uint8Array([0x25, 0x50, 0x44, 0x46]), "макет заказа.pdf");
 
 check(
   "имя на диске случайное, не присланное",
-  /^[0-9a-f]{32}\.pdf$/.test(saved.filename),
+  /^[0-9a-f]{32}.pdf$/.test(saved.filename),
   saved.filename,
 );
 check("исходное имя сохранено отдельно", saved.originalName === "макет заказа.pdf");
@@ -59,32 +59,28 @@ check("файл лежит на диске", await uploadExists(saved.filename))
 
 // ------------------------------------------------- отказы до записи
 
-await rejects(
-  "исполняемый файл не принимается",
-  () => saveUpload(new File([new Uint8Array([1])], "virus.exe")),
-  "формат",
-);
+await rejects("исполняемый файл не принимается", () => save(new Uint8Array([1]), "virus.exe"), "формат");
+await rejects("файл без расширения не принимается", () => save(new Uint8Array([1]), "readme"), "формат");
+await rejects("пустой файл не принимается", () => save(new Uint8Array(0), "a.pdf"), "пустой");
 
+// Предел считается по пришедшим байтам, а не по заголовку: маленький
+// предел и файл побольше. Недописанный файл не должен остаться на диске
+const before = new Set(await readdir(path.join(ROOT, "clients")));
 await rejects(
-  "файл без расширения не принимается",
-  () => saveUpload(new File([new Uint8Array([1])], "readme")),
-  "формат",
-);
-
-await rejects("пустой файл не принимается", () => saveUpload(new File([], "a.pdf")), "пустой");
-
-await rejects(
-  "файл больше пятидесяти мегабайт не принимается",
-  () =>
-    saveUpload(
-      // Размер берём из свойства, а не из содержимого: держать 50 МБ в
-      // памяти ради проверки незачем
-      Object.defineProperty(new File([new Uint8Array([1])], "big.zip"), "size", {
-        value: MAX_UPLOAD_SIZE + 1,
-      }),
-    ),
+  "файл больше предела обрывается на лету",
+  () => saveUploadStream(stream(new Uint8Array(2048)), "big.zip", "application/zip", 1024),
   "50 МБ",
 );
+const after = await readdir(path.join(ROOT, "clients"));
+check("после отказа на диске ничего не осталось", after.every((n) => before.has(n)));
+
+// ------------------------------------------- имя из заголовка запроса
+
+check("имя декодируется", cleanOriginalName(encodeURIComponent("макет 1.pdf")) === "макет 1.pdf");
+check("путь в имени отсекается", cleanOriginalName(encodeURIComponent("../../etc/passwd")) === "passwd");
+check("обратные слэши тоже", cleanOriginalName(encodeURIComponent(String.raw`..\..\a.pdf`)) === "a.pdf");
+check("пустое имя отвергается", cleanOriginalName("") === null);
+check("битое кодирование отвергается", cleanOriginalName("%E0%A4%A") === null);
 
 // ------------------------------------------------- выход из папки
 
@@ -128,4 +124,4 @@ if (!clientsExisted) {
 }
 
 console.log(failed === 0 ? "\nВсе проверки прошли." : `\nОшибок: ${failed}`);
-process.exit(failed === 0 ? 0 : 1);
+process.exitCode = failed === 0 ? 0 : 1;

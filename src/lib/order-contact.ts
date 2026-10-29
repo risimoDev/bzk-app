@@ -14,6 +14,18 @@ export type OrderContact = {
   originalTotal?: number;
   urgentFee?: number;
   promo?: unknown;
+  /**
+   * Реквизиты покупателя на момент заказа. Есть только у заказов,
+   * оформленных после появления снимка; у остальных - undefined, и
+   * документы берут текущие данные профиля.
+   */
+  buyer?: {
+    isCorporate: boolean;
+    companyName?: string;
+    inn?: string;
+    kpp?: string;
+    legalAddress?: string;
+  };
   /** Текст как есть - если это оказался не JSON */
   raw?: string;
 };
@@ -40,6 +52,16 @@ export function parseContact(value: string | null): OrderContact | null {
       originalTotal: num(j.original_total_price),
       urgentFee: num(j.urgent_fee),
       promo: j.promo_data ?? undefined,
+      buyer:
+        typeof j.is_corporate === "boolean"
+          ? {
+              isCorporate: j.is_corporate,
+              companyName: str(j.company_name),
+              inn: str(j.inn),
+              kpp: str(j.kpp),
+              legalAddress: str(j.legal_address),
+            }
+          : undefined,
     };
   } catch {
     // Не JSON - показываем как обычный текст, это тоже валидный случай

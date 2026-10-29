@@ -5,12 +5,16 @@ import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { tochkaInvoices } from "@/db/schema";
 import { can } from "@/lib/permissions";
+import { audit } from "@/lib/audit";
+import { applyPaidTochkaInvoice } from "@/lib/order-money-db";
 import {
   setCustomerCode,
   getInvoicePaymentStatus,
   sendInvoiceToEmail,
   TochkaError,
 } from "@/lib/tochka";
+import { tochkaStatusOf, isKnownTochkaStatus } from "@/lib/tochka-status";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type TochkaState = { ok: boolean; message?: string };
 
@@ -37,6 +41,8 @@ export async function selectCustomer(
     return toState(e);
   }
 
+  await audit("tochka.customer", { type: "settings" }, { customerCode: code });
+
   revalidatePath("/admin/tochka");
   return { ok: true, message: `Компания ${code} сохранена` };
 }
@@ -47,6 +53,14 @@ export async function selectCustomer(
  * Банк не присылает уведомлений в это приложение, поэтому статус
  * приходится спрашивать самим. Проверяем только счета, которые ещё ждут
  * оплаты: по закрытым спрашивать нечего.
+ *
+ * Оплаченный счёт, привязанный к заказу, сразу становится платежом в
+ * карточке этого заказа - той же транзакцией, что и смена статуса счёта.
+ * Повторная сверка второго платежа не заведёт: платёж помнит свой счёт
+ * (order_payments.tochka_invoice_id, уникальный).
+ *
+ * Право - finance.edit: сверка пишет деньги в бухгалтерию, а не только
+ * смотрит на них.
  */
 export async function syncPaymentStatuses(
   _prev: TochkaState,
@@ -56,8 +70,8 @@ export async function syncPaymentStatuses(
   void _prev;
   void _formData;
 
-  if (!(await can("finance", "view"))) {
-    return { ok: false, message: "Нужны права на просмотр финансов" };
+  if (!(await can("finance", "edit"))) {
+    return { ok: false, message: "Нужны права на изменение финансов" };
   }
 
   const waiting = await db
@@ -70,49 +84,91 @@ export async function syncPaymentStatuses(
   }
 
   let changed = 0;
+  let unknown = 0;
+  let payments = 0;
   const failures: string[] = [];
 
   for (const inv of waiting) {
     try {
       const r = await getInvoicePaymentStatus(inv.documentId);
-      const raw = (r.Data?.paymentStatus ?? r.Data?.status ?? "").toLowerCase();
+      const raw = r.Data?.paymentStatus ?? r.Data?.status ?? "";
 
-      // Названия статусов у банка свои; сводим к трём нашим
-      const status =
-        raw.includes("paid") || raw.includes("оплач")
-          ? "paid"
-          : raw.includes("expir") || raw.includes("истек")
-            ? "expired"
-            : null;
+      // Только точное совпадение со словарём: подстрока "paid" сидит и в
+      // "unpaid", и неоплаченный счёт становился оплаченным
+      const status = tochkaStatusOf(raw);
+
+      // Незнакомый статус не трогаем, но пишем в журнал: если банк
+      // переименует значения, сверка замолчит, и это надо заметить
+      if (!isKnownTochkaStatus(raw)) {
+        unknown++;
+        console.warn(
+          `[tochka] неизвестный статус оплаты счёта ${inv.documentId}: ${JSON.stringify(raw)}`,
+        );
+      }
 
       if (!status) continue;
 
-      const paidAt = r.Data?.paidAt ? new Date(r.Data.paidAt) : new Date();
-      await db
-        .update(tochkaInvoices)
-        .set({
-          paymentStatus: status,
-          paidAt: status === "paid" ? paidAt : null,
-        })
-        .where(eq(tochkaInvoices.id, inv.id));
+      // Кривая дата от банка не должна ронять запись статуса
+      const bankPaidAt = r.Data?.paidAt ? new Date(r.Data.paidAt) : null;
+      const paidAt =
+        bankPaidAt && !Number.isNaN(bankPaidAt.getTime()) ? bankPaidAt : new Date();
+      const applied = await db.transaction(async (tx) => {
+        await tx
+          .update(tochkaInvoices)
+          .set({
+            paymentStatus: status,
+            paidAt: status === "paid" ? paidAt : null,
+          })
+          .where(eq(tochkaInvoices.id, inv.id));
+        return status === "paid" ? applyPaidTochkaInvoice(tx, inv.id) : null;
+      });
       changed++;
+
+      if (applied?.paymentId != null && applied.summary) {
+        payments++;
+        await audit(
+          "finance.payment_add",
+          { type: "orders_accounting", id: applied.summary.cardId },
+          {
+            amount: applied.amount.toFixed(2),
+            tochkaInvoiceId: inv.id,
+            orderId: applied.orderId,
+            status: applied.summary.status,
+          },
+        );
+        revalidatePath(`/admin/orders/${applied.orderId}`);
+        revalidatePath(`/client/orders/${applied.orderId}`);
+        revalidatePath(`/admin/finance/${applied.summary.cardId}`);
+      }
     } catch (e) {
       failures.push(e instanceof Error ? e.message : String(e));
     }
   }
 
   revalidatePath("/admin/tochka");
+  if (payments > 0) {
+    revalidatePath("/admin/finance");
+    revalidatePath("/admin/analytics");
+    revalidatePath("/admin");
+    revalidatePath("/client/orders");
+  }
 
   if (failures.length > 0 && changed === 0) {
     return { ok: false, message: `Банк не ответил: ${failures[0]}` };
   }
 
+  const base =
+    changed === 0
+      ? `Проверено счетов: ${waiting.length}, изменений нет`
+      : `Обновлено счетов: ${changed} из ${waiting.length}` +
+        (payments > 0 ? `, платежей в заказы: ${payments}` : "");
+
   return {
     ok: true,
     message:
-      changed === 0
-        ? `Проверено счетов: ${waiting.length}, изменений нет`
-        : `Обновлено счетов: ${changed} из ${waiting.length}`,
+      unknown > 0
+        ? `${base}. Статус банка не распознан у ${unknown} - подробности в журнале сервера`
+        : base,
   };
 }
 
@@ -120,6 +176,9 @@ export async function emailInvoice(
   _prev: TochkaState,
   formData: FormData,
 ): Promise<TochkaState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("documents", "create"))) {
     return { ok: false, message: "Нужны права на создание документов" };
   }
@@ -137,6 +196,8 @@ export async function emailInvoice(
   } catch (e) {
     return toState(e);
   }
+
+  await audit("tochka.invoice_email", { type: "tochka_invoice" }, { documentId, email });
 
   revalidatePath("/admin/tochka");
   return { ok: true, message: `Счёт отправлен на ${email}` };

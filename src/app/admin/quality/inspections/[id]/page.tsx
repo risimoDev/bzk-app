@@ -26,6 +26,7 @@ import {
 } from "@/lib/quality";
 import { DefectForm } from "../../inspect/[id]/DefectForm";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Протокол проверки · Админка",
@@ -52,8 +53,8 @@ export default async function AdminInspection({
   }
 
   const { id } = await params;
-  const inspectionId = Number(id);
-  if (!Number.isInteger(inspectionId) || inspectionId <= 0) notFound();
+  const inspectionId = parseId(id);
+  if (inspectionId === null) notFound();
 
   const [inspection] = await db
     .select({

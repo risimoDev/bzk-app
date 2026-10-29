@@ -4,7 +4,6 @@ import { useActionState, useState } from "react";
 import { CalendarClock, Check, TriangleAlert } from "lucide-react";
 import {
   deleteExternalOrder,
-  setPaymentStatus,
   setProductionStatus,
   setReadyDate,
   updateExternalOrder,
@@ -12,12 +11,9 @@ import {
   type OrderFormState,
 } from "@/app/actions/external-orders";
 import { attachOrderToCounterparty } from "@/app/actions/counterparties";
-import {
-  EXTERNAL_PAYMENT_STATUS,
-  EXTERNAL_PRODUCTION_STATUS,
-  type ExternalPaymentStatus,
-  type ExternalProductionStatus,
-} from "@/lib/external-orders";
+import { EXTERNAL_PRODUCTION_STATUS } from "@/lib/external-orders";
+import { nextStatuses } from "@/lib/order-status";
+import { externalOrderTotal } from "@/lib/order-money";
 import { counterpartyLabel } from "@/lib/counterparties";
 import { cn } from "@/lib/cn";
 import { adminLabelClass } from "@/components/ui/form-classes";
@@ -25,51 +21,10 @@ import { adminLabelClass } from "@/components/ui/form-classes";
 const initial: ExternalState = { ok: false };
 const blank: OrderFormState = {};
 
-/** Оплата: три состояния, поэтому кнопки, а не список. */
-export function PaymentControls({
-  orderId,
-  status,
-}: {
-  orderId: number;
-  status: string | null;
-}) {
-  const [state, action, pending] = useActionState(setPaymentStatus, initial);
-  const current = status ?? "unpaid";
-
-  return (
-    <form action={action} className="flex flex-wrap items-center gap-1.5">
-      <input type="hidden" name="orderId" value={orderId} />
-      {(Object.keys(EXTERNAL_PAYMENT_STATUS) as ExternalPaymentStatus[]).map((key) => {
-        const active = key === current;
-        return (
-          <button
-            key={key}
-            type="submit"
-            name="status"
-            value={key}
-            disabled={pending || active}
-            className={cn(
-              "rounded px-3 py-1 font-display text-[0.6rem] tracking-wider transition-colors",
-              active
-                ? EXTERNAL_PAYMENT_STATUS[key].className
-                : "border border-ink/12 text-ink/45 hover:border-ink/30 hover:text-ink",
-              pending && "opacity-60",
-            )}
-          >
-            {EXTERNAL_PAYMENT_STATUS[key].label}
-          </button>
-        );
-      })}
-      {state.message && (
-        <span className={cn("text-xs", state.ok ? "text-ok" : "text-danger")} role="status">
-          {state.message}
-        </span>
-      )}
-    </form>
-  );
-}
-
-/** Производство: статусов восемь, здесь удобнее список. */
+/**
+ * Производство: статусов восемь, здесь удобнее список. В нём только
+ * допустимые переходы из текущего - ту же таблицу проверяет сервер.
+ */
 export function ProductionControls({
   orderId,
   status,
@@ -88,16 +43,17 @@ export function ProductionControls({
       <select
         id={`prod-${orderId}`}
         name="productionStatus"
+        // После сохранения статус другой - пересоздаём поле, иначе React
+        // оставит прежний выбор
+        key={status ?? "pending"}
         defaultValue={status ?? "pending"}
         className="rounded-lg border border-ink/15 bg-paper px-3 py-2 text-sm text-ink hover:border-ink/30 focus:outline-2 focus:outline-offset-1 focus:outline-brand-bright"
       >
-        {(Object.keys(EXTERNAL_PRODUCTION_STATUS) as ExternalProductionStatus[]).map(
-          (key) => (
-            <option key={key} value={key}>
-              {EXTERNAL_PRODUCTION_STATUS[key].label}
-            </option>
-          ),
-        )}
+        {nextStatuses(status).map((key) => (
+          <option key={key} value={key}>
+            {EXTERNAL_PRODUCTION_STATUS[key].label}
+          </option>
+        ))}
       </select>
       <button
         type="submit"
@@ -189,7 +145,11 @@ export function ReadyDateForm({
 }
 
 /**
- * Шапка заказа: на кого оформлен, контакты, описание и итог.
+ * Шапка заказа: на кого оформлен, контакты, описание и корректировка.
+ *
+ * Итог руками не вписывается: он сумма позиций плюс корректировка, и
+ * форма показывает расчёт. Раньше итог был отдельным полем и после
+ * правки позиций молча расходился с ними.
  *
  * Срок готовности сюда не входит - он живёт отдельной формой, потому
  * что каждое его изменение уходит в историю переносов.
@@ -204,10 +164,18 @@ export function OrderHeaderForm({
     email: string | null;
     address: string | null;
     description: string | null;
-    totalPrice: string;
+    itemsSum: number;
+    adjustment: string;
+    adjustmentNote: string | null;
   };
 }) {
   const [state, action, pending] = useActionState(updateExternalOrder, blank);
+  const [adjustment, setAdjustment] = useState(
+    Number(order.adjustment) === 0 ? "" : order.adjustment,
+  );
+  const parsed = Number(adjustment.replace(/\s/g, "").replace(",", ".").replace(/^[\u2212\u2013]/, "-"));
+  const preview = externalOrderTotal(order.itemsSum, Number.isFinite(parsed) ? parsed : 0);
+  const hasAdjustment = Number.isFinite(parsed) && parsed !== 0;
 
   return (
     <form action={action} className="grid gap-4 sm:grid-cols-2">
@@ -227,20 +195,44 @@ export function OrderHeaderForm({
       </label>
 
       <label className="flex flex-col gap-1.5">
-        <span className={labelClass}>ИТОГ ЗАКАЗА</span>
+        <span className={labelClass}>КОРРЕКТИРОВКА ИТОГА, ₽</span>
         <input
-          name="totalPrice"
-          defaultValue={order.totalPrice}
+          name="adjustment"
+          value={adjustment}
+          onChange={(e) => setAdjustment(e.target.value)}
           inputMode="decimal"
+          placeholder="0"
           className={cn(
             fieldClass,
             "font-mono",
-            state.fieldErrors?.totalPrice && "border-danger",
+            state.fieldErrors?.adjustment && "border-danger",
           )}
         />
-        {state.fieldErrors?.totalPrice && (
-          <span className="text-xs text-danger">{state.fieldErrors.totalPrice}</span>
+        <span className="text-xs text-ink/45">
+          Скидка - с минусом (-500), наценка - без. Итог:{" "}
+          {money.format(order.itemsSum)} {Number.isFinite(parsed) && parsed < 0 ? "−" : "+"}{" "}
+          {money.format(Math.abs(Number.isFinite(parsed) ? parsed : 0))} ={" "}
+          <b className="font-mono text-ink/70">{money.format(preview)}</b>
+        </span>
+        {state.fieldErrors?.adjustment && (
+          <span className="text-xs text-danger">{state.fieldErrors.adjustment}</span>
         )}
+      </label>
+
+      <label className="flex flex-col gap-1.5 sm:col-span-2">
+        <span className={labelClass}>ЗА ЧТО КОРРЕКТИРОВКА</span>
+        {/* Без корректировки заметка не сохраняется (сервер её сбрасывает),
+            поэтому и поле выключено - чтобы не казалось, что она записана */}
+        <input
+          name="adjustmentNote"
+          defaultValue={order.adjustmentNote ?? ""}
+          maxLength={255}
+          disabled={!hasAdjustment}
+          placeholder={
+            hasAdjustment ? "Скидка постоянному клиенту, доставка" : "Сначала укажите корректировку"
+          }
+          className={cn(fieldClass, !hasAdjustment && "opacity-50")}
+        />
       </label>
 
       <label className="flex flex-col gap-1.5">
@@ -386,8 +378,9 @@ export function DeleteOrderButton({ orderId }: { orderId: number }) {
     <form action={action} className="flex flex-col gap-2">
       <input type="hidden" name="orderId" value={orderId} />
       <p className="text-sm text-ink/70">
-        Позиции уйдут вместе с заказом. Бухгалтерская карточка останется - деньги по
-        нему могли уже пройти.
+        Позиции и бухгалтерская карточка уйдут вместе с заказом. Если по заказу уже
+        были платежи или списания со склада, удалить его нельзя - такой заказ
+        отменяют.
       </p>
       <div className="flex flex-wrap gap-2">
         <button
@@ -413,6 +406,12 @@ export function DeleteOrderButton({ orderId }: { orderId: number }) {
     </form>
   );
 }
+
+const money = new Intl.NumberFormat("ru-RU", {
+  style: "currency",
+  currency: "RUB",
+  maximumFractionDigits: 2,
+});
 
 const labelClass = adminLabelClass;
 const fieldClass =

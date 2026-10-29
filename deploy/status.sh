@@ -35,11 +35,18 @@ echo ""
 
 echo "--- 2. Проверка здоровья (/api/health) ---"
 if docker compose ps --status running | grep -q 'app'; then
-  HEALTH_JSON=$(docker compose exec -T app wget -q -O - http://127.0.0.1:3000/api/health 2>/dev/null || echo "error")
-  if [ "$HEALTH_JSON" != "error" ]; then
+  # Статус healthcheck контейнера: healthy / unhealthy / starting
+  APP_ID="$(docker compose ps -q app)"
+  echo "Healthcheck контейнера: $(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}не настроен{{end}}' "${APP_ID}" 2>/dev/null || echo "н/д")"
+  # Ответ - только {"status":"ok"} (200) или {"status":"degraded"} (503):
+  # подробности сбоя адрес наружу не отдаёт, они в логе приложения.
+  # busybox wget на 503 тело не печатает и завершается ошибкой - тогда
+  # ответ пустой
+  HEALTH_JSON=$(docker compose exec -T app wget -q -O - http://127.0.0.1:3000/api/health 2>/dev/null </dev/null || true)
+  if [ -n "$HEALTH_JSON" ]; then
     echo "Ответ /api/health: ${HEALTH_JSON}"
   else
-    echo "Предупреждение: не удалось получить ответ от /api/health"
+    echo "Предупреждение: /api/health не ответил 200 - причина в логе: bash deploy/logs.sh"
   fi
 else
   echo "Контейнер app не запущен!"
@@ -63,7 +70,9 @@ echo ""
 
 echo "--- 5. Последние резервные копии ---"
 if [ -d "${ROOT_DIR}/backups" ]; then
-  find "${ROOT_DIR}/backups" -type f -name "*.sql.gz" -printf "%TY-%Tm-%Td %TH:%TM: %p (%s bytes)\n" 2>/dev/null | sort -r | head -n 5 || echo "Бэкапов пока нет."
+  # Все копии теперь .dump (формат custom): ночные, ручные, перед деплоем.
+  # .sql.gz - копии, снятые до перехода на этот формат
+  find "${ROOT_DIR}/backups" -type f \( -name "*.dump" -o -name "*.sql.gz" \) -printf "%TY-%Tm-%Td %TH:%TM: %p (%s bytes)\n" 2>/dev/null | sort -r | head -n 5 || echo "Бэкапов пока нет."
 else
   echo "Папка backups/ ещё не создана."
 fi

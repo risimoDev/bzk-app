@@ -1,4 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { and, eq } from "drizzle-orm";
+import { db } from "@/db";
+import { products } from "@/db/schema";
+import { parseId } from "@/lib/ids";
 
 /**
  * Content-Security-Policy.
@@ -57,7 +61,41 @@ function policy(nonce: string, dev: boolean) {
   return directives.join("; ");
 }
 
-export function proxy(request: NextRequest) {
+/**
+ * Есть ли открытый для витрины товар с таким адресом.
+ *
+ * Нужен для настоящего 404: у витрины есть loading.tsx, и к моменту, когда
+ * страница товара понимает, что товара нет, ответ уже начат со статусом
+ * 200. Сбой базы считаем «не знаю» и пропускаем запрос дальше - страница
+ * разберётся сама.
+ */
+async function productMissing(pathname: string): Promise<boolean> {
+  const match = /^\/catalog\/([^/]+)\/?$/.exec(pathname);
+  if (!match) return false;
+
+  let raw = match[1];
+  try {
+    raw = decodeURIComponent(raw);
+  } catch {
+    return true;
+  }
+  const id = parseId(raw);
+  if (id === null) return true;
+
+  try {
+    const [row] = await db
+      .select({ id: products.id })
+      .from(products)
+      .where(and(eq(products.id, id), eq(products.isHidden, false)))
+      .limit(1);
+    return !row;
+  } catch (e) {
+    console.error("[proxy] не удалось проверить товар:", e instanceof Error ? e.message : e);
+    return false;
+  }
+}
+
+export async function proxy(request: NextRequest) {
   const dev = process.env.NODE_ENV === "development";
   const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
   const csp = policy(nonce, dev);
@@ -68,7 +106,14 @@ export function proxy(request: NextRequest) {
   requestHeaders.set("x-nonce", nonce);
   requestHeaders.set("Content-Security-Policy", csp);
 
-  const response = NextResponse.next({ request: { headers: requestHeaders } });
+  // Несуществующего пути нет, поэтому Next отвечает на него страницей
+  // not-found с кодом 404; с адресом товара внутри она бы снова открыла
+  // карточку
+  const response = (await productMissing(request.nextUrl.pathname))
+    ? NextResponse.rewrite(new URL("/__product-not-found", request.url), {
+        request: { headers: requestHeaders },
+      })
+    : NextResponse.next({ request: { headers: requestHeaders } });
   response.headers.set("Content-Security-Policy", csp);
 
   return response;
@@ -80,9 +125,13 @@ export const config = {
      * Всё, кроме статики и предзагрузки ссылок. Картинкам и файлам сборки
      * политика не нужна, а на предзагрузке next/link ключ только зря
      * ломал бы кеш ответов.
+     *
+     * api/client-uploads - загрузка макетов до 50 МБ потоком. Proxy
+     * буферизует тело запроса в памяти (proxyClientMaxBodySize), а тут оно
+     * должно идти на диск, не оседая в памяти; политика ответу-JSON не нужна.
      */
     {
-      source: "/((?!_next/static|_next/image|favicon.ico|logo.svg|bg/|collage/|editor/|production/|products/|video/).*)",
+      source: "/((?!_next/static|_next/image|favicon.ico|logo.svg|bg/|collage/|editor/|production/|products/|video/|api/client-uploads).*)",
       missing: [
         { type: "header", key: "next-router-prefetch" },
         { type: "header", key: "purpose", value: "prefetch" },

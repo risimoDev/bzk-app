@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState } from "react";
+import { useLatestActionState } from "@/components/admin/useLatestActionState";
 import { Eye, EyeOff } from "lucide-react";
 import { setDocumentsVisible, type DocumentsState } from "./actions";
 import { cn } from "@/lib/cn";
@@ -23,7 +23,7 @@ export function DocumentsToggle({
   orderId: number;
   visible: boolean;
 }) {
-  const [state, action, pending] = useActionState(setDocumentsVisible, initial);
+  const [state, action, pending] = useLatestActionState(setDocumentsVisible, initial);
 
   return (
     <form action={action} className="flex flex-col gap-2">

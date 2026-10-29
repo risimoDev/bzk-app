@@ -1,5 +1,5 @@
 import "server-only";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 
 /**
  * Телеграм-бот: отправка сообщений и привязка аккаунта.
@@ -9,13 +9,13 @@ import { createHmac, timingSafeEqual } from "node:crypto";
  * боте команда «/connect почта@клиента» привязывала чат к аккаунту по
  * одному только адресу: кто знал почту клиента, тот и получал его
  * уведомления о заказах. Здесь вместо адреса разовый код из кабинета -
- * он подтверждает, что человек владеет и аккаунтом, и чатом.
+ * он подтверждает, что человек владеет и аккаунтом, и чатом. Выдача и
+ * погашение кодов - `telegram-link.ts` и `telegram-link-db.ts`.
  */
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim() ?? "";
 const GROUP_CHAT_ID = process.env.TELEGRAM_GROUP_CHAT_ID?.trim() ?? "";
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET?.trim() ?? "";
-const LINK_SECRET = process.env.AUTH_SECRET?.trim() ?? "";
 
 const API = "https://api.telegram.org";
 
@@ -93,6 +93,19 @@ async function callApi<T = unknown>(
   }
 }
 
+/**
+ * Ошибка телеграма, которая не пройдёт сама: бот заблокирован, чата нет,
+ * аккаунт удалён. Повторять отправку бессмысленно - в отличие от сетевого
+ * сбоя или «слишком часто». Сравнение по тексту описания, потому что
+ * кроме него и кода 400/403 ничего различающего API не отдаёт.
+ */
+export function isPermanentTelegramError(error: string | undefined | null): boolean {
+  if (!error) return false;
+  return /bot was blocked|chat not found|user is deactivated|can't initiate conversation|bot was kicked|have no rights to send|peer_id_invalid|chat_id is empty|group chat was upgraded/i.test(
+    error,
+  );
+}
+
 export type InlineButton = { text: string; url?: string; callback_data?: string };
 
 export async function sendMessage(
@@ -168,55 +181,4 @@ export async function setWebhook(url: string) {
 export async function deleteWebhook() {
   const r = await callApi("deleteWebhook", { drop_pending_updates: true });
   return r.ok ? { ok: true } : { ok: false, error: r.description };
-}
-
-// ------------------------------------------------- код для привязки
-
-/** Сколько живёт код привязки. */
-export const LINK_CODE_TTL_MINUTES = 15;
-
-function windowIndex(at = Date.now()) {
-  return Math.floor(at / (LINK_CODE_TTL_MINUTES * 60_000));
-}
-
-function signature(userId: number, window: number) {
-  return createHmac("sha256", LINK_SECRET || "telegram-link")
-    .update(`${userId}:${window}`)
-    .digest("hex")
-    .slice(0, 6)
-    .toUpperCase();
-}
-
-/**
- * Разовый код вида «2-9F3A17»: номер пользователя и подпись от него.
- *
- * Код нигде не хранится - он выводится из номера, времени и секрета
- * приложения. Поэтому не нужна ни таблица, ни уборка просроченных
- * записей, а подделать код без секрета нельзя.
- */
-export function makeLinkCode(userId: number, at = Date.now()) {
-  return `${userId.toString(36).toUpperCase()}-${signature(userId, windowIndex(at))}`;
-}
-
-/**
- * Проверка кода. Принимаем и текущее окно, и предыдущее: код, показанный
- * на последней минуте, не должен протухнуть, пока его набирают.
- */
-export function verifyLinkCode(code: string, at = Date.now()): number | null {
-  const cleaned = code.trim().toUpperCase().replace(/\s+/g, "");
-  const match = /^([0-9A-Z]+)-([0-9A-F]{6})$/.exec(cleaned);
-  if (!match) return null;
-
-  const userId = parseInt(match[1], 36);
-  if (!Number.isInteger(userId) || userId <= 0) return null;
-
-  const now = windowIndex(at);
-  for (const w of [now, now - 1]) {
-    const expected = signature(userId, w);
-    const a = Buffer.from(expected);
-    const b = Buffer.from(match[2]);
-    if (a.length === b.length && timingSafeEqual(a, b)) return userId;
-  }
-
-  return null;
 }

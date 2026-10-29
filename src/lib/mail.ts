@@ -1,5 +1,7 @@
 import "server-only";
-import nodemailer from "nodemailer";
+// С 10-й версии nodemailer везёт свои типы вместо @types/nodemailer, и тип
+// транспорта там обычный именованный экспорт, а не член пространства имён
+import nodemailer, { type Transporter } from "nodemailer";
 
 /**
  * Отправка почты.
@@ -27,7 +29,7 @@ export function isMailConfigured() {
  * переподключается. Создавать транспорт на каждое письмо - лишнее
  * рукопожатие TLS на каждую отправку.
  */
-let transport: nodemailer.Transporter | null = null;
+let transport: Transporter | null = null;
 
 function getTransport() {
   if (!isMailConfigured()) return null;

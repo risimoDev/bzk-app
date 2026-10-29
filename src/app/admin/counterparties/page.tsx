@@ -32,7 +32,7 @@ const PER_PAGE = 40;
 export default async function AdminCounterparties({
   searchParams,
 }: PageProps<"/admin/counterparties">) {
-  if (!(await can("users", "view"))) {
+  if (!(await can("counterparties", "view"))) {
     return (
       <AdminPage title="Контрагенты">
         <AdminEmpty
@@ -63,7 +63,7 @@ export default async function AdminCounterparties({
   }
   const where = and(...conditions);
 
-  const canEdit = await can("users", "edit");
+  const canEdit = await can("counterparties", "edit");
 
   const [rows, [totals], [orphans]] = await Promise.all([
     db

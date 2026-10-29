@@ -16,6 +16,7 @@ import {
 import { MovementForm } from "./MovementForm";
 import { MaterialForm } from "../MaterialForm";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Материал · Админка",
@@ -48,7 +49,8 @@ export default async function AdminMaterial(
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const materialId = parseId(id);
+  if (materialId === null) notFound();
 
   const [material] = await db
     .select({
@@ -68,7 +70,7 @@ export default async function AdminMaterial(
     })
     .from(materials)
     .leftJoin(materialsStock, eq(materialsStock.materialId, materials.id))
-    .where(eq(materials.id, Number(id)))
+    .where(eq(materials.id, materialId))
     .limit(1);
 
   if (!material) notFound();

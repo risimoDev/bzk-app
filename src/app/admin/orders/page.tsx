@@ -8,6 +8,8 @@ import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { ORDER_STATUS, statusOf, type OrderStatus } from "@/lib/order-status";
 import { can } from "@/lib/permissions";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Заказы · Админка",
@@ -49,12 +51,15 @@ export default async function AdminOrders(props: PageProps<"/admin/orders">) {
   const page = Math.max(1, Number(one(sp.page)) || 1);
 
   const filters: SQL[] = [];
-  if (status && status in ORDER_STATUS) {
+  if (status && isKeyOf(ORDER_STATUS, status)) {
     filters.push(eq(orders.status, status as OrderStatus));
   }
   if (query) {
     const like = `%${query}%`;
-    const byId = /^\d+$/.test(query) ? eq(orders.id, Number(query)) : undefined;
+    // Длинное число - это не номер заказа, а, скорее, телефон: в integer
+    // оно не влезет, и сравнение с id уронило бы запрос
+    const orderId = parseId(query);
+    const byId = orderId === null ? undefined : eq(orders.id, orderId);
     const cond = or(ilike(users.name, like), ilike(users.email, like), byId);
     if (cond) filters.push(cond);
   }
@@ -183,7 +188,7 @@ export default async function AdminOrders(props: PageProps<"/admin/orders">) {
                         >
                           {o.id}
                         </Link>
-                        {o.isNew && (
+                        {o.isNew && o.status !== "cancelled" && (
                           <span className="ml-2 rounded bg-brand/12 px-1.5 py-0.5 font-display text-[0.58rem] tracking-wider text-brand">
                             НОВЫЙ
                           </span>

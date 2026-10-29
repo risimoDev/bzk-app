@@ -7,6 +7,8 @@ import { auditLog, users } from "@/db/schema";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { AdminPager, offsetOf, pageFrom } from "@/components/admin/AdminPager";
 import { can } from "@/lib/permissions";
+import { parseId } from "@/lib/ids";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Журнал действий · Админка",
@@ -65,7 +67,13 @@ const ACTION_LABEL: Record<string, string> = {
   "material.create": "Заведён материал",
   "material.update": "Изменён материал",
   "material.write_off": "Списан материал",
+  "material.write_off_return": "Списание возвращено на склад",
   "purchase.create": "Оформлена закупка",
+  "purchase.receive": "Принята позиция закупки",
+  "purchase.payment_add": "Отмечена оплата закупки",
+  "purchase.payment_cancel": "Отменена оплата закупки",
+  "quality.inspection": "Проведена проверка качества",
+  "quality.defect": "Зарегистрирован дефект",
   "offer.create": "Создано КП",
   "offer.status": "Сменён статус КП",
   "offer.to_order": "КП превращено в заказ",
@@ -89,6 +97,31 @@ const ACTION_LABEL: Record<string, string> = {
   "review.create": "Оставлен отзыв",
   "user.totp_enabled": "Включён вход с кодом",
   "user.totp_disabled": "Выключен вход с кодом",
+  "user.block": "Пользователь заблокирован",
+  "user.unblock": "Пользователь разблокирован",
+  "user.editor_access": "Изменён доступ к редактору открыток",
+  "user.warehouse_access": "Изменён доступ к мини-складу",
+  "user.reset_link": "Отправлена ссылка на смену пароля",
+  "crm.lead_create": "Заведён лид",
+  "crm.lead_status": "Сменён статус лида",
+  "task.create": "Создана задача",
+  "task.status": "Сменён статус задачи",
+  "task.assign": "Назначен исполнитель задачи",
+  "task.delete": "Удалена задача",
+  "quality.defect_status": "Сменён статус дефекта",
+  "quality.defect_delete": "Удалён дефект",
+  "quality.checklist_item_save": "Изменён пункт чек-листа",
+  "quality.checklist_item_delete": "Удалён пункт чек-листа",
+  "purchase.status": "Сменён статус закупки",
+  "product.image.main": "Выбрано главное фото товара",
+  "settings.company": "Изменены реквизиты компании",
+  "seo.save": "Изменены SEO-тексты страницы",
+  "seo.clear": "Сброшены SEO-тексты страницы",
+  "message.delete": "Удалено обращение с сайта",
+  "review.status": "Модерация отзыва",
+  "promocode.toggle": "Промокод включён или выключен",
+  "tochka.customer": "Выбрана компания в банке",
+  "tochka.invoice_email": "Счёт банка отправлен на почту",
 };
 
 /** Куда ведёт запись: у части сущностей есть своя страница. */
@@ -114,6 +147,14 @@ const ENTITY: Record<string, { label: string; href?: (id: number) => string }> =
   document_category: { label: "Раздел документов" },
   general_expense: { label: "Общий расход" },
   review: { label: "Отзыв" },
+  qc_inspection: { label: "Проверка качества", href: (id) => `/admin/quality/inspections/${id}` },
+  qc_defect: { label: "Дефект" },
+  qc_checklist: { label: "Чек-лист", href: (id) => `/admin/quality/checklists/${id}` },
+  task: { label: "Задача" },
+  contact_message: { label: "Обращение с сайта" },
+  settings: { label: "Настройки" },
+  seo_page: { label: "SEO" },
+  tochka_invoice: { label: "Счёт банка" },
 };
 
 function one(value: string | string[] | undefined) {
@@ -147,7 +188,7 @@ export default async function AdminAudit({ searchParams }: PageProps<"/admin/aud
   const sp = await searchParams;
   const q = one(sp.q).trim().slice(0, 100);
   const userRaw = one(sp.user);
-  const userId = /^\d+$/.test(userRaw) ? Number(userRaw) : null;
+  const userId = parseId(userRaw);
   const type = one(sp.type);
   const page = pageFrom(sp.page);
 
@@ -155,7 +196,7 @@ export default async function AdminAudit({ searchParams }: PageProps<"/admin/aud
   // % и _ в поиске - обычные символы, а не шаблон LIKE
   if (q) conditions.push(ilike(auditLog.action, `%${q.replace(/[\\%_]/g, "\\$&")}%`));
   if (userId) conditions.push(eq(auditLog.userId, userId));
-  if (type && type in ENTITY) conditions.push(eq(auditLog.entityType, type));
+  if (type && isKeyOf(ENTITY, type)) conditions.push(eq(auditLog.entityType, type));
   const where = conditions.length > 0 ? and(...conditions) : undefined;
 
   const [rows, [{ n: total }], staff] = await Promise.all([
@@ -209,7 +250,7 @@ export default async function AdminAudit({ searchParams }: PageProps<"/admin/aud
             </option>
           ))}
         </select>
-        <select name="type" defaultValue={type in ENTITY ? type : ""} aria-label="Раздел" className={selectClass}>
+        <select name="type" defaultValue={isKeyOf(ENTITY, type) ? type : ""} aria-label="Раздел" className={selectClass}>
           <option value="">Все разделы</option>
           {Object.entries(ENTITY).map(([key, e]) => (
             <option key={key} value={key}>

@@ -4,10 +4,12 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { clients, crmLeads, crmInteractions, crmReminders, users } from "@/db/schema";
+import { clients, crmLeads, crmInteractions, crmReminders } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { isActiveStaff } from "@/lib/staff-db";
+import { parseId } from "@/lib/ids";
 import {
   LEAD_STATUS,
   LEAD_SOURCE,
@@ -19,24 +21,31 @@ import {
   type LeadPriority,
   type InteractionType,
 } from "@/lib/crm";
+import { isKeyOf } from "@/lib/guards";
+import { parseCalendarDate, parseCalendarDateTime } from "@/lib/dates";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type CrmState = { ok: boolean; message?: string };
 
 const DENIED: CrmState = { ok: false, message: "Нет прав на CRM" };
 
 /**
- * Отдельного модуля прав у CRM нет: лид - это будущий клиент, поэтому
- * доступ привязан к правам на клиентов. Страница проверяет право сама -
- * из файла с «use server» такую проверку наружу не отдаём, иначе она
- * станет ещё одним открытым эндпоинтом.
+ * Право на CRM - свой модуль `crm`. Раньше раздел был закрыт правом на
+ * клиентов (`users`), и выдать сотруднику лиды значило пустить его к
+ * блокировке аккаунтов. Страница проверяет право сама - из файла с
+ * «use server» такую проверку наружу не отдаём, иначе она станет ещё
+ * одним открытым эндпоинтом.
  */
 async function mayEdit() {
-  return can("users", "edit");
+  return can("crm", "edit");
 }
 
 // ----------------------------------------------------------------- лиды
 
 export async function createLead(_prev: CrmState, formData: FormData): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayEdit())) return DENIED;
 
@@ -48,17 +57,20 @@ export async function createLead(_prev: CrmState, formData: FormData): Promise<C
   const tags = String(formData.get("tags") ?? "").trim().slice(0, 500);
 
   const rawSource = String(formData.get("source") ?? "website");
-  const source = (rawSource in LEAD_SOURCE ? rawSource : "website") as LeadSource;
+  const source = (isKeyOf(LEAD_SOURCE, rawSource) ? rawSource : "website") as LeadSource;
 
   const rawPriority = String(formData.get("priority") ?? "medium");
-  const priority = (rawPriority in LEAD_PRIORITY ? rawPriority : "medium") as LeadPriority;
+  const priority = (isKeyOf(LEAD_PRIORITY, rawPriority) ? rawPriority : "medium") as LeadPriority;
 
   const rawRevenue = String(formData.get("expectedRevenue") ?? "").trim();
   const rawCloseDate = String(formData.get("expectedCloseDate") ?? "").trim();
 
   const rawAssignee = String(formData.get("assignedTo") ?? "").trim();
-  const assignedTo = rawAssignee === "" ? null : Number(rawAssignee);
+  const assignedTo = rawAssignee === "" ? null : parseId(rawAssignee);
 
+  if (rawAssignee !== "" && assignedTo === null) {
+    return { ok: false, message: "Ответственный не найден" };
+  }
   if (name === "") return { ok: false, message: "Впишите имя или название компании" };
   if (email === "" && phone === "") {
     return { ok: false, message: "Нужен хотя бы один контакт - почта или телефон" };
@@ -76,34 +88,37 @@ export async function createLead(_prev: CrmState, formData: FormData): Promise<C
     expectedRevenue = value.toFixed(2);
   }
 
-  if (rawCloseDate !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(rawCloseDate)) {
+  const closeDate = rawCloseDate === "" ? null : parseCalendarDate(rawCloseDate);
+  if (rawCloseDate !== "" && !closeDate) {
     return { ok: false, message: "Проверьте дату закрытия" };
   }
 
-  if (assignedTo !== null) {
-    const [staff] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, assignedTo))
-      .limit(1);
-    if (!staff) return { ok: false, message: "Ответственный не найден" };
+  // Ответственный - действующий сотрудник: id клиента в форму подставить
+  // можно, и лид повис бы на человеке без доступа в админку
+  if (assignedTo !== null && !(await isActiveStaff(assignedTo))) {
+    return { ok: false, message: "Ответственный не найден" };
   }
 
-  await db.insert(crmLeads).values({
-    name,
-    company: company || null,
-    email: email || null,
-    phone: phone || null,
-    source,
-    priority,
-    assignedTo,
-    expectedRevenue,
-    // Столбец календарный: строка «ГГГГ-ММ-ДД» уходит как есть
-    expectedCloseDate: rawCloseDate || null,
-    notes: notes || null,
-    tags: tags || null,
-    createdBy: Number(user.id),
-  });
+  const [createdLead] = await db
+    .insert(crmLeads)
+    .values({
+      name,
+      company: company || null,
+      email: email || null,
+      phone: phone || null,
+      source,
+      priority,
+      assignedTo,
+      expectedRevenue,
+      // Столбец календарный: строка «ГГГГ-ММ-ДД» уходит как есть
+      expectedCloseDate: closeDate,
+      notes: notes || null,
+      tags: tags || null,
+      createdBy: Number(user.id),
+    })
+    .returning({ id: crmLeads.id });
+
+  await audit("crm.lead_create", { type: "crm_lead", id: createdLead.id }, { assignedTo });
 
   revalidatePath("/admin/crm");
   return { ok: true, message: "Лид заведён" };
@@ -113,6 +128,9 @@ export async function setLeadStatus(
   _prev: CrmState,
   formData: FormData,
 ): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await mayEdit())) return DENIED;
 
   const leadId = Number(formData.get("leadId"));
@@ -120,7 +138,7 @@ export async function setLeadStatus(
   const lossReason = String(formData.get("lossReason") ?? "").trim();
 
   if (!Number.isInteger(leadId)) return { ok: false, message: "Лид не найден" };
-  if (!(raw in LEAD_STATUS)) return { ok: false, message: "Неизвестный статус" };
+  if (!isKeyOf(LEAD_STATUS, raw)) return { ok: false, message: "Неизвестный статус" };
 
   const status = raw as LeadStatus;
 
@@ -142,6 +160,8 @@ export async function setLeadStatus(
 
   if (updated.length === 0) return { ok: false, message: "Лид не найден" };
 
+  await audit("crm.lead_status", { type: "crm_lead", id: leadId }, { status });
+
   revalidatePath("/admin/crm");
   revalidatePath(`/admin/crm/${leadId}`);
   return { ok: true, message: LEAD_STATUS[status].label };
@@ -153,12 +173,15 @@ export async function logInteraction(
   _prev: CrmState,
   formData: FormData,
 ): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayEdit())) return DENIED;
 
   const leadId = Number(formData.get("leadId"));
   const rawType = String(formData.get("type") ?? "note");
-  const type = (rawType in INTERACTION_TYPE ? rawType : "note") as InteractionType;
+  const type = (isKeyOf(INTERACTION_TYPE, rawType) ? rawType : "note") as InteractionType;
   const subject = String(formData.get("subject") ?? "").trim().slice(0, 255);
   const description = String(formData.get("description") ?? "").trim();
   const result = String(formData.get("result") ?? "").trim();
@@ -222,6 +245,9 @@ export async function createReminder(
   _prev: CrmState,
   formData: FormData,
 ): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData, { message: 500 });
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayEdit())) return DENIED;
 
@@ -234,12 +260,9 @@ export async function createReminder(
 
   // datetime-local отдаёт «ГГГГ-ММ-ДДTЧЧ:ММ» без часового пояса - читаем
   // как местное время, именно в нём менеджер и назначает звонок
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(rawDate)) {
-    return { ok: false, message: "Укажите дату и время" };
-  }
-  const remindAt = new Date(rawDate);
-  if (Number.isNaN(remindAt.getTime())) {
-    return { ok: false, message: "Проверьте дату и время" };
+  const remindAt = parseCalendarDateTime(rawDate);
+  if (!remindAt) {
+    return { ok: false, message: rawDate === "" ? "Укажите дату и время" : "Проверьте дату и время" };
   }
 
   const [lead] = await db
@@ -307,7 +330,7 @@ export async function convertLeadToCounterparty(
   formData: FormData,
 ): Promise<CrmState> {
   const me = await currentUser();
-  if (!me || !(await can("users", "edit"))) {
+  if (!me || !(await can("crm", "edit")) || !(await can("counterparties", "edit"))) {
     return { ok: false, message: "Нет прав заводить контрагентов" };
   }
 

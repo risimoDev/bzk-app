@@ -23,6 +23,7 @@ import {
 } from "./LeadControls";
 import { CompleteReminderButton } from "../ReminderControls";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Лид · Админка",
@@ -48,7 +49,7 @@ const dtTime = new Intl.DateTimeFormat("ru-RU", {
 });
 
 export default async function AdminLead({ params }: PageProps<"/admin/crm/[id]">) {
-  if (!(await can("users", "view"))) {
+  if (!(await can("crm", "view"))) {
     return (
       <AdminPage title="Лид">
         <AdminEmpty title="Нет доступа" text="У вашей роли нет права смотреть клиентов." />
@@ -57,8 +58,8 @@ export default async function AdminLead({ params }: PageProps<"/admin/crm/[id]">
   }
 
   const { id } = await params;
-  const leadId = Number(id);
-  if (!Number.isInteger(leadId) || leadId <= 0) notFound();
+  const leadId = parseId(id);
+  if (leadId === null) notFound();
 
   const [lead] = await db
     .select({
@@ -118,7 +119,7 @@ export default async function AdminLead({ params }: PageProps<"/admin/crm/[id]">
       .orderBy(asc(crmReminders.isCompleted), asc(crmReminders.remindAt)),
   ]);
 
-  const canEdit = await can("users", "edit");
+  const canEdit = await can("crm", "edit");
   const st = leadStatus(lead.status);
   const pr = leadPriority(lead.priority);
   const tags = readTags(lead.tags);

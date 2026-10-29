@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { asc, eq, sql } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { db } from "@/db";
 import {
   clients,
@@ -14,7 +14,10 @@ import {
 import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
-import { createAccountingForExternalOrder } from "@/lib/accounting-db";
+import { recalcOrderMoney } from "@/lib/order-money-db";
+import { nextOfferNumber } from "@/lib/numbering-db";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate } from "@/lib/dates";
 
 export type OfferState = {
   ok?: boolean;
@@ -46,6 +49,9 @@ export async function createOffer(
   _prev: OfferState,
   formData: FormData,
 ): Promise<OfferState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me || !(await can("documents", "create"))) {
     return { error: "У вашей роли нет права заводить КП" };
@@ -139,7 +145,11 @@ export async function createOffer(
   const subtotal = items.reduce((s, i) => s + Number(i.total), 0);
   const total = round2(subtotal * (1 - discount / 100));
 
-  const validUntil = String(formData.get("validUntil") ?? "").trim();
+  const rawValidUntil = String(formData.get("validUntil") ?? "").trim();
+  const validUntil = rawValidUntil === "" ? null : parseCalendarDate(rawValidUntil);
+  if (rawValidUntil !== "" && !validUntil) {
+    return { fieldErrors: { validUntil: "Такой даты нет в календаре" } };
+  }
   const rawDays = String(formData.get("productionDays") ?? "").trim();
   const productionDays = rawDays === "" ? null : Number(rawDays);
   if (productionDays !== null && (!Number.isInteger(productionDays) || productionDays < 0)) {
@@ -147,18 +157,14 @@ export async function createOffer(
   }
 
   const offerId = await db.transaction(async (tx) => {
-    const year = new Date().getFullYear();
-    // На колонке номера уникальный индекс: если два КП заведут в одну
-    // секунду, второе упадёт на вставке, а не займёт чужой номер
-    const [{ n }] = await tx
-      .select({ n: sql<number>`count(*)::int` })
-      .from(commercialOffers)
-      .where(sql`${commercialOffers.number} like ${`КП-${year}-%`}`);
+    // Номер выдаёт атомарный счётчик, а не count(*) + 1: два КП,
+    // заведённые одновременно, не должны получить один номер
+    const number = await nextOfferNumber(tx);
 
     const [created] = await tx
       .insert(commercialOffers)
       .values({
-        number: `КП-${year}-${String(n + 1).padStart(3, "0")}`,
+        number,
         clientId,
         clientName,
         clientCompany: clientCompany || null,
@@ -166,7 +172,7 @@ export async function createOffer(
         clientPhone: clientPhone || null,
         clientAddress:
           String(formData.get("clientAddress") ?? "").trim().slice(0, 1000) || null,
-        validUntil: /^\d{4}-\d{2}-\d{2}$/.test(validUntil) ? validUntil : null,
+        validUntil,
         discountPercent: discount.toFixed(2),
         productionDays,
         prepaymentPercent: prepayment.toFixed(2),
@@ -225,8 +231,14 @@ export async function setOfferStatus(
  * Завести заказ по принятому предложению.
  *
  * До этого путь «КП принято → заказ» приходилось проходить руками,
- * переписывая позиции заново. Скидка КП уже учтена в итоге, поэтому в
- * заказ уходит именно он, а не сумма позиций.
+ * переписывая позиции заново. Скидка КП переносится в заказ явной
+ * корректировкой: итог тот же, что в КП, но видно, откуда разница с
+ * суммой позиций, и она переживает правку позиций.
+ *
+ * Повторное нажатие (двойной щелчок, вторая вкладка) второго заказа не
+ * заводит: КП берётся под блокировку, и если заказ из него уже есть
+ * (commercial_offers.external_order_id), человека отправляют на него.
+ * Из отклонённого и просроченного КП заказ не заводится.
  */
 export async function createOrderFromOffer(
   _prev: OfferState,
@@ -239,94 +251,112 @@ export async function createOrderFromOffer(
   const offerId = Number(formData.get("offerId"));
   if (!Number.isInteger(offerId) || offerId <= 0) return { error: "КП не найдено" };
 
-  const [offer] = await db
-    .select()
-    .from(commercialOffers)
-    .where(eq(commercialOffers.id, offerId))
-    .limit(1);
-  if (!offer) return { error: "КП не найдено" };
+  const result = await db.transaction(
+    async (tx): Promise<{ error: string } | { orderId: number; created: boolean }> => {
+      // Блокировка на всю транзакцию: второй запрос ждёт здесь, а потом
+      // видит external_order_id, который проставил первый
+      const [offer] = await tx
+        .select()
+        .from(commercialOffers)
+        .where(eq(commercialOffers.id, offerId))
+        .for("update")
+        .limit(1);
+      if (!offer) return { error: "КП не найдено" };
 
-  const items = await db
-    .select()
-    .from(commercialOfferItems)
-    .where(eq(commercialOfferItems.offerId, offerId))
-    .orderBy(asc(commercialOfferItems.sortOrder), asc(commercialOfferItems.id));
+      if (offer.externalOrderId !== null) {
+        return { orderId: offer.externalOrderId, created: false };
+      }
 
-  if (items.length === 0) {
-    return { error: "В предложении нет позиций - заводить нечего" };
-  }
+      if (offer.status === "rejected") {
+        return { error: "КП отклонено - заказ по нему не заводится. Верните КП в работу или заведите новое" };
+      }
+      if (offer.status === "expired") {
+        return { error: "Срок КП истёк - заказ по нему не заводится. Продлите КП или заведите новое" };
+      }
 
-  const subtotal = items.reduce((s, i) => s + Number(i.total), 0);
-  const discount = Number(offer.discountPercent ?? 0);
-  const total = round2(subtotal * (1 - discount / 100));
+      const items = await tx
+        .select()
+        .from(commercialOfferItems)
+        .where(eq(commercialOfferItems.offerId, offerId))
+        .orderBy(asc(commercialOfferItems.sortOrder), asc(commercialOfferItems.id));
 
-  const orderId = await db.transaction(async (tx) => {
-    // Контрагента заводим, если КП писали тому, кого ещё нет в
-    // справочнике: иначе заказ снова остался бы без заказчика
-    let clientId = offer.clientId;
-    if (clientId === null) {
-      const [created] = await tx
-        .insert(clients)
+      if (items.length === 0) {
+        return { error: "В предложении нет позиций - заводить нечего" };
+      }
+
+      const subtotal = items.reduce((s, i) => s + Number(i.total), 0);
+      const discount = Number(offer.discountPercent ?? 0);
+      const total = round2(subtotal * (1 - discount / 100));
+
+      // Контрагента заводим, если КП писали тому, кого ещё нет в
+      // справочнике: иначе заказ снова остался бы без заказчика
+      let clientId = offer.clientId;
+      if (clientId === null) {
+        const [created] = await tx
+          .insert(clients)
+          .values({
+            name: offer.clientName,
+            companyName: offer.clientCompany,
+            email: offer.clientEmail,
+            phone: offer.clientPhone,
+            address: offer.clientAddress,
+          })
+          .returning({ id: clients.id });
+        clientId = created.id;
+      }
+
+      const [order] = await tx
+        .insert(externalOrders)
         .values({
-          name: offer.clientName,
-          companyName: offer.clientCompany,
+          clientId,
+          clientName: offer.clientName,
           email: offer.clientEmail,
           phone: offer.clientPhone,
           address: offer.clientAddress,
+          description: `По коммерческому предложению ${offer.number}`,
+          status: "unpaid",
+          totalPrice: total.toFixed(2),
+          adjustment: round2(total - subtotal).toFixed(2),
+          adjustmentNote: discount !== 0 ? `Скидка ${discount} % по КП ${offer.number}` : null,
         })
-        .returning({ id: clients.id });
-      clientId = created.id;
+        .returning({ id: externalOrders.id });
+
+      await tx.insert(externalOrderItems).values(
+        items.map((i) => ({
+          externalOrderId: order.id,
+          isCustom: true,
+          itemName: i.name,
+          itemDescription: i.description,
+          quantity: i.quantity,
+          // В заказе price - сумма строки целиком, как и в КП
+          price: i.total,
+        })),
+      );
 
       await tx
         .update(commercialOffers)
-        .set({ clientId })
+        .set({ status: "accepted", clientId, externalOrderId: order.id })
         .where(eq(commercialOffers.id, offerId));
-    }
 
-    const [order] = await tx
-      .insert(externalOrders)
-      .values({
-        clientId,
-        clientName: offer.clientName,
-        email: offer.clientEmail,
-        phone: offer.clientPhone,
-        address: offer.clientAddress,
-        description: `По коммерческому предложению ${offer.number}`,
-        status: "unpaid",
-        totalPrice: total.toFixed(2),
-      })
-      .returning({ id: externalOrders.id });
+      await recalcOrderMoney(
+        tx,
+        { source: "external", id: order.id },
+        { rebuildTotal: true, refreshEstimate: true },
+      );
 
-    await tx.insert(externalOrderItems).values(
-      items.map((i) => ({
-        externalOrderId: order.id,
-        isCustom: true,
-        itemName: i.name,
-        itemDescription: i.description,
-        quantity: i.quantity,
-        // В заказе price - сумма строки целиком, как и в КП
-        price: i.total,
-      })),
-    );
+      return { orderId: order.id, created: true };
+    },
+  );
 
-    await tx
-      .update(commercialOffers)
-      .set({ status: "accepted" })
-      .where(eq(commercialOffers.id, offerId));
+  if ("error" in result) return { error: result.error };
 
-    await createAccountingForExternalOrder(tx, {
-      id: order.id,
-      clientName: offer.clientName,
-      income: total.toFixed(2),
-      status: "unpaid",
+  if (result.created) {
+    await audit("offer.to_order", { type: "commercial_offer", id: offerId }, {
+      orderId: result.orderId,
     });
-
-    return order.id;
-  });
-
-  await audit("offer.to_order", { type: "commercial_offer", id: offerId }, { orderId });
+  }
 
   revalidatePath("/admin/offers");
   revalidatePath("/admin/external-orders");
-  redirect(`/admin/external-orders/${orderId}`);
+  redirect(`/admin/external-orders/${result.orderId}`);
 }

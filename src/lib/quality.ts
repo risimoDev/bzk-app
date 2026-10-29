@@ -85,4 +85,9 @@ export function passRate(passed: number, total: number) {
 /** Форматы фотоотчёта по дефекту. */
 export const QC_PHOTO_EXTENSIONS = ["jpg", "jpeg", "png", "webp"] as const;
 export const QC_PHOTO_ACCEPT = QC_PHOTO_EXTENSIONS.map((e) => `.${e}`).join(",");
-export const MAX_QC_PHOTO_SIZE = 10 * 1024 * 1024;
+/**
+ * Фото уходит серверным действием, а у действий общий потолок тела 10 МБ
+ * (serverActions.bodySizeLimit в next.config.ts) - снимок плюс служебные
+ * байты формы должны в него влезать.
+ */
+export const MAX_QC_PHOTO_SIZE = 8 * 1024 * 1024;

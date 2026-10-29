@@ -13,8 +13,13 @@ import {
   isTelegramConfigured,
 } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
+import { formatLinkCode } from "@/lib/telegram-link";
+import { issueLinkCode } from "@/lib/telegram-link-db";
+import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
 
 export type TelegramState = { ok: boolean; message?: string };
+
+export type LinkCodeState = { code?: string; error?: string };
 
 const WEBHOOK_PATH = "/api/telegram/webhook";
 
@@ -132,4 +137,39 @@ export async function unlinkTelegram(
 
   revalidatePath("/admin/telegram");
   return { ok: true, message: `${updated[0].name} отвязан` };
+}
+
+/**
+ * Код привязки телеграма для текущего пользователя. Выдаётся по кнопке:
+ * код одноразовый и хранится в базе (отпечатком), его нельзя создавать при
+ * каждом показе страницы. Нового можно просить не чаще пяти раз за 15
+ * минут, а прежний при этом гаснет.
+ */
+export async function issueTelegramLinkCode(
+  _prev: LinkCodeState,
+): Promise<LinkCodeState> {
+  void _prev;
+
+  const me = await currentUser();
+  if (!me) return { error: "Нужно войти" };
+  if (!isTelegramConfigured()) return { error: "Телеграм не настроен" };
+
+  const userId = Number(me.id);
+
+  const [row] = await db
+    .select({ chatId: users.telegramChatId })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  if (row?.chatId) {
+    return { error: "Телеграм уже привязан - сначала отправьте боту /disconnect" };
+  }
+
+  const limit = await checkRateLimit(`tgissue:${userId}`, "telegramLinkIssue");
+  if (!limit.ok) {
+    return { error: `Слишком много кодов. Попробуйте ${retryAfterText(limit.retryAfter)}` };
+  }
+  await recordAttempt(`tgissue:${userId}`, "telegramLinkIssue");
+
+  return { code: formatLinkCode(await issueLinkCode(userId)) };
 }

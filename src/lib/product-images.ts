@@ -38,6 +38,14 @@ export const PRODUCT_IMAGE_ACCEPT = PRODUCT_IMAGE_EXTENSIONS.map((e) => `.${e}`)
 /** Потолок: витрине хватает картинки в тысячу-другую точек по стороне. */
 export const MAX_PRODUCT_IMAGE_SIZE = 8 * 1024 * 1024;
 
+/**
+ * Все файлы одной отправки вместе. Форма уходит серверным действием с
+ * потолком тела 10 МБ (next.config.ts); 9 МБ оставляют место служебным
+ * байтам формы. Один файл до 8 МБ проходит всегда, пачка - пока в сумме
+ * укладывается.
+ */
+export const MAX_PRODUCT_BATCH_SIZE = 9 * 1024 * 1024;
+
 /** Адрес выдачи. Файлы лежат в хранилище, а не в public - см. lib/uploads.ts. */
 export const PRODUCT_IMAGE_ROUTE = "/api/product-image/";
 

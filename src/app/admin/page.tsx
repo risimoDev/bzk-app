@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { and, count, desc, eq, inArray, isNotNull, ne, notInArray, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
 import { ChevronRight } from "lucide-react";
 import { db } from "@/db";
 import {
@@ -21,6 +21,7 @@ import {
 } from "@/lib/external-orders";
 import { isOverdue } from "@/lib/tasks";
 import { cn } from "@/lib/cn";
+import { openDebt } from "@/lib/order-money-db";
 
 export const metadata: Metadata = {
   title: "Сводка · Админка",
@@ -37,7 +38,7 @@ const dt = new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit" }
 const today = new Intl.DateTimeFormat("ru-RU", { weekday: "long", day: "numeric", month: "long" });
 
 /** Статусы заказа с сайта, при которых он ещё в работе. */
-const SITE_OPEN = ["pending", "processing", "in_work", "delayed", "shipped"] as const;
+const SITE_OPEN = ["pending", "processing", "in_work", "ready", "delayed", "shipped"] as const;
 
 /** Закрытые заказы менеджера - те же, что считает isExternalClosed. */
 const EXTERNAL_CLOSED = ["completed", "cancelled"] as const;
@@ -79,22 +80,31 @@ export default async function AdminDashboard() {
             .from(externalOrders)
             .where(notInArray(externalOrders.productionStatus, [...EXTERNAL_CLOSED]))
         : Promise.resolve([]),
+      // Долг - доход минус платежи по каждой карточке, по заказам обоих
+      // видов и без отменённых. Раньше здесь была полная сумма неоплаченных
+      // заказов менеджера: частичная оплата долг не уменьшала
+      // Без права на бухгалтерию денег не показываем: только число
+      // неоплаченных заказов менеджера (не отменённых) - ровно то, что
+      // откроет ссылка на список с фильтром «Не оплачен»
       canOrders
-        ? db
-            .select({
-              n: count(),
-              sum: sql<string>`coalesce(sum(${externalOrders.totalPrice}), 0)`,
-            })
-            .from(externalOrders)
-            .where(
-              and(ne(externalOrders.status, "paid"), ne(externalOrders.productionStatus, "cancelled")),
-            )
-        : Promise.resolve([]),
+        ? canFinance
+          ? openDebt()
+          : db
+              .select({ n: count() })
+              .from(externalOrders)
+              .where(
+                and(
+                  eq(externalOrders.status, "unpaid"),
+                  sql`${externalOrders.productionStatus} <> 'cancelled'`,
+                ),
+              )
+              .then(([r]) => ({ n: Number(r?.n ?? 0), debt: 0, paid: 0 }))
+        : Promise.resolve(null),
       canOrders
         ? db
             .select({
               open: sql<number>`count(*) filter (where ${inArray(orders.status, [...SITE_OPEN])})::int`,
-              fresh: sql<number>`count(*) filter (where ${eq(orders.isNew, true)})::int`,
+              fresh: sql<number>`count(*) filter (where ${eq(orders.isNew, true)} and ${orders.status} <> 'cancelled')::int`,
             })
             .from(orders)
         : Promise.resolve([]),
@@ -178,7 +188,7 @@ export default async function AdminDashboard() {
       t.dueDate.getTime() < afterTomorrow.getTime() - 24 * 3600 * 1000,
   );
 
-  const unpaidRow = unpaid[0];
+  const unpaidRow = unpaid;
   const site = siteStats[0];
 
   return (
@@ -201,11 +211,15 @@ export default async function AdminDashboard() {
               tone={soon.length > 0 ? "brand" : "plain"}
             />
           </StatLink>
-          <StatLink href="/admin/external-orders?status=unpaid" enabled>
+          <StatLink href={canFinance ? "/admin/finance" : "/admin/external-orders?status=unpaid"} enabled>
             <AdminStat
               label="Ждут оплаты"
               value={String(unpaidRow?.n ?? 0)}
-              hint={canFinance ? `на ${money.format(Number(unpaidRow?.sum ?? 0))}` : "заказов менеджера"}
+              hint={
+                canFinance
+                  ? `долг ${money.format(unpaidRow?.debt ?? 0)} - сайт и менеджер`
+                  : "заказов менеджера без оплаты"
+              }
             />
           </StatLink>
           <StatLink href="/admin/orders" enabled>
@@ -403,7 +417,7 @@ export default async function AdminDashboard() {
                         <span className="min-w-0">
                           <span className="font-mono text-xs text-ink/45">№ {o.id} · </span>
                           <span className="text-sm text-ink">{o.clientName ?? "-"}</span>
-                          {o.isNew && (
+                          {o.isNew && o.status !== "cancelled" && (
                             <span className="ml-2 rounded bg-brand/12 px-1.5 py-0.5 font-display text-[0.55rem] tracking-wider text-brand">
                               НОВЫЙ
                             </span>

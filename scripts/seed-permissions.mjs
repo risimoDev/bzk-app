@@ -21,6 +21,8 @@ const MODULES = [
   "orders",
   "products",
   "users",
+  "crm",
+  "counterparties",
   "finance",
   "materials",
   "documents",

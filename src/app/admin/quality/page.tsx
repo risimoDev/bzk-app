@@ -45,7 +45,7 @@ export default async function AdminQuality() {
       .select()
       .from(qcChecklistItems)
       .orderBy(asc(qcChecklistItems.sortOrder), asc(qcChecklistItems.id)),
-    db.select().from(productionStages).orderBy(asc(productionStages.sortOrder)),
+    db.select().from(productionStages).orderBy(asc(productionStages.sortOrder), asc(productionStages.id)),
     db
       .select({
         total: count(),

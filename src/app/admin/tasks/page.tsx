@@ -7,6 +7,7 @@ import { tasks, taskComments, users, ordersAccounting } from "@/db/schema";
 import { AdminPage, AdminEmpty, AdminStat } from "@/components/admin/AdminPage";
 import { AdminPager, offsetOf, pageFrom } from "@/components/admin/AdminPager";
 import { can } from "@/lib/permissions";
+import { staffOptions as loadStaffOptions } from "@/lib/staff-db";
 import {
   taskStatus,
   taskPriority,
@@ -24,6 +25,7 @@ import {
   DeleteTaskButton,
 } from "./TaskControls";
 import { cn } from "@/lib/cn";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Задачи · Админка",
@@ -56,7 +58,7 @@ export default async function AdminTasks({ searchParams }: PageProps<"/admin/tas
 
   const sp = await searchParams;
   const rawStatus = String(sp.status ?? "");
-  const status = rawStatus in TASK_STATUS ? (rawStatus as TaskStatus) : null;
+  const status = isKeyOf(TASK_STATUS, rawStatus) ? (rawStatus as TaskStatus) : null;
 
   // По умолчанию показываем то, что в работе: закрытые задачи копятся и
   // вытесняют живые
@@ -94,11 +96,7 @@ export default async function AdminTasks({ searchParams }: PageProps<"/admin/tas
   const [{ n: found }] = await db.select({ n: count() }).from(tasks).where(where);
 
   const [staff, byStatus, comments, linkedOrders] = await Promise.all([
-    db
-      .select({ id: users.id, name: users.name })
-      .from(users)
-      .where(inArray(users.role, ["admin", "manager"]))
-      .orderBy(asc(users.name)),
+    loadStaffOptions(),
     db.select({ status: tasks.status, n: count() }).from(tasks).groupBy(tasks.status),
     rows.length
       ? db

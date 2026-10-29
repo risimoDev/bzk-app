@@ -8,6 +8,7 @@ import { clients, externalOrders, users } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { phoneDigits } from "@/lib/counterparties";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type CounterpartyState = {
   ok?: boolean;
@@ -51,7 +52,10 @@ export async function saveCounterparty(
   _prev: CounterpartyState,
   formData: FormData,
 ): Promise<CounterpartyState> {
-  if (!(await can("users", "edit"))) return DENIED;
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
+  if (!(await can("counterparties", "edit"))) return DENIED;
 
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId ? Number(rawId) : null;
@@ -139,7 +143,7 @@ export async function linkCounterpartyToUser(
   _prev: CounterpartyState,
   formData: FormData,
 ): Promise<CounterpartyState> {
-  if (!(await can("users", "edit"))) return DENIED;
+  if (!(await can("counterparties", "edit"))) return DENIED;
 
   const id = Number(formData.get("id"));
   const rawUser = String(formData.get("userId") ?? "").trim();
@@ -255,7 +259,7 @@ export async function archiveCounterparty(
   _prev: CounterpartyState,
   formData: FormData,
 ): Promise<CounterpartyState> {
-  if (!(await can("users", "edit"))) return DENIED;
+  if (!(await can("counterparties", "edit"))) return DENIED;
 
   const id = Number(formData.get("id"));
   const archived = String(formData.get("archived") ?? "") === "1";

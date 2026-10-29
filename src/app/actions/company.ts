@@ -5,7 +5,15 @@ import { sql } from "drizzle-orm";
 import { db } from "@/db";
 import { settings } from "@/db/schema";
 import { can } from "@/lib/permissions";
+import { audit } from "@/lib/audit";
+import { readCompany } from "@/lib/company-db";
 import { COMPANY_FIELDS, validateCompany, type Company, type CompanyField } from "@/lib/company";
+import { rejectOverlong } from "@/lib/text-limits";
+
+// settings.value - varchar(255): у каждого реквизита этот предел, а не общий 5000
+const COMPANY_LIMITS: Record<string, number> = Object.fromEntries(
+  Object.keys(COMPANY_FIELDS).map((k) => [k, 255]),
+);
 
 export type CompanyFormState = {
   ok: boolean;
@@ -24,6 +32,9 @@ export async function saveCompany(
   _prev: CompanyFormState,
   formData: FormData,
 ): Promise<CompanyFormState> {
+  const tooLong = rejectOverlong(formData, COMPANY_LIMITS);
+  if (tooLong) return tooLong;
+
   if (!(await can("settings", "edit"))) {
     return { ok: false, message: "У вашей роли нет права менять настройки" };
   }
@@ -42,6 +53,12 @@ export async function saveCompany(
     return { ok: false, message: "Проверьте выделенные поля", errors };
   }
 
+  // Что именно поменялось - для журнала: реквизиты попадают в счета и
+  // УПД, и «кто поменял расчётный счёт» должно находиться. Значения не
+  // пишем, только названия полей
+  const before = await readCompany();
+  const changed = keys.filter((k) => before[k] !== values[k]);
+
   const rows = keys.map((name) => ({ name, value: values[name] }));
 
   await db
@@ -51,6 +68,10 @@ export async function saveCompany(
       target: settings.name,
       set: { value: sql`excluded.value` },
     });
+
+  if (changed.length > 0) {
+    await audit("settings.company", { type: "settings" }, { fields: changed });
+  }
 
   revalidatePath("/admin/settings/company");
   return { ok: true, message: "Реквизиты сохранены" };

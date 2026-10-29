@@ -6,6 +6,7 @@ import { createDocument, type DocumentState } from "@/app/actions/documents";
 import { DOC_STATUS, DOC_TYPE } from "@/lib/documents-meta";
 import { parseFieldsSchema, type TemplateField } from "@/lib/document-templates";
 import { cn } from "@/lib/cn";
+import { isKeyOf } from "@/lib/guards";
 import { adminInputClass, adminLabelClass } from "@/components/ui/form-classes";
 
 const initial: DocumentState = {};
@@ -89,7 +90,7 @@ export function DocumentForm({
     setValues((prev) => {
       const next = { ...prev };
       for (const f of fields) {
-        if (f.name in map && map[f.name] && !next[f.name]) next[f.name] = map[f.name]!;
+        if (isKeyOf(map, f.name) && map[f.name] && !next[f.name]) next[f.name] = map[f.name]!;
       }
       return next;
     });
@@ -158,8 +159,15 @@ export function DocumentForm({
               name="documentNumber"
               maxLength={50}
               placeholder="Оставьте пустым - присвоим по шаблону"
-              className={cn(inputClass, "font-mono")}
+              className={cn(
+                inputClass,
+                "font-mono",
+                state.fieldErrors?.documentNumber && "border-danger",
+              )}
             />
+            {state.fieldErrors?.documentNumber && (
+              <span className="text-xs text-danger">{state.fieldErrors.documentNumber}</span>
+            )}
           </label>
 
           <label className="flex flex-col gap-1.5">

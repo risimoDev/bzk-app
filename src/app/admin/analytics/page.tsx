@@ -1,13 +1,9 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { desc, sql, count, gte } from "drizzle-orm";
+import { and, desc, sql, count, eq } from "drizzle-orm";
 import { TrendingUp, Users, Package, Repeat } from "lucide-react";
 import { db } from "@/db";
-import {
-  ordersAccounting,
-  externalOrders,
-  externalOrderItems,
-} from "@/db/schema";
+import { ordersAccounting, externalOrders } from "@/db/schema";
 import { AdminPage, AdminEmpty, AdminStat } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import {
@@ -16,8 +12,10 @@ import {
   monthLabel,
   lastMonths,
   barHeight,
+  REPORT_TZ,
   type MonthPoint,
 } from "@/lib/analytics";
+import { openDebt } from "@/lib/order-money-db";
 import { cn } from "@/lib/cn";
 
 export const metadata: Metadata = {
@@ -43,20 +41,31 @@ export default async function AdminAnalytics() {
   }
 
   const months = lastMonths(MONTHS_SHOWN);
-  const since = new Date(`${months[0]}-01T00:00:00`);
 
-  const [byMonth, totals, byClient, byItem, repeatRows, readyTimes] = await Promise.all([
+  // Месяц - по часовому поясу мастерской, а не сервера: иначе заказ,
+  // оформленный 1-го числа рано утром, уезжал в прошлый месяц.
+  // orders_accounting.created_at - timestamptz, поэтому одного
+  // `at time zone` достаточно: он даёт местное время. Двойное
+  // `at time zone 'UTC' at time zone …` нужно только колонкам без пояса
+  const localCreated = sql`(${ordersAccounting.createdAt} at time zone ${sql.raw(`'${REPORT_TZ}'`)})`;
+  const monthKey = sql<string>`to_char(${localCreated}, 'YYYY-MM')`;
+
+  // Отменённые заказы и карточки без заказа в выручку не входят: денег по
+  // ним не будет, а раньше они раздували и выручку, и средний чек
+  const active = eq(ordersAccounting.isCancelled, false);
+
+  const [byMonth, totals, byClient, byItem, repeatRows, readyTimes, debt] = await Promise.all([
     db
       .select({
-        month: sql<string>`to_char(${ordersAccounting.createdAt}, 'YYYY-MM')`,
+        month: monthKey,
         income: sql<string>`coalesce(sum(${ordersAccounting.income}), 0)`,
         expense: sql<string>`coalesce(sum(${ordersAccounting.totalExpense}), 0)`,
         tax: sql<string>`coalesce(sum(${ordersAccounting.taxAmount}), 0)`,
         orders: count(),
       })
       .from(ordersAccounting)
-      .where(gte(ordersAccounting.createdAt, since))
-      .groupBy(sql`to_char(${ordersAccounting.createdAt}, 'YYYY-MM')`),
+      .where(and(active, sql`${localCreated} >= ${`${months[0]}-01`}::timestamp`))
+      .groupBy(monthKey),
     db
       .select({
         income: sql<string>`coalesce(sum(${ordersAccounting.income}), 0)`,
@@ -64,7 +73,8 @@ export default async function AdminAnalytics() {
         tax: sql<string>`coalesce(sum(${ordersAccounting.taxAmount}), 0)`,
         orders: count(),
       })
-      .from(ordersAccounting),
+      .from(ordersAccounting)
+      .where(active),
     db
       .select({
         client: ordersAccounting.clientName,
@@ -74,32 +84,68 @@ export default async function AdminAnalytics() {
         orders: count(),
       })
       .from(ordersAccounting)
+      .where(active)
       .groupBy(ordersAccounting.clientName)
       .orderBy(desc(sql`sum(${ordersAccounting.income})`))
       .limit(12),
-    // Что именно продаём: позиции внешних заказов - там название пишет
-    // менеджер, поэтому группируем по нему
-    db
-      .select({
-        name: sql<string>`coalesce(${externalOrderItems.itemName}, 'без названия')`,
-        revenue: sql<string>`coalesce(sum(${externalOrderItems.price}), 0)`,
-        expense: sql<string>`coalesce(sum(${externalOrderItems.expenseAmount}), 0)`,
-        quantity: sql<string>`coalesce(sum(${externalOrderItems.quantity}), 0)`,
-        times: count(),
-      })
-      .from(externalOrderItems)
-      .groupBy(sql`coalesce(${externalOrderItems.itemName}, 'без названия')`)
-      .orderBy(desc(sql`sum(${externalOrderItems.price})`))
-      .limit(12),
-    // Повторные клиенты: сколько имён встречается больше одного раза
-    db
-      .select({
-        client: externalOrders.clientName,
-        orders: count(),
-        revenue: sql<string>`coalesce(sum(${externalOrders.totalPrice}), 0)`,
-      })
-      .from(externalOrders)
-      .groupBy(externalOrders.clientName),
+    // Что именно продаём - по позициям обоих видов заказов. Название -
+    // из каталога, а у позиций без товара - то, что вписал менеджер: у
+    // товарных позиций item_name пуст, и раньше они сливались в одно
+    // «без названия». Отменённые заказы не считаем
+    db.execute<{
+      name: string;
+      revenue: string;
+      expense: string;
+      quantity: string;
+      times: string;
+    }>(sql`
+      select name,
+             sum(price) as revenue,
+             sum(expense) as expense,
+             sum(quantity) as quantity,
+             count(distinct order_key) as times
+      from (
+        select coalesce(p.name, i.item_name, 'без названия') as name,
+               i.price, i.expense_amount as expense, i.quantity,
+               'e' || i.external_order_id as order_key
+        from external_order_items i
+        join external_orders o on o.id = i.external_order_id
+        left join products p on p.id = i.product_id
+        where o.production_status <> 'cancelled'
+        union all
+        select coalesce(p.name, i.product_name, i.item_name, 'без названия'),
+               i.price, 0, i.quantity,
+               's' || i.order_id
+        from order_items i
+        join orders o on o.id = i.order_id
+        left join products p on p.id = i.product_id
+        where o.status is distinct from 'cancelled'
+      ) items
+      group by name
+      order by sum(price) desc
+      limit 12
+    `),
+    // Повторные клиенты - по человеку, а не по строке имени: сайтовый
+    // клиент - аккаунт, заказчик менеджера - контрагент (а если контрагент
+    // связан с аккаунтом - тот же аккаунт). У старых заказов без
+    // контрагента остаётся только имя
+    db.execute<{ client: string; orders: string; revenue: string }>(sql`
+      select min(name) as client, count(*) as orders, sum(total) as revenue
+      from (
+        select coalesce('u' || c.user_id, 'c' || o.client_id, 'n' || lower(trim(o.client_name))) as who,
+               coalesce(c.name, o.client_name) as name,
+               o.total_price as total
+        from external_orders o
+        left join clients c on c.id = o.client_id
+        where o.production_status <> 'cancelled'
+        union all
+        select 'u' || o.user_id, coalesce(u.name, 'Клиент сайта'), o.total_price
+        from orders o
+        left join users u on u.id = o.user_id
+        where o.status is distinct from 'cancelled'
+      ) x
+      group by who
+    `),
     // Сколько дней от оформления до назначенной готовности
     db
       .select({
@@ -107,6 +153,7 @@ export default async function AdminAnalytics() {
       })
       .from(externalOrders)
       .where(sql`${externalOrders.estimatedReadyDate} is not null`),
+    openDebt(),
   ]);
 
   const monthMap = new Map(byMonth.map((r) => [r.month, r]));
@@ -134,9 +181,10 @@ export default async function AdminAnalytics() {
   const totalProfit = profitOf(totalIncome, totalExpense, totalTax);
   const totalOrders = Number(t?.orders ?? 0);
 
-  const repeat = repeatRows.filter((r) => Number(r.orders) > 1);
+  const clientsRows = repeatRows.rows;
+  const repeat = clientsRows.filter((r) => Number(r.orders) > 1);
   const repeatShare =
-    repeatRows.length > 0 ? Math.round((repeat.length / repeatRows.length) * 100) : 0;
+    clientsRows.length > 0 ? Math.round((repeat.length / clientsRows.length) * 100) : 0;
 
   const days = readyTimes
     .map((r) => Number(r.days))
@@ -172,10 +220,11 @@ export default async function AdminAnalytics() {
         <AdminStat
           label="Средний чек"
           value={money.format(totalOrders > 0 ? totalIncome / totalOrders : 0)}
+          hint={debt.debt > 0 ? `ждём оплаты ${money.format(debt.debt)}` : undefined}
         />
         <AdminStat
           label="Повторных клиентов"
-          value={`${repeat.length} из ${repeatRows.length}`}
+          value={`${repeat.length} из ${clientsRows.length}`}
           hint={`${repeatShare}% заказывали больше одного раза`}
           tone={repeatShare >= 30 ? "brand" : "plain"}
         />
@@ -350,13 +399,13 @@ export default async function AdminAnalytics() {
             Что продаём
           </h2>
 
-          {byItem.length === 0 ? (
+          {byItem.rows.length === 0 ? (
             <div className="mt-4">
               <AdminEmpty title="Позиций нет" />
             </div>
           ) : (
             <ul className="mt-4 flex flex-col gap-2">
-              {byItem.map((i) => {
+              {byItem.rows.map((i) => {
                 const revenue = Number(i.revenue);
                 const expense = Number(i.expense);
                 const margin = revenue > 0 ? marginOf(revenue, revenue - expense) : 0;
@@ -395,9 +444,9 @@ export default async function AdminAnalytics() {
             {repeat
               .sort((a, b) => Number(b.orders) - Number(a.orders))
               .slice(0, 20)
-              .map((r) => (
+              .map((r, idx) => (
                 <li
-                  key={r.client}
+                  key={`${r.client}-${idx}`}
                   className="rounded-lg border border-ink/10 bg-bone px-4 py-2 text-sm"
                 >
                   <span className="text-ink">{r.client}</span>

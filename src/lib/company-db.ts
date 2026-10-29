@@ -3,6 +3,7 @@ import { inArray } from "drizzle-orm";
 import { db } from "@/db";
 import { settings } from "@/db/schema";
 import { COMPANY_FIELDS, EMPTY_COMPANY, type Company, type CompanyField } from "@/lib/company";
+import { isKeyOf } from "@/lib/guards";
 
 /**
  * Чтение реквизитов продавца из настроек.
@@ -19,7 +20,7 @@ export async function readCompany(): Promise<Company> {
 
   const out = { ...EMPTY_COMPANY };
   for (const r of rows) {
-    if (r.name in out) out[r.name as CompanyField] = r.value ?? "";
+    if (isKeyOf(out, r.name)) out[r.name as CompanyField] = r.value ?? "";
   }
   return out;
 }

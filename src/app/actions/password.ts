@@ -7,7 +7,8 @@ import { users } from "@/db/schema";
 import { redirect } from "next/navigation";
 import { currentUser } from "@/auth";
 import { clientIp } from "@/lib/client-ip";
-import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
+import { checkRateLimit, recordAttempt, clearAttempts, retryAfterText } from "@/lib/rate-limit";
+import { bumpSessionVersion } from "@/lib/sessions-db";
 import { checkPassword } from "@/lib/password-policy";
 import { sendMail, isMailConfigured, escapeHtml } from "@/lib/mail";
 import { sendMessage, esc, isTelegramConfigured } from "@/lib/telegram";
@@ -18,6 +19,7 @@ import {
   clearResetToken,
   RESET_TTL_MINUTES,
 } from "@/lib/password-reset";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type PasswordState = {
   ok?: boolean;
@@ -47,6 +49,9 @@ export async function requestPasswordReset(
   _prev: PasswordState,
   formData: FormData,
 ): Promise<PasswordState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const email = String(formData.get("email") ?? "").trim().toLowerCase().slice(0, 255);
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -129,6 +134,9 @@ export async function resetPassword(
   _prev: PasswordState,
   formData: FormData,
 ): Promise<PasswordState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const token = String(formData.get("token") ?? "").trim();
   const password = String(formData.get("password") ?? "");
   const confirm = String(formData.get("passwordConfirm") ?? "");
@@ -148,7 +156,14 @@ export async function resetPassword(
   await db.transaction(async (tx) => {
     await tx
       .update(users)
-      .set({ password: hash, resetToken: null, resetTokenExpires: null, passwordChangedAt: new Date() })
+      .set({
+        password: hash,
+        resetToken: null,
+        resetTokenExpires: null,
+        passwordChangedAt: new Date(),
+        // Сброс пароля - обычно «меня взломали»: старые сессии должны умереть
+        sessionVersion: bumpSessionVersion,
+      })
       .where(eq(users.id, target.id));
   });
 
@@ -161,6 +176,9 @@ export async function changePassword(
   _prev: PasswordState,
   formData: FormData,
 ): Promise<PasswordState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return { error: "Нужно войти" };
 
@@ -174,6 +192,15 @@ export async function changePassword(
 
   const problem = checkNewPassword(password, confirm);
   if (problem) return { fieldErrors: { password: problem } };
+
+  // Лимит - до bcrypt: проверка пароля дорогая, и подбор через эту форму
+  // иначе упирался бы в лимит уже после того, как сделал всю работу.
+  // Ключ свой, не от входа: попытки здесь не должны запирать вход
+  const reauthKey = `reauth:${user.id}`;
+  const limit = await checkRateLimit(reauthKey, "reauth");
+  if (!limit.ok) {
+    return { error: `Слишком много попыток. Попробуйте ${retryAfterText(limit.retryAfter)}` };
+  }
 
   const [row] = await db
     .select({ password: users.password })
@@ -189,13 +216,9 @@ export async function changePassword(
    * пароль и забрать аккаунт целиком.
    */
   if (!(await bcrypt.compare(current, row.password))) {
-    // Считаем как неудачную попытку входа - подбор через эту форму такой
-    // же подбор, только с другой стороны
-    await recordAttempt(user.email, "login");
-    const limit = await checkRateLimit(user.email, "login");
-    if (!limit.ok) {
-      return { error: `Слишком много попыток. Попробуйте ${retryAfterText(limit.retryAfter)}` };
-    }
+    // Подбор через эту форму - такой же подбор, как на входе, только с
+    // другой стороны
+    await recordAttempt(reauthKey, "reauth");
     return { fieldErrors: { currentPassword: "Текущий пароль неверный" } };
   }
 
@@ -206,8 +229,13 @@ export async function changePassword(
   const hash = await bcrypt.hash(password, 10);
   await db
     .update(users)
-    .set({ password: hash, passwordChangedAt: new Date() })
+    .set({ password: hash, passwordChangedAt: new Date(), sessionVersion: bumpSessionVersion })
     .where(eq(users.id, Number(user.id)));
+
+  // Ключ reauth общий с отключением второго фактора (там подбирают код).
+  // Снимать счётчик на верном пароле нельзя: тот, кто знает пароль, получал
+  // бы свежие пять попыток на код. Снимаем только когда смена прошла целиком
+  await clearAttempts(reauthKey, "reauth");
 
   // Смена пароля отзывает все сессии, включая текущую. Отправляем на вход
   // с понятной причиной, а не оставляем на странице, с которой человека

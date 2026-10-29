@@ -51,3 +51,33 @@ export const stageStatusOf = (v: string | null) =>
 
 export const priorityOf = (v: string | null) =>
   PRIORITY[(v ?? "medium") as Priority] ?? PRIORITY.medium;
+
+/**
+ * Какой этап закрывать и какой включать следующим.
+ *
+ * Принимает статусы этапов заказа уже в порядке прохождения
+ * (sort_order, id). Текущий - первый «в работе» (нет такого - первый
+ * ожидающий), следующий - первый ожидающий после него. Сравнение по
+ * позиции в списке, а не по значению sort_order: у этапов с одинаковым
+ * порядком (новые этапы раньше получали 0) строгое «больше» пропускало
+ * все, кроме первого.
+ *
+ * Возвращает null, если закрывать нечего; `next: null` - текущий этап
+ * последний.
+ */
+export function nextStageIndex(
+  statuses: readonly (string | null)[],
+): { current: number; next: number | null } | null {
+  let current = statuses.findIndex((s) => s === "in_progress");
+  if (current < 0) current = statuses.findIndex((s) => s === "pending");
+  if (current < 0) return null;
+
+  let next: number | null = null;
+  for (let i = current + 1; i < statuses.length; i++) {
+    if (statuses[i] === "pending") {
+      next = i;
+      break;
+    }
+  }
+  return { current, next };
+}

@@ -6,6 +6,7 @@ import { buildUpd, longDate, type UpdRow } from "@/lib/upd";
 import { missingFields, REQUIRED_FOR_DOCUMENTS, COMPANY_FIELDS } from "@/lib/company";
 import { PrintBar } from "@/components/print/PrintBar";
 import { docStyles } from "@/components/print/doc-styles";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "УПД",
@@ -33,8 +34,8 @@ const shortDate = new Intl.DateTimeFormat("ru-RU", {
  */
 export default async function UpdPrintPage({ params }: PageProps<"/print/upd/[source]/[id]">) {
   const { source: rawSource, id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   // Номера сайтовых и менеджерских заказов идут своими
   // последовательностями и пересекаются - без источника «заказ № 17»
@@ -87,14 +88,16 @@ export default async function UpdPrintPage({ params }: PageProps<"/print/upd/[so
       <PrintBar
         title={`УПД по заказу №${upd.documentNumber}`}
         backHref={backHref}
+        // Предупреждение и ссылка в настройки - только сотруднику: клиенту
+        // они ни к чему, а адрес админки ему знать незачем
         warning={
-          missing.length > 0
+          access.isStaff && missing.length > 0
             ? `Не заполнены реквизиты продавца: ${missing
                 .map((f) => COMPANY_FIELDS[f].toLowerCase())
                 .join(", ")}. Документ выйдет с пустыми полями.`
             : undefined
         }
-        settingsHref="/admin/settings/company"
+        settingsHref={access.isStaff ? "/admin/settings/company" : undefined}
       />
 
       <article className="doc doc--landscape">

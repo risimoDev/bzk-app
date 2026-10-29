@@ -8,6 +8,7 @@ import { db } from "@/db";
 import { externalOrderItems, purchaseOrders, suppliers } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type SupplierState = {
   ok?: boolean;
@@ -42,6 +43,9 @@ export async function saveSupplier(
   _prev: SupplierState,
   formData: FormData,
 ): Promise<SupplierState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;

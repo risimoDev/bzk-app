@@ -12,6 +12,7 @@ import {
 import { paymentQrSvg } from "@/lib/payment-qr";
 import { PrintBar } from "@/components/print/PrintBar";
 import { docStyles } from "@/components/print/doc-styles";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Счёт на оплату",
@@ -38,8 +39,8 @@ const longDateFmt = new Intl.DateTimeFormat("ru-RU", {
  */
 export default async function InvoicePrintPage({ params }: PageProps<"/print/invoice/[source]/[id]">) {
   const { source: rawSource, id } = await params;
-  const orderId = Number(id);
-  if (!Number.isInteger(orderId) || orderId <= 0) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   // Номера сайтовых и менеджерских заказов идут своими
   // последовательностями и пересекаются - без источника «заказ № 17»
@@ -115,8 +116,10 @@ export default async function InvoicePrintPage({ params }: PageProps<"/print/inv
       <PrintBar
         title={`Счёт № ${doc.documentNumber}`}
         backHref={backHref}
-        warning={warnings.length > 0 ? warnings.join(" ") : undefined}
-        settingsHref="/admin/settings/company"
+        // Про пустые реквизиты и ссылку в настройки знает только сотрудник:
+        // клиенту это не нужно, а ссылка на админку выдаёт её устройство
+        warning={access.isStaff && warnings.length > 0 ? warnings.join(" ") : undefined}
+        settingsHref={access.isStaff ? "/admin/settings/company" : undefined}
       />
 
       <article className="doc doc--portrait">
@@ -239,6 +242,12 @@ export default async function InvoicePrintPage({ params }: PageProps<"/print/inv
           <br />
           <b>{doc.amountInWords}</b>
         </p>
+
+        {doc.discount > 0 && (
+          <p style={{ marginTop: "3mm", fontSize: "8pt" }}>
+            Цены указаны с учётом скидки по заказу: {money.format(doc.discount)} руб.
+          </p>
+        )}
 
         <p style={{ marginTop: "3mm", fontSize: "8pt" }}>
           Без налога (НДС) - продавец применяет упрощённую систему налогообложения и не

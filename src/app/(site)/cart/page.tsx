@@ -5,7 +5,7 @@ import { Container } from "@/components/ui/Container";
 import { ButtonLink } from "@/components/ui/Button";
 import { PageHero } from "@/components/site/PageHero";
 import { readCart, resolveCart } from "@/lib/cart";
-import { setQuantity, removeFromCart, clearCart } from "@/app/actions/cart";
+import { setQuantity, removeFromCart, clearCart, pruneCart } from "@/app/actions/cart";
 
 export const metadata: Metadata = {
   title: "Корзина",
@@ -19,7 +19,12 @@ const money = new Intl.NumberFormat("ru-RU", {
 });
 
 export default async function CartPage() {
-  const items = await resolveCart(await readCart());
+  const lines = await readCart();
+  const items = await resolveCart(lines);
+  // Строки, которые resolveCart выбросил: товар скрыли или поменяли его
+  // характеристики. Молча терять их нельзя - человек не поймёт, куда
+  // делась позиция
+  const dropped = lines.length - items.length;
   const total = items.reduce((sum, i) => sum + i.lineTotal, 0);
 
   return (
@@ -33,6 +38,28 @@ export default async function CartPage() {
 
       <section className="relative overflow-hidden torn-2 pb-20 pt-24 paper-light sm:pb-24 sm:pt-28">
         <Container>
+          {dropped > 0 && (
+            <div
+              role="status"
+              className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-card border border-warn/40 bg-warn/12 px-5 py-4 text-sm text-ink/80"
+            >
+              <p>
+                Некоторые позиции убраны: товар скрыт или изменились его
+                характеристики - добавьте их заново из каталога.
+              </p>
+              {/* Кука переписывается только действием: серверный компонент
+                  страницы писать куки не может */}
+              <form action={pruneCart}>
+                <button
+                  type="submit"
+                  className="rounded-pill border border-ink/20 px-3.5 py-1.5 text-ink/75 transition-colors hover:border-brand hover:text-brand"
+                >
+                  Понятно
+                </button>
+              </form>
+            </div>
+          )}
+
           {items.length === 0 ? (
             <div className="mx-auto max-w-lg rounded-card border border-ink/10 bg-bone/85 p-12 text-center">
               <h2 className="font-display text-2xl text-ink">Корзина пуста</h2>
@@ -78,10 +105,13 @@ export default async function CartPage() {
                                 </span>
                                 {o.value}
                                 {o.modifier !== 0 && (
-                                  <span className="ml-1 font-mono text-xs text-brand">
-                                    {o.modifier > 0 ? "+" : "−"}
-                                    {money.format(Math.abs(o.modifier))}
-                                  </span>
+                                  <>
+                                    {" "}
+                                    <span className="font-mono text-xs text-brand">
+                                      ({o.modifier > 0 ? "+" : "−"}
+                                      {money.format(Math.abs(o.modifier))})
+                                    </span>
+                                  </>
                                 )}
                               </li>
                             ))}
@@ -211,9 +241,8 @@ function QtyButton({
   return (
     <form action={setQuantity}>
       <input type="hidden" name="key" value={item.key} />
+      {/* Минимум и шаг сервер берёт из базы; здесь только желаемое число */}
       <input type="hidden" name="quantity" value={Math.max(next, item.minQuantity)} />
-      <input type="hidden" name="minQuantity" value={item.minQuantity} />
-      <input type="hidden" name="multiplicity" value={item.multiplicity} />
       <button
         type="submit"
         aria-label={label}

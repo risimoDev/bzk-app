@@ -1,6 +1,9 @@
 import "server-only";
 import { randomBytes } from "node:crypto";
+import { createWriteStream } from "node:fs";
 import { mkdir, writeFile, unlink, stat } from "node:fs/promises";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { extensionOf, isAllowedExtension, MAX_UPLOAD_SIZE } from "@/lib/client-portal";
 import { QC_PHOTO_EXTENSIONS, MAX_QC_PHOTO_SIZE } from "@/lib/quality";
@@ -64,33 +67,86 @@ export type SavedUpload = {
   mimeType: string;
 };
 
-/**
- * Сохраняет файл из формы. Имя на диске случайное: исходное может
- * содержать что угодно, вплоть до путей, а показывать его достаточно из
- * базы.
- */
-export async function saveUpload(file: File): Promise<SavedUpload> {
-  if (file.size === 0) throw new Error("Файл пустой");
-  if (file.size > MAX_UPLOAD_SIZE) {
-    throw new Error("Файл больше 50 МБ - сожмите или пришлите архивом");
-  }
+/** Ошибка, текст которой можно показать человеку как есть. */
+export class UploadError extends Error {}
 
-  const originalName = path.basename(file.name);
+/**
+ * Имя из заголовка запроса в имя для показа: разобранное, без путей. Пустое
+ * или нечитаемое - null.
+ */
+export function cleanOriginalName(raw: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+  const name = path.basename(decoded.replace(/\\/g, "/")).trim().slice(0, 255);
+  return name === "" || name === "." || name === ".." ? null : name;
+}
+
+/**
+ * Сохраняет макет потоком: тело запроса сразу уходит на диск, в памяти
+ * держится один кусок, а не весь файл (раньше File из формы целиком
+ * собирался в Buffer - пятьдесят мегабайт на каждую загрузку).
+ *
+ * Размер считается по фактически пришедшим байтам, а не по заголовку
+ * Content-Length: его можно соврать. Как только счётчик перешёл предел,
+ * поток обрывается, недописанный файл удаляется. Имя на диске случайное:
+ * исходное может содержать что угодно, вплоть до путей, а показывать его
+ * достаточно из базы.
+ */
+export async function saveUploadStream(
+  body: ReadableStream<Uint8Array>,
+  originalName: string,
+  mimeType: string,
+  maxBytes: number = MAX_UPLOAD_SIZE,
+): Promise<SavedUpload> {
   if (!isAllowedExtension(originalName)) {
-    throw new Error("Такой формат мы не принимаем");
+    throw new UploadError("Такой формат мы не принимаем");
   }
 
   await mkdir(BUCKETS.clients, { recursive: true });
 
   const filename = `${randomBytes(16).toString("hex")}.${extensionOf(originalName)}`;
-  const bytes = Buffer.from(await file.arrayBuffer());
-  await writeFile(uploadPath(filename), bytes);
+  const target = uploadPath(filename);
+
+  let size = 0;
+  const counter = new Transform({
+    transform(chunk: Buffer, _enc, done) {
+      size += chunk.length;
+      if (size > maxBytes) {
+        done(new UploadError("Файл больше 50 МБ - сожмите или пришлите архивом"));
+      } else {
+        done(null, chunk);
+      }
+    },
+  });
+
+  try {
+    await pipeline(
+      Readable.fromWeb(body as import("node:stream/web").ReadableStream<Uint8Array>),
+      counter,
+      // wx: имя случайное, но затереть чужой файл не должны ни при каких условиях
+      createWriteStream(target, { flags: "wx" }),
+    );
+  } catch (e) {
+    await unlink(target).catch(() => {});
+    if (e instanceof UploadError) throw e;
+    // Обрыв соединения посреди загрузки - не наша ошибка и не повод для 500
+    throw new UploadError("Загрузка прервалась - попробуйте ещё раз");
+  }
+
+  if (size === 0) {
+    await unlink(target).catch(() => {});
+    throw new UploadError("Файл пустой");
+  }
 
   return {
     filename,
     originalName,
-    size: file.size,
-    mimeType: file.type || "application/octet-stream",
+    size,
+    mimeType: mimeType || "application/octet-stream",
   };
 }
 
@@ -122,7 +178,7 @@ export async function uploadExists(filename: string, bucket: Bucket = "clients")
 export async function saveQcPhoto(file: File): Promise<SavedUpload> {
   if (file.size === 0) throw new Error("Файл пустой");
   if (file.size > MAX_QC_PHOTO_SIZE) {
-    throw new Error("Снимок больше 10 МБ - сожмите его");
+    throw new Error("Снимок больше 8 МБ - сожмите его");
   }
 
   const originalName = path.basename(file.name);

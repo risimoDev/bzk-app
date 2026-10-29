@@ -1,17 +1,18 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { asc, count } from "drizzle-orm";
+import { asc, count, sql } from "drizzle-orm";
 import { ArrowLeft, EyeOff, Hash, Plus } from "lucide-react";
 import { db } from "@/db";
 import {
   documentTemplates,
   documentCategories,
-  documentNumberCounters,
+  counters as numberCounters,
   documents,
 } from "@/db/schema";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import { cn } from "@/lib/cn";
+import { counterKey, padNumber } from "@/lib/numbering";
 
 export const metadata: Metadata = {
   title: "Шаблоны документов · Админка",
@@ -53,7 +54,7 @@ export default async function AdminDocumentTemplates() {
   const [categories, templates, counters, usage] = await Promise.all([
     db.select().from(documentCategories).orderBy(asc(documentCategories.sortOrder)),
     db.select().from(documentTemplates).orderBy(asc(documentTemplates.id)),
-    db.select().from(documentNumberCounters),
+    db.select().from(numberCounters).where(sql`starts_with(${numberCounters.key}, 'doc:')`),
     db
       .select({ templateId: documents.templateId, n: count() })
       .from(documents)
@@ -62,14 +63,8 @@ export default async function AdminDocumentTemplates() {
 
   const usedCount = new Map(usage.map((u) => [u.templateId ?? 0, Number(u.n)]));
 
-  // У одного шаблона счётчик заводится на каждый год отдельно
-  const countersOf = new Map<number, { year: number; last: number }[]>();
-  for (const c of counters) {
-    const key = c.templateId ?? 0;
-    const list = countersOf.get(key) ?? [];
-    list.push({ year: c.year, last: c.lastNumber ?? 0 });
-    countersOf.set(key, list);
-  }
+  // Счётчик номеров заведён на пару «префикс + год» (lib/numbering-db.ts)
+  const lastOf = new Map(counters.map((c) => [c.key, c.value]));
 
   const year = new Date().getFullYear();
   const canCreate = await can("documents", "create");
@@ -126,7 +121,6 @@ export default async function AdminDocumentTemplates() {
                   const fields = readFields(t.fieldsSchema);
                   const required = fields.filter((f) => f.required).length;
                   const used = usedCount.get(t.id) ?? 0;
-                  const cur = countersOf.get(t.id)?.find((c) => c.year === year);
 
                   return (
                     <li
@@ -152,7 +146,10 @@ export default async function AdminDocumentTemplates() {
                               <Hash className="size-3" aria-hidden />
                               {t.numberPrefix}
                               {year}-
-                              {String((cur?.last ?? 0) + 1).padStart(4, "0")}
+                              {padNumber(
+                                (lastOf.get(counterKey.document(t.numberPrefix.trim(), year)) ?? 0) + 1,
+                                4,
+                              )}
                             </span>
                           )}
                           <span>полей: {fields.length}</span>

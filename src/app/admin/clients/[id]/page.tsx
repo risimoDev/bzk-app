@@ -12,6 +12,7 @@ import { currentUser } from "@/auth";
 import { setBlocked, setEditorAccess, setWarehouseAccess } from "../actions";
 import { ResetLinkButton } from "./ResetLinkButton";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
 
 export const metadata: Metadata = {
   title: "Клиент · Админка",
@@ -42,12 +43,13 @@ export default async function AdminClient(
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const clientId = parseId(id);
+  if (clientId === null) notFound();
 
   const [client] = await db
     .select()
     .from(users)
-    .where(eq(users.id, Number(id)))
+    .where(eq(users.id, clientId))
     .limit(1);
 
   if (!client) notFound();
@@ -74,8 +76,12 @@ export default async function AdminClient(
       .where(eq(orders.userId, client.id)),
   ]);
 
-  const manageable = await can("users", "manage");
   const me = await currentUser();
+  // Учётную запись администратора трогает только администратор (так же
+  // отвечает сервер, см. loadTarget в ../actions.ts): менеджеру кнопки не
+  // показываем, иначе он нажал бы и получил молчаливый отказ
+  const manageable =
+    (await can("users", "manage")) && !(client.role === "admin" && me?.role !== "admin");
   const isSelf = me != null && Number(me.id) === client.id;
 
   return (

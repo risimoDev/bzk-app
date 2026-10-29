@@ -3,9 +3,12 @@
 import { revalidatePath } from "next/cache";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { orderItems, orders, products, reviews } from "@/db/schema";
+import { products, reviews } from "@/db/schema";
 import { currentUser } from "@/auth";
 import { audit } from "@/lib/audit";
+import { notifyNewReview } from "@/lib/notify";
+import { hasReviewableOrder } from "@/lib/reviews-db";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type ReviewState = {
   ok?: boolean;
@@ -17,15 +20,20 @@ export type ReviewState = {
 /**
  * Отзыв о товаре.
  *
- * Оставить его может только тот, кто этот товар заказывал: отзывы «с
- * улицы» на сайте типографии - это спам, а не мнение. Отзыв уходит на
- * модерацию: показывать его сразу нельзя, в админке для этого есть
- * очередь.
+ * Оставить его может только тот, кто этот товар заказывал и чей заказ
+ * уже отправлен, доставлен или завершён (lib/reviews.ts): отзывы «с
+ * улицы» на сайте типографии - это спам, а не мнение, а отзыв по
+ * отменённому заказу - тем более. Отзыв уходит на модерацию: показывать
+ * его сразу нельзя, в админке для этого есть очередь, и о новом отзыве
+ * сотрудникам приходит уведомление.
  */
 export async function leaveReview(
   _prev: ReviewState,
   formData: FormData,
 ): Promise<ReviewState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return { error: "Чтобы оставить отзыв, войдите в кабинет" };
 
@@ -45,7 +53,7 @@ export async function leaveReview(
   }
 
   const [product] = await db
-    .select({ id: products.id })
+    .select({ id: products.id, name: products.name })
     .from(products)
     .where(eq(products.id, productId))
     .limit(1);
@@ -53,17 +61,13 @@ export async function leaveReview(
 
   const userId = Number(user.id);
 
-  // Право на отзыв даёт заказ: без этой проверки страницу товара
-  // завалили бы отзывами те, кто ничего не покупал
-  const [ordered] = await db
-    .select({ id: orderItems.id })
-    .from(orderItems)
-    .innerJoin(orders, eq(orders.id, orderItems.orderId))
-    .where(and(eq(orderItems.productId, productId), eq(orders.userId, userId)))
-    .limit(1);
-
-  if (!ordered) {
-    return { error: "Отзыв можно оставить о товаре, который вы заказывали" };
+  // Право на отзыв даёт заказ, который уже ушёл к клиенту: без этой
+  // проверки страницу товара завалили бы отзывами те, кто ничего не
+  // получал
+  if (!(await hasReviewableOrder(userId, productId))) {
+    return {
+      error: "Отзыв можно оставить о товаре из заказа, который уже отправлен или завершён",
+    };
   }
 
   const [twin] = await db
@@ -86,6 +90,13 @@ export async function leaveReview(
     .returning({ id: reviews.id });
 
   await audit("review.create", { type: "review", id: created.id }, { productId, rating });
+
+  await notifyNewReview({
+    productName: product.name,
+    clientName: user.name ?? "Клиент",
+    rating,
+    preview: message,
+  });
 
   revalidatePath(`/catalog/${productId}`);
   revalidatePath("/admin/inbox");

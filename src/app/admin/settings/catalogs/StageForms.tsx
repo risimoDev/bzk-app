@@ -47,7 +47,8 @@ export function StageRow({ value }: { value?: StageValue }) {
       <div className="flex flex-wrap items-center gap-2">
         <input
           name="sortOrder"
-          defaultValue={value?.sortOrder ?? 0}
+          defaultValue={value?.sortOrder ?? ""}
+          placeholder={value ? undefined : "авто"}
           inputMode="numeric"
           aria-label="Порядок в цепочке"
           title="Порядок в цепочке"

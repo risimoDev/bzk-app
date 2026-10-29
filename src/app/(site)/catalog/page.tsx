@@ -15,6 +15,8 @@ import { ProductImage } from "@/components/catalog/ProductImage";
 import { FavoriteButton } from "@/components/catalog/FavoriteButton";
 import { TapeLabel } from "@/components/ui/TapeLabel";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
+import { fromPrices } from "@/lib/catalog-price-db";
 
 /**
  * Заголовок и описание можно переопределить в админке: если для
@@ -31,11 +33,13 @@ export async function generateMetadata(): Promise<Metadata> {
   return applySeo(baseMetadata, await readSeo("/catalog"), "/catalog");
 }
 
-/** Цена показывается «от», потому что реальная зависит от тиража. */
-function formatPrice(value: string | null) {
-  if (!value) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) return null;
+/**
+ * Цена показывается «от», потому что реальная зависит от тиража: это цена
+ * за единицу при минимальном тираже (lib/product-price.ts), а не базовая.
+ */
+function formatPrice(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return null;
+  const n = value;
   return new Intl.NumberFormat("ru-RU", {
     style: "currency",
     currency: "RUB",
@@ -55,6 +59,8 @@ async function getCatalog(categoryId?: number) {
       name: products.name,
       description: products.description,
       basePrice: products.basePrice,
+      minQuantity: products.minQuantity,
+      multiplicity: products.multiplicity,
       unit: products.unit,
       isPopular: products.isPopular,
       categoryId: products.categoryId,
@@ -82,9 +88,12 @@ async function getCategories() {
 export default async function CatalogPage(props: PageProps<"/catalog">) {
   const params = await props.searchParams;
   const raw = Array.isArray(params.category) ? params.category[0] : params.category;
-  const activeId = raw && /^\d+$/.test(raw) ? Number(raw) : undefined;
+  // Негодная категория - не ошибка, а просто весь каталог: адрес мог
+  // остаться от старого сайта или быть подобран руками
+  const activeId = parseId(raw) ?? undefined;
 
   const [items, cats] = await Promise.all([getCatalog(activeId), getCategories()]);
+  const prices = await fromPrices(items);
   const active = cats.find((c) => c.id === activeId);
 
   return (
@@ -150,7 +159,7 @@ export default async function CatalogPage(props: PageProps<"/catalog">) {
           ) : (
             <ul className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
               {items.map((item) => {
-                const price = formatPrice(item.basePrice);
+                const price = formatPrice(prices.get(item.id));
                 return (
                   <li key={item.id} className="relative">
                     <FavoriteButton

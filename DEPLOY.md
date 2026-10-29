@@ -98,6 +98,7 @@ nano .env
 5. `SITE_URL`: канонический адрес с https: `https://bzkprint.ru`.
 6. `SMTP_*`: параметры Яндекс/VK Workmail почты для отправки счетов и паролей.
 7. `TELEGRAM_BOT_TOKEN`: токен вашего бота от `@BotFather`.
+8. `CRON_SECRET`: секрет планировщика (`openssl rand -hex 32`). Контейнер `cron` раз в пять минут зовёт по нему приложение: напоминания CRM, предупреждения о сроках задач, уборка журналов. Пустой - планировщик выключен, `deploy.sh` предупредит.
 
 ---
 
@@ -111,7 +112,7 @@ bash deploy/first-install.sh
 
 **Он выполнит:**
 1. Проверит `.env` - заполнен ли и не остались ли заглушки (`CHANGE_ME`…), поставит права `600`.
-2. Запустит `deploy.sh`: страховочный бэкап, сборку образа, применение схемы (`drizzle-kit push`), запуск сервисов, проверку `/api/health`.
+2. Запустит `deploy.sh`: страховочный бэкап, сборку образа, применение схемы (`drizzle-kit push`), пересчёт бухгалтерских карточек (`recalc-accounting --apply`), запуск сервисов, ожидание статуса `healthy` у контейнера приложения (Docker сам опрашивает `/api/health` изнутри контейнера; Caddy стартует только после этого).
 3. Наполнит базу: права ролей и реквизиты компании.
 4. Заведёт первого администратора (спросит почту и пароль).
 5. Напечатает оставшиеся ручные шаги.
@@ -134,6 +135,18 @@ git pull
 bash deploy/deploy.sh
 ```
 
+> **Пересчёт денег заказов.** Сразу после `drizzle-kit push` и **до** запуска
+> нового приложения `deploy.sh` запускает
+> `npm run recalc-accounting -- --apply` в контейнере `tools`. Статус оплаты
+> теперь считается только из платежей, и старые заказы, отмеченные
+> оплаченными без платежа, должны получить платёж-перенос раньше, чем их
+> кто-нибудь поправит в новом приложении. Скрипт безопасен к повторному
+> запуску (на обычном деплое ничего не меняет) и печатает отчёт. Если он
+> отказал (код 2 - пересчёт поменял бы итоги заказов) или упал, деплой
+> останавливается до запуска нового приложения, старое продолжает работать.
+> Посмотреть отчёт без записи:
+> `docker compose -f docker-compose.yml -f deploy/compose.tools.yml run --rm tools npm run recalc-accounting`
+
 ---
 
 ## 7. Отдельные операции с базой (если нужны вручную)
@@ -149,6 +162,10 @@ $TOOLS run --rm tools node scripts/seed-company.mjs
 
 # Матрица прав ролей сотрудников
 $TOOLS run --rm tools node scripts/seed-permissions.mjs
+
+# Права на модули crm и counterparties (копия действий с users; разово,
+# deploy.sh вызывает сам; --force повторит выдачу)
+$TOOLS run --rm tools npm run grant-module-permissions
 
 # Ещё один администратор или смена пароля существующему
 $TOOLS run --rm tools node --experimental-strip-types --import ./scripts/alias-loader.mjs \
@@ -166,6 +183,12 @@ $TOOLS run --rm tools npx drizzle-kit push
 ```bash
 docker compose -f docker-compose.yml -f deploy/compose.tools.yml \
   run --rm tools node scripts/migrate-data.mjs
+```
+После переноса **обязательно** приведите деньги перенесённых заказов к
+новым правилам (иначе оплаченные заказы станут долгами):
+```bash
+docker compose -f docker-compose.yml -f deploy/compose.tools.yml \
+  run --rm tools npm run recalc-accounting -- --apply
 ```
 Скрипт идемпотентен - его можно запускать повторно без дублирования данных.
 
@@ -199,19 +222,28 @@ bash deploy/logs.sh all        # логи всех сервисов
 ```bash
 bash deploy/status.sh
 ```
-*Показывает статус контейнеров, ответ /api/health, свободную память, размер базы и свежие бэкапы.*
+*Показывает статус контейнеров и healthcheck приложения, ответ /api/health, свободную память, размер базы и свежие бэкапы. `/api/health` открыт всему интернету и поэтому отвечает только `{"status":"ok"}` (200) или `{"status":"degraded"}` (503); причину сбоя ищите в `bash deploy/logs.sh`.*
+
+### Журнал запросов Caddy
+Лог доступа пишется в том `caddy_data` (`/data/access.log` в контейнере `proxy`), ротация - по 50 МБ, хранятся 10 файлов. Из адресов и заголовка `Referer` вырезается параметр `token` (ссылка сброса пароля), заголовки `Cookie`, `Authorization` и `Set-Cookie` не пишутся вовсе. Посмотреть:
+```bash
+docker compose exec proxy tail -n 50 /data/access.log
+```
+
+### Часовой пояс базы
+Контейнер `db` живёт по `Asia/Yekaterinburg` (`TZ`, `PGTZ`, `log_timezone`): время в логах Postgres и вывод `docker compose exec db psql` - местные. Сам сервер базы при этом намеренно закреплён в UTC (`-c timezone=UTC` в `docker-compose.yml`): часть колонок - `timestamp` без пояса, их `DEFAULT now()` зависит от пояса сеанса, а приложение читает их как UTC. Поэтому, вставляя строки руками через psql, задавайте даты явно.
 
 ### Создание ручного бэкапа (База + Загрузки):
 ```bash
 bash deploy/backup-now.sh
 ```
-*Создаёт архив с дампом PostgreSQL и всеми загруженными макетами в `/opt/bzk-app/backups/manual-...`.*
+*Создаёт в `/opt/bzk-app/backups/manual-...` дамп PostgreSQL (`postgres-bzk-….dump`, формат custom, проверенный так же, как ночной) и архив всех загруженных макетов.*
 
 ### Восстановление из бэкапа:
 ```bash
 bash deploy/restore.sh
 ```
-*Интерактивное меню с выбором даты бэкапа и подтверждением.*
+*Интерактивное меню с выбором даты бэкапа и подтверждением. Можно сразу указать файл: `bash deploy/restore.sh backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.dump`. Понимает и `.dump` (ночные, ручные, страховочные `pre-deploy-…` перед деплоем), и старые `.sql.gz`; восстановление идёт одной транзакцией - если дамп битый, база остаётся как была.*
 
 ### Быстрый перезапуск:
 ```bash
@@ -230,14 +262,54 @@ bash deploy/deploy.sh
 ## 10. Резервное копирование (Автоматическое)
 
 В `docker-compose.yml` встроен независимый фоновый сервис `backup`:
-- Каждую ночь в **03:00** (по часовому поясу компании) создаётся сжатый дамп `backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.sql.gz`.
+- Каждую ночь в **03:00** (по часовому поясу компании) создаётся дамп `backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.dump` - формат custom (`pg_dump -Fc`), он уже сжат. Перед тем как дать файлу имя, скрипт проверяет его через `pg_restore --list` и полным чтением (`pg_restore -f /dev/null`); не собравшийся дамп удаляется, а не остаётся рядом с целыми. Так же снимаются ручные копии (`backup-now.sh`) и страховочные перед деплоем (`deploy.sh`, хранятся 10 последних). Копии до этого перехода называются `….sql.gz` и удаляются по тому же сроку.
 - Рядом кладётся архив всех загруженных файлов - макетов клиентов, фотоотчётов брака, картинок каталога: `backups/uploads-ГГГГ-ММ-ДД-ЧЧММ.tar.gz`. Без него дамп неполон: в базе лежат только имена файлов.
 - Дампы старше 14 дней (`BACKUP_RETAIN_DAYS`) и архивы файлов старше 7 дней (`BACKUP_UPLOADS_RETAIN_DAYS`) удаляются автоматически. Файлы весят на порядки больше базы, поэтому хранятся меньше.
 - Всё сохраняется на хосте в `/opt/bzk-app/backups/`.
+
+Восстановить базу - проще всего `bash deploy/restore.sh` (см. выше). Вручную, при остановленном приложении (`docker compose stop app`); папка `backups/` видна в контейнере базы как `/backups`:
+```bash
+# новые копии (.dump)
+docker compose exec -T db pg_restore -U bzk -d bzk --clean --if-exists \
+  --no-owner --single-transaction /backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.dump
+
+# старые копии (.sql.gz) - простой SQL, накатывать на пустую базу
+gunzip -c backups/bzk-ГГГГ-ММ-ДД-ЧЧММ.sql.gz | docker compose exec -T db psql -U bzk -d bzk
+```
 
 Восстановить файлы из ночного архива:
 ```bash
 docker compose exec -T app tar -xzf - -C /app/storage/uploads < backups/uploads-ГГГГ-ММ-ДД-ЧЧММ.tar.gz
 ```
 
-Рекомендуется периодически копировать папку `/opt/bzk-app/backups/` на внешнее хранилище (Яндекс.Диск, S3 или дополнительный сервер).
+### Копии вне сервера (rclone)
+
+Копии на том же диске не спасут, если пропадёт сам сервер. Сервис `backup` умеет после каждого успешного дампа отправить его во внешнее хранилище через [rclone](https://rclone.org) (Яндекс.Диск, S3, SFTP и т.д.) - если задана переменная `RCLONE_REMOTE`. В образе `postgres:17-alpine` rclone нет; без него скрипт пишет в лог предупреждение и работает как раньше. Архивы файлов (`uploads-…`) не выгружаются - они большие; их при желании копируйте отдельно.
+
+Как включить, не меняя `docker-compose.yml`:
+
+1. На своём компьютере настройте хранилище: `rclone config` (например, удалённое хранилище с именем `yadisk`). Скопируйте получившийся `rclone.conf` на сервер в `/opt/bzk-app/rclone.conf` и закройте его: `chmod 600 rclone.conf`. В git этот файл не попадает (`/rclone.conf` в `.gitignore`) - в нём ключи доступа.
+2. В `.env` добавьте `RCLONE_REMOTE=yadisk:bzk-backups` (имя хранилища из конфига и папка в нём).
+3. Рядом с `docker-compose.yml` создайте `docker-compose.override.yml` - Compose подхватит его сам:
+   ```yaml
+   services:
+     backup:
+       environment:
+         RCLONE_REMOTE: ${RCLONE_REMOTE:-}
+         RCLONE_CONFIG: /config/rclone.conf
+       volumes:
+         # Не только для чтения: у хранилищ со входом через OAuth
+         # (Яндекс.Диск, Google Drive) rclone дописывает в конфиг
+         # обновлённый токен
+         - ./rclone.conf:/config/rclone.conf
+       # rclone ставится при каждом старте контейнера. Не поставился (нет
+       # сети) - бэкап всё равно запускается, а в логе будет предупреждение
+       entrypoint:
+         - /bin/sh
+         - -c
+         - 'apk add --no-cache rclone >/dev/null 2>&1 || echo "[backup] rclone не установился"; exec /bin/sh /usr/local/bin/backup.sh'
+   ```
+   `docker compose up` (и `deploy/deploy.sh`) подхватывают этот файл без дополнительных флагов.
+4. `docker compose up -d backup`, затем `bash deploy/logs.sh backup` (или `docker compose logs backup`): в логе должна появиться строка `выгружено: yadisk:bzk-backups/bzk-….dump`.
+
+Срок хранения во внешнем хранилище скрипт не отслеживает - настройте его там (правило жизненного цикла в S3) или периодически чистите `rclone delete --min-age 60d yadisk:bzk-backups`.

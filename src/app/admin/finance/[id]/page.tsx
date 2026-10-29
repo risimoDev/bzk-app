@@ -15,6 +15,8 @@ import { can } from "@/lib/permissions";
 import { paymentStateOf, profitOf, SOURCE } from "@/lib/finance";
 import { DeleteRow, ExpenseForm, PaymentForm } from "../FinanceForms";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
+import { debtOf, effectiveExpense, isAutoExpense } from "@/lib/order-money";
 
 export const metadata: Metadata = {
   title: "Запись бухгалтерии · Админка",
@@ -45,12 +47,13 @@ export default async function AdminFinanceEntry(
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const entryId = parseId(id);
+  if (entryId === null) notFound();
 
   const [entry] = await db
     .select()
     .from(ordersAccounting)
-    .where(eq(ordersAccounting.id, Number(id)))
+    .where(eq(ordersAccounting.id, entryId))
     .limit(1);
 
   if (!entry) notFound();
@@ -68,6 +71,7 @@ export default async function AdminFinanceEntry(
         costPerUnit: orderExpenses.costPerUnit,
         amount: orderExpenses.amount,
         description: orderExpenses.description,
+        isWriteOff: orderExpenses.isWriteOff,
         expenseDate: orderExpenses.expenseDate,
         categoryName: expensesCategories.name,
       })
@@ -97,19 +101,22 @@ export default async function AdminFinanceEntry(
     tax: entry.taxAmount,
   });
 
-  // Сумма строк расходов и поле total_expense в старой базе могут
-  // разойтись, если запись правили в обход пересчёта. Показываем обе,
-  // иначе расхождение останется незамеченным
-  const expensesSum = expenses.reduce((s, e) => s + Number(e.amount), 0);
+  // Расход считается по правилу «факт вытесняет оценку»: при списаниях
+  // со склада строка расчётной себестоимости в итог не входит. Сверяем
+  // поле карточки с тем же правилом - иначе расхождение, оставшееся от
+  // правок в обход пересчёта, никто не заметит
+  const expensesSum = effectiveExpense(expenses);
+  const hasFact = expenses.some((e) => e.isWriteOff);
   const mismatch = Math.abs(expensesSum - p.expense) > 0.01;
 
   const paidSum = payments.reduce((s, x) => s + Number(x.amount), 0);
   const st = paymentStateOf(entry.status);
+  const debt = debtOf(p.income, paidSum);
 
   return (
     <AdminPage
       title={entry.clientName ?? "Без имени"}
-      subtitle={`${SOURCE[entry.source] ?? entry.source} · запись № ${entry.id}`}
+      subtitle={`${SOURCE[entry.source] ?? entry.source} · запись № ${entry.id}${entry.isCancelled ? " · заказ отменён" : ""}`}
       actions={
         <>
           {entry.orderId && (
@@ -152,11 +159,20 @@ export default async function AdminFinanceEntry(
         />
       </div>
 
+      {entry.isCancelled && (
+        <p className="mt-4 rounded-lg bg-danger/8 px-4 py-3 text-sm text-danger">
+          {entry.orderId || entry.externalOrderId
+            ? "Заказ отменён."
+            : "Заказа больше нет."}{" "}
+          Запись осталась для истории, но в выручку, долги и аналитику не входит.
+        </p>
+      )}
+
       {mismatch && (
         <p className="mt-4 rounded-lg bg-warn/10 px-4 py-3 text-sm text-warn">
-          Сумма строк расходов - {money.format(expensesSum)}, а в записи стоит{" "}
-          {money.format(p.expense)}. Расхождение перенесено из старой базы, где
-          итог хранился отдельным полем.
+          По строкам расход - {money.format(expensesSum)}, а в записи стоит{" "}
+          {money.format(p.expense)}. Запись правили в обход пересчёта - любой
+          новый платёж или расход её пересчитает.
         </p>
       )}
 
@@ -192,6 +208,14 @@ export default async function AdminFinanceEntry(
                         <span className="block text-ink">
                           {e.materialName ?? e.description ?? "Без названия"}
                         </span>
+                        {e.isWriteOff && (
+                          <span className="block text-xs text-ink/45">списано со склада</span>
+                        )}
+                        {hasFact && isAutoExpense(e.description) && (
+                          <span className="block text-xs text-ink/45">
+                            оценка для сравнения - в расход не входит, есть списания
+                          </span>
+                        )}
                         {e.categoryName && (
                           <span className="block text-xs text-ink/45">
                             {e.categoryName}
@@ -211,7 +235,13 @@ export default async function AdminFinanceEntry(
                       </td>
                       {canDelete && (
                         <td className="whitespace-nowrap px-4 py-3 text-right">
-                          <DeleteRow kind="expense" cardId={entry.id} rowId={e.id} />
+                          {/* Списание снимается возвратом материала на склад в
+                              карточке заказа, а не удалением строки */}
+                          {e.isWriteOff ? (
+                            <span className="text-xs text-ink/35">вернуть на склад</span>
+                          ) : (
+                            <DeleteRow kind="expense" cardId={entry.id} rowId={e.id} />
+                          )}
                         </td>
                       )}
                     </tr>
@@ -250,21 +280,15 @@ export default async function AdminFinanceEntry(
               </span>
             </div>
 
-            {/* Остаток показываем только у неоплаченных: при статусе
-                «оплачен» без записей о платежах это выглядело бы как
-                противоречие - «оплачен, но должен всю сумму» */}
-            {entry.status !== "paid" && p.income > 0 && paidSum < p.income && (
+            {/* Статус считается из платежей, поэтому остаток - та же разница */}
+            {debt > 0 && !entry.isCancelled && (
               <p className="mt-3 text-sm text-warn">
-                Остаток к оплате: {money.format(p.income - paidSum)}
+                Остаток к оплате: {money.format(debt)}
               </p>
             )}
 
             {payments.length === 0 ? (
-              <p className="mt-4 text-sm text-ink/50">
-                {entry.status === "paid"
-                  ? "Отмечен оплаченным без записей о платежах - в старой базе статус проставляли вручную."
-                  : "Платежей не зафиксировано."}
-              </p>
+              <p className="mt-4 text-sm text-ink/50">Платежей не зафиксировано.</p>
             ) : (
               <ul className="mt-4 flex flex-col gap-2 border-t border-ink/10 pt-3">
                 {payments.map((x) => (
@@ -272,8 +296,11 @@ export default async function AdminFinanceEntry(
                     key={x.id}
                     className="flex items-baseline justify-between gap-3 text-sm"
                   >
-                    <span className="font-mono text-xs text-ink/50">
-                      {x.paymentDate ? dt.format(x.paymentDate) : "-"}
+                    <span className="flex flex-col">
+                      <span className="font-mono text-xs text-ink/50">
+                        {x.paymentDate ? dt.format(x.paymentDate) : "-"}
+                      </span>
+                      {x.note && <span className="text-xs text-ink/45">{x.note}</span>}
                     </span>
                     <span className="flex items-center gap-2 font-mono text-ink">
                       {money.format(Number(x.amount))}

@@ -2,19 +2,16 @@
 
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { redirect } from "next/navigation";
 import { db } from "@/db";
-import {
-  externalOrders,
-  materials,
-  materialsStock,
-  orderExpenses,
-  ordersAccounting,
-} from "@/db/schema";
+import { materials, materialsStock } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
-import { applyMovement } from "@/lib/stock";
+import { StockError, applyMovement, syncStockAlerts } from "@/lib/stock";
+import { MoneyRuleError, type OrderRef } from "@/lib/order-money-db";
+import { returnWriteOff, writeOffToOrder, type WriteOffSource } from "@/lib/write-off-db";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type MovementState = {
   ok?: string;
@@ -44,6 +41,9 @@ export async function recordMovement(
   _prev: MovementState,
   formData: FormData,
 ): Promise<MovementState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return { error: tooLong.error };
+
   if (!(await can("materials", "edit"))) {
     return { error: "У вашей роли нет права менять склад" };
   }
@@ -72,9 +72,8 @@ export async function recordMovement(
       });
     });
   } catch (e) {
-    return {
-      error: e instanceof Error ? e.message : "Не удалось записать движение",
-    };
+    if (e instanceof StockError) return { error: e.message };
+    throw e;
   }
 
   revalidatePath(`/admin/materials/${materialId}`);
@@ -133,6 +132,9 @@ export async function saveMaterial(
   _prev: MaterialState,
   formData: FormData,
 ): Promise<MaterialState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;
@@ -196,11 +198,35 @@ export async function saveMaterial(
     redirect(`/admin/materials/${materialId}`);
   }
 
-  const updated = await db
-    .update(materials)
-    .set(values)
-    .where(eq(materials.id, id))
-    .returning({ id: materials.id });
+  // Правка и пересчёт оповещений - одной транзакцией. Поднятый минимум
+  // должен сразу показать нехватку, а снятый или выключенный материал -
+  // погасить уже открытое оповещение: раньше оповещения пересчитывались
+  // только при движении склада
+  const updated = await db.transaction(async (tx) => {
+    // Остаток блокируем первым: так же идут приёмка и списание (остаток →
+    // материал → оповещения). В другом порядке правка карточки и приёмка
+    // ждали бы друг друга по кругу и могли завести два оповещения
+    const [exists] = await tx.select({ id: materials.id }).from(materials).where(eq(materials.id, id)).limit(1);
+    if (!exists) return [];
+
+    await tx
+      .insert(materialsStock)
+      .values({ materialId: id, quantity: "0.00" })
+      .onConflictDoNothing({ target: materialsStock.materialId });
+    await tx
+      .select({ id: materialsStock.id })
+      .from(materialsStock)
+      .where(eq(materialsStock.materialId, id))
+      .for("update");
+
+    const rows = await tx
+      .update(materials)
+      .set(values)
+      .where(eq(materials.id, id))
+      .returning({ id: materials.id });
+    if (rows.length > 0) await syncStockAlerts(tx, id);
+    return rows;
+  });
   if (updated.length === 0) return { error: "Материал не найден" };
 
   await audit("material.update", { type: "material", id }, { name: v.name });
@@ -217,13 +243,34 @@ export type WriteOffState = {
   message?: string;
 };
 
+/** Заказ из формы: источник и номер. Источник - только из двух значений. */
+function orderRefFrom(formData: FormData): OrderRef | null {
+  const raw = String(formData.get("source") ?? "external");
+  if (raw !== "site" && raw !== "external") return null;
+  const id = Number(formData.get("orderId") ?? formData.get("externalOrderId"));
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return { source: raw as WriteOffSource, id };
+}
+
+/** Страницы, где видно списание: заказ, склад, бухгалтерия. */
+function revalidateWriteOff(ref: OrderRef, materialId: number) {
+  revalidatePath(
+    ref.source === "site" ? `/admin/orders/${ref.id}` : `/admin/external-orders/${ref.id}`,
+  );
+  revalidatePath(`/admin/materials/${materialId}`);
+  revalidatePath("/admin/materials");
+  revalidatePath("/admin/finance");
+  revalidatePath("/admin/analytics");
+}
+
 /**
- * Списать материал со склада на заказ.
+ * Списать материал со склада на заказ - менеджера или с сайта.
  *
  * До этого расход материалов ни к какому заказу не привязывался, и
  * себестоимость по факту собрать было нельзя: в карточке заказа стоял
  * только расчёт по рецептуре товара. Здесь движение уходит на склад, а
- * его стоимость - отдельной строкой расхода в бухгалтерию заказа.
+ * его стоимость - отдельной строкой расхода в бухгалтерию заказа
+ * (см. writeOffToOrder).
  */
 export async function writeOffMaterial(
   _prev: WriteOffState,
@@ -233,11 +280,10 @@ export async function writeOffMaterial(
     return { ok: false, error: "У вашей роли нет права менять склад" };
   }
 
-  const externalOrderId = Number(formData.get("externalOrderId"));
+  const ref = orderRefFrom(formData);
+  if (!ref) return { ok: false, error: "Заказ не найден" };
+
   const materialId = Number(formData.get("materialId"));
-  if (!Number.isInteger(externalOrderId) || externalOrderId <= 0) {
-    return { ok: false, error: "Заказ не найден" };
-  }
   if (!Number.isInteger(materialId) || materialId <= 0) {
     return { ok: false, error: "Выберите материал" };
   }
@@ -247,95 +293,72 @@ export async function writeOffMaterial(
     return { ok: false, error: "Количество вида 12.5, больше нуля" };
   }
 
-  const [order] = await db
-    .select({ id: externalOrders.id })
-    .from(externalOrders)
-    .where(eq(externalOrders.id, externalOrderId))
-    .limit(1);
-  if (!order) return { ok: false, error: "Заказ не найден" };
-
-  const [material] = await db
-    .select({
-      id: materials.id,
-      name: materials.name,
-      unit: materials.unit,
-      cost: materials.costPerUnit,
-    })
-    .from(materials)
-    .where(eq(materials.id, materialId))
-    .limit(1);
-  if (!material) return { ok: false, error: "Материал не найден" };
-
-  const amount = Number(raw);
-  const cost = Math.round(amount * Number(material.cost ?? 0) * 100) / 100;
-
+  let result: Awaited<ReturnType<typeof writeOffToOrder>>;
   try {
-    await db.transaction(async (tx) => {
-      await applyMovement(tx, {
-        materialId,
-        type: "out",
-        quantity: raw,
-        referenceType: "order",
-        referenceId: externalOrderId,
-        // Номера сайтовых и менеджерских заказов лежат в разных
-        // таблицах, поэтому тип заказа пишем словами: по одному
-        // referenceId его не отличить
-        comment: `Заказ менеджера № ${externalOrderId}`,
-      });
-
-      // Фактический расход попадает в бухгалтерию заказа отдельной
-      // строкой - рядом с расчётной себестоимостью, а не вместо неё
-      if (cost > 0) {
-        const [card] = await tx
-          .select({ id: ordersAccounting.id })
-          .from(ordersAccounting)
-          .where(eq(ordersAccounting.externalOrderId, externalOrderId))
-          .limit(1);
-
-        if (card) {
-          await tx.insert(orderExpenses).values({
-            orderAccountingId: card.id,
-            materialName: material.name,
-            quantity: raw,
-            unit: material.unit,
-            costPerUnit: material.cost,
-            totalCost: cost.toFixed(2),
-            amount: cost.toFixed(2),
-            description: `Списано со склада: ${material.name}`,
-          });
-
-          const [{ sum }] = await tx
-            .select({ sum: sql<string>`coalesce(sum(${orderExpenses.amount}), 0)` })
-            .from(orderExpenses)
-            .where(eq(orderExpenses.orderAccountingId, card.id));
-
-          await tx
-            .update(ordersAccounting)
-            .set({ totalExpense: Number(sum).toFixed(2) })
-            .where(eq(ordersAccounting.id, card.id));
-        }
-      }
-    });
+    result = await db.transaction((tx) => writeOffToOrder(tx, ref, { materialId, quantity: raw }));
   } catch (e) {
-    return {
-      ok: false,
-      error: e instanceof Error ? e.message : "Не удалось списать материал",
-    };
+    if (e instanceof MoneyRuleError || e instanceof StockError) {
+      return { ok: false, error: e.message };
+    }
+    throw e;
   }
 
-  await audit("material.write_off", { type: "external_order", id: externalOrderId }, {
-    materialId,
-    quantity: raw,
-    cost: cost.toFixed(2),
-  });
+  await audit(
+    "material.write_off",
+    { type: ref.source === "site" ? "order" : "external_order", id: ref.id },
+    { materialId, quantity: raw, cost: result.cost.toFixed(2) },
+  );
 
-  revalidatePath(`/admin/external-orders/${externalOrderId}`);
-  revalidatePath(`/admin/materials/${materialId}`);
-  revalidatePath("/admin/materials");
-  revalidatePath("/admin/finance");
+  revalidateWriteOff(ref, materialId);
 
   return {
     ok: true,
-    message: `Списано ${amount} ${material.unit} - ${cost.toFixed(2)} ₽ в расходы заказа`,
+    message: `Списано ${result.amount} ${result.material.unit} - ${result.cost.toFixed(2)} ₽ в расходы заказа`,
+  };
+}
+
+/**
+ * Вернуть списание на склад: приход, снятие строки расхода и пересчёт
+ * денег заказа - одной транзакцией. Права те же, что у самого списания.
+ */
+export async function returnWriteOffToStock(
+  _prev: WriteOffState,
+  formData: FormData,
+): Promise<WriteOffState> {
+  if (!(await can("materials", "edit"))) {
+    return { ok: false, error: "У вашей роли нет права менять склад" };
+  }
+
+  const ref = orderRefFrom(formData);
+  if (!ref) return { ok: false, error: "Заказ не найден" };
+
+  const movementId = Number(formData.get("movementId"));
+  if (!Number.isInteger(movementId) || movementId <= 0) {
+    return { ok: false, error: "Списание не найдено" };
+  }
+
+  let result: Awaited<ReturnType<typeof returnWriteOff>>;
+  try {
+    result = await db.transaction((tx) => returnWriteOff(tx, ref, movementId));
+  } catch (e) {
+    if (e instanceof MoneyRuleError || e instanceof StockError) {
+      return { ok: false, error: e.message };
+    }
+    throw e;
+  }
+
+  await audit(
+    "material.write_off_return",
+    { type: ref.source === "site" ? "order" : "external_order", id: ref.id },
+    { movementId, materialId: result.materialId, quantity: result.quantity },
+  );
+
+  revalidateWriteOff(ref, result.materialId);
+
+  return {
+    ok: true,
+    message: result.expenseRemoved
+      ? "Материал возвращён на склад, расход по заказу снят"
+      : "Материал возвращён на склад",
   };
 }

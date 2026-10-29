@@ -12,6 +12,7 @@ import {
 } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { rejectOverlong } from "@/lib/text-limits";
 
 /**
  * Справочники: категории товаров, статьи расходов, разделы документов и
@@ -120,6 +121,9 @@ export async function saveExpenseCategory(
   _prev: CatalogState,
   formData: FormData,
 ): Promise<CatalogState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;
@@ -180,6 +184,9 @@ export async function saveDocumentCategory(
   _prev: CatalogState,
   formData: FormData,
 ): Promise<CatalogState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;

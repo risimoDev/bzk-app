@@ -7,6 +7,7 @@ import { ProductImage } from "@/components/catalog/ProductImage";
 import {
   PRODUCT_IMAGE_ACCEPT,
   PRODUCT_IMAGE_KINDS,
+  MAX_PRODUCT_BATCH_SIZE,
   type ProductImageKind,
 } from "@/lib/product-images";
 import {
@@ -157,6 +158,14 @@ function UploadForm({
         accept={PRODUCT_IMAGE_ACCEPT}
         multiple={multiple}
         required
+        onChange={(e) => {
+          // Пачка уходит одним запросом с потолком 9 МБ: говорим об этом
+          // до отправки, а не общей ошибкой сервера после
+          const total = Array.from(e.currentTarget.files ?? []).reduce((s, f) => s + f.size, 0);
+          e.currentTarget.setCustomValidity(
+            total > MAX_PRODUCT_BATCH_SIZE ? "Файлы вместе больше 9 МБ - выберите меньше" : "",
+          );
+        }}
         className="w-full rounded-lg border border-ink/15 bg-bone px-3 py-2 text-xs text-ink file:mr-3 file:rounded-pill file:border-0 file:bg-ink file:px-3 file:py-1 file:font-display file:text-[0.6rem] file:tracking-wider file:text-bone hover:border-ink/30"
       />
 
@@ -174,7 +183,7 @@ function UploadForm({
       </div>
 
       <p className="text-xs text-ink/40">
-        JPG, PNG или WebP, до 8 МБ{multiple ? ". Можно выбрать несколько" : ""}.
+        JPG, PNG или WebP, до 8 МБ{multiple ? ". Можно выбрать несколько, вместе до 9 МБ" : ""}.
       </p>
     </form>
   );

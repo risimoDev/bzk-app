@@ -2,21 +2,36 @@ import type { Metadata } from "next";
 import { Fragment } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { eq, asc, desc } from "drizzle-orm";
+import { eq, asc, desc, sql } from "drizzle-orm";
 import { ArrowLeft, Mail, Phone, MapPin, Flame, Receipt, FileSignature } from "lucide-react";
 import { db } from "@/db";
-import { orders, orderItems, users, products, clientUploads } from "@/db/schema";
+import {
+  orders,
+  orderItems,
+  users,
+  products,
+  clientUploads,
+  ordersAccounting,
+  orderPayments,
+} from "@/db/schema";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
-import { ORDER_STATUS, statusOf, type OrderStatus } from "@/lib/order-status";
+import { statusOf } from "@/lib/order-status";
 import { can } from "@/lib/permissions";
 import { parseContact } from "@/lib/order-contact";
-import { changeStatus, toggleUrgent } from "../actions";
+import { toggleUrgent } from "../actions";
+import { formatOrderAttribute, parseOrderAttributes } from "@/lib/order-attributes";
+import { StatusForm } from "./StatusForm";
 import { readOrderMessages } from "@/lib/order-chat";
 import { OrderChat } from "./OrderChat";
 import { DeleteOrderItemButton, OrderItemForm } from "./OrderItemForm";
 import { DocumentsToggle } from "../DocumentsToggle";
 import { ProofReview } from "./ProofReview";
 import { cn } from "@/lib/cn";
+import { parseId } from "@/lib/ids";
+import { paymentStateOf } from "@/lib/finance";
+import { debtOf } from "@/lib/order-money";
+import { ReturnWriteOffButton, WriteOffForm } from "@/app/admin/materials/WriteOffForm";
+import { activeMaterialOptions, listWriteOffs } from "@/lib/write-off-db";
 
 export const metadata: Metadata = {
   title: "Заказ · Админка",
@@ -47,7 +62,8 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
   }
 
   const { id } = await props.params;
-  if (!/^\d+$/.test(id)) notFound();
+  const orderId = parseId(id);
+  if (orderId === null) notFound();
 
   const [order] = await db
     .select({
@@ -68,7 +84,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
     })
     .from(orders)
     .leftJoin(users, eq(orders.userId, users.id))
-    .where(eq(orders.id, Number(id)))
+    .where(eq(orders.id, orderId))
     .limit(1);
 
   if (!order) notFound();
@@ -89,7 +105,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
     })
     .from(orderItems)
     .leftJoin(products, eq(orderItems.productId, products.id))
-    .where(eq(orderItems.orderId, Number(id)))
+    .where(eq(orderItems.orderId, orderId))
     .orderBy(asc(orderItems.id));
 
   // Макеты, которые клиент приложил к заказу: менеджер их принимает
@@ -104,7 +120,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
       createdAt: clientUploads.createdAt,
     })
     .from(clientUploads)
-    .where(eq(clientUploads.orderId, Number(id)))
+    .where(eq(clientUploads.orderId, orderId))
     .orderBy(desc(clientUploads.createdAt));
 
   const st = statusOf(order.status);
@@ -123,6 +139,44 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
         .orderBy(asc(products.name))
     : [];
   const contact = parseContact(order.contactInfo);
+
+  // Материалы со склада: список списаний видит любой, кто смотрит склад,
+  // форму - кто его правит. Менеджерские заказы так делали давно, сайтовые
+  // - нет, и себестоимость по факту у них собрать было нельзя
+  const [canStockView, canStock] = await Promise.all([
+    can("materials", "view"),
+    can("materials", "edit"),
+  ]);
+  const [writeOffs, materialList] = canStockView
+    ? await Promise.all([
+        listWriteOffs(db, { source: "site", id: order.id }),
+        canStock ? activeMaterialOptions(db) : Promise.resolve([]),
+      ])
+    : [[], []];
+
+  // Оплата - из бухгалтерской карточки: платежи вносит бухгалтерия, а
+  // оплаченный счёт Точки попадает туда сам при сверке
+  const canFinance = await can("finance", "view");
+  const [card] = canFinance
+    ? await db
+        .select({
+          id: ordersAccounting.id,
+          status: ordersAccounting.status,
+          income: ordersAccounting.income,
+        })
+        .from(ordersAccounting)
+        .where(eq(ordersAccounting.orderId, order.id))
+        .orderBy(asc(ordersAccounting.id))
+        .limit(1)
+    : [];
+  const [paidRow] = card
+    ? await db
+        .select({ paid: sql<string>`coalesce(sum(${orderPayments.amount}), 0)` })
+        .from(orderPayments)
+        .where(eq(orderPayments.orderAccountingId, card.id))
+    : [];
+  const paidSum = Number(paidRow?.paid ?? 0);
+  const pay = card ? paymentStateOf(card.status) : null;
 
   return (
     <AdminPage
@@ -182,10 +236,7 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
                 <tbody>
                   {items.map((it) => {
                     const name = it.productName ?? it.itemName ?? "Без названия";
-                    const attrs =
-                      it.attributes && typeof it.attributes === "object"
-                        ? Object.entries(it.attributes as Record<string, unknown>)
-                        : [];
+                    const attrs = parseOrderAttributes(it.attributes);
 
                     return (
                       <Fragment key={it.id}>
@@ -208,10 +259,8 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
                           )}
                           {attrs.length > 0 && (
                             <ul className="mt-1 flex flex-wrap gap-x-3 text-xs text-ink/50">
-                              {attrs.map(([k, v]) => (
-                                <li key={k}>
-                                  {k}: {String(v)}
-                                </li>
+                              {attrs.map((a, i) => (
+                                <li key={i}>{formatOrderAttribute(a)}</li>
                               ))}
                             </ul>
                           )}
@@ -372,36 +421,46 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
             </p>
 
             {editable ? (
-              <form action={changeStatus} className="mt-4 flex flex-col gap-2">
-                <input type="hidden" name="orderId" value={order.id} />
-                <label htmlFor="status" className="sr-only">
-                  Новый статус заказа
-                </label>
-                <select
-                  id="status"
-                  name="status"
-                  defaultValue={order.status ?? "pending"}
-                  className="rounded-lg border border-ink/15 bg-paper px-3 py-2 text-sm text-ink focus:outline-2 focus:outline-offset-1 focus:outline-brand-bright"
-                >
-                  {(Object.keys(ORDER_STATUS) as OrderStatus[]).map((key) => (
-                    <option key={key} value={key}>
-                      {ORDER_STATUS[key].label}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="submit"
-                  className="rounded-lg bg-brand px-4 py-2 text-sm text-bone transition-colors hover:bg-brand-bright"
-                >
-                  Сохранить статус
-                </button>
-              </form>
+              <StatusForm orderId={order.id} status={order.status} />
             ) : (
               <p className="mt-3 text-xs text-ink/45">
                 У вашей роли нет права менять статус.
               </p>
             )}
           </div>
+
+          {card && pay && (
+            <div className="rounded-xl border border-ink/10 bg-bone p-5">
+              <p className="font-display text-[0.62rem] tracking-[0.18em] text-ink/40">
+                Оплата
+              </p>
+              <p className="mt-2 flex flex-wrap items-center gap-2">
+                <span
+                  className={cn(
+                    "rounded px-2.5 py-1 font-display text-xs tracking-wider",
+                    pay.className,
+                  )}
+                >
+                  {pay.label}
+                </span>
+                <span className="font-mono text-sm text-ink/60">
+                  {paidSum.toLocaleString("ru-RU")} из{" "}
+                  {Number(card.income).toLocaleString("ru-RU")} ₽
+                </span>
+              </p>
+              {debtOf(Number(card.income), paidSum) > 0 && order.status !== "cancelled" && (
+                <p className="mt-2 text-xs text-warn">
+                  Остаток {debtOf(Number(card.income), paidSum).toLocaleString("ru-RU")} ₽
+                </p>
+              )}
+              <Link
+                href={`/admin/finance/${card.id}`}
+                className="mt-2 inline-block text-xs text-brand hover:text-brand-bright"
+              >
+                Платежи и расходы заказа
+              </Link>
+            </div>
+          )}
 
           {editable && (
             <div className="rounded-xl border border-ink/10 bg-bone p-5">
@@ -418,7 +477,9 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
             </div>
           )}
 
-          {editable && (
+          {/* Отменённому и завершённому заказу срочность менять нельзя: у
+              первого нет работы, у второго итог уже закрыт. Сервер отказывает так же */}
+          {editable && order.status !== "cancelled" && order.status !== "completed" && (
             <form action={toggleUrgent}>
               <input type="hidden" name="orderId" value={order.id} />
               <input
@@ -475,6 +536,47 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
               )}
             </ul>
           </div>
+
+          {canStockView && (
+            <div className="rounded-xl border border-ink/10 bg-bone p-5">
+              <h2 className="font-display text-[0.62rem] tracking-[0.18em] text-ink/40">
+                МАТЕРИАЛЫ СО СКЛАДА
+              </h2>
+
+              {writeOffs.length > 0 && (
+                <ul className="mt-3 flex flex-col gap-1.5 border-b border-ink/10 pb-3 text-sm">
+                  {writeOffs.map((w) => (
+                    <li key={w.id} className="flex items-center justify-between gap-3">
+                      <span className={cn("text-ink/75", w.returned && "text-ink/40 line-through")}>
+                        {w.name}
+                      </span>
+                      <span className="flex items-center gap-2 whitespace-nowrap font-mono text-xs text-ink/50">
+                        {Number(w.quantity)} {w.unit}
+                        {w.amount && ` · ${Number(w.amount).toLocaleString("ru-RU")} ₽`}
+                        {w.returned ? (
+                          <span className="font-sans text-ok">возвращено</span>
+                        ) : (
+                          canStock && (
+                            <ReturnWriteOffButton
+                              source="site"
+                              orderId={order.id}
+                              movementId={w.id}
+                            />
+                          )
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {canStock && (
+                <div className="mt-3">
+                  <WriteOffForm source="site" orderId={order.id} materials={materialList} />
+                </div>
+              )}
+            </div>
+          )}
 
           {order.readyDate && (
             <div className="rounded-xl border border-ink/10 bg-bone p-5">

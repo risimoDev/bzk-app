@@ -13,6 +13,7 @@ import { type Company } from "@/lib/company";
 import { readCompany } from "@/lib/company-db";
 import { parseContact } from "@/lib/order-contact";
 import { rublesInWords } from "@/lib/num2words";
+import { settleRows } from "@/lib/upd-rows";
 
 /**
  * Данные универсального передаточного документа по заказу.
@@ -58,8 +59,13 @@ export type UpdData = {
   rows: UpdRow[];
   totalQuantity: number;
   totalSum: number;
-  /** Сумма позиций разошлась с суммой заказа - например, из-за срочной надбавки */
+  /**
+   * Наценка сверх позиций (срочность, доставка) - отдельная строка
+   * документа. Всегда неотрицательная: скидка распределена по строкам.
+   */
   extra: number;
+  /** Скидка, распределённая по строкам пропорционально сумме (0, если её нет). */
+  discount: number;
   /** Чем объясняется расхождение, если это известно из данных заказа */
   extraLabel: string;
   amountInWords: string;
@@ -122,7 +128,8 @@ async function buildSiteUpd(orderId: number): Promise<UpdData | null> {
       unitPrice: orderItems.unitPrice,
       price: orderItems.price,
       productName: products.name,
-      unit: products.unit,
+      productUnit: products.unit,
+      snapshotUnit: orderItems.unit,
     })
     .from(orderItems)
     .leftJoin(products, eq(orderItems.productId, products.id))
@@ -132,19 +139,26 @@ async function buildSiteUpd(orderId: number): Promise<UpdData | null> {
   const seller = await readCompany();
   const contact = parseContact(order.contactInfo);
 
-  const isCorporate = Boolean(order.isCorporate);
+  // Реквизиты покупателя на момент заказа лежат в contact_info. У заказов,
+  // оформленных до появления снимка, их нет - тогда берём текущий профиль
+  const snap = contact?.buyer;
+  const isCorporate = snap ? snap.isCorporate : Boolean(order.isCorporate);
+  const companyName = snap ? snap.companyName : order.companyName?.trim();
+  const legalAddress = snap ? snap.legalAddress : order.legalAddress?.trim();
+  const inn = snap ? snap.inn : order.inn?.trim();
+  const kpp = snap ? snap.kpp : order.kpp?.trim();
+  const personName = snap
+    ? contact?.name || order.clientName?.trim()
+    : order.clientName?.trim() || contact?.name;
+
   const buyer = {
-    name:
-      (isCorporate && order.companyName?.trim()) ||
-      order.clientName?.trim() ||
-      contact?.name ||
-      "Покупатель не указан",
+    name: (isCorporate && companyName) || personName || "Покупатель не указан",
     address:
-      (isCorporate && order.legalAddress?.trim()) ||
+      (isCorporate && legalAddress) ||
       order.shippingAddress?.trim() ||
       "Адрес не указан",
-    inn: order.inn?.trim() ?? "",
-    kpp: order.kpp?.trim() ?? "",
+    inn: inn ?? "",
+    kpp: kpp ?? "",
     isCorporate,
   };
 
@@ -157,21 +171,24 @@ async function buildSiteUpd(orderId: number): Promise<UpdData | null> {
 
     return {
       index: i + 1,
-      name: it.productName ?? it.itemName ?? "Без названия",
-      unit: it.unit ?? "шт",
+      // Снимок названия и единицы с момента заказа - раньше текущих данных
+      // товара: его могли переименовать или убрать из каталога
+      name: it.itemName?.trim() || it.productName || "Без названия",
+      unit: it.snapshotUnit ?? it.productUnit ?? "шт",
       quantity,
       price: +price.toFixed(2),
       sum: +sum.toFixed(2),
     };
   });
 
-  const totalSum = +rows.reduce((s, r) => s + r.sum, 0).toFixed(2);
-  const totalQuantity = rows.reduce((s, r) => s + r.quantity, 0);
   const orderTotal = Number(order.totalPrice);
 
   // Надбавка за срочность и доставка в позиции заказа не попадают, а в
-  // документе сумма обязана сойтись с тем, что клиент платит
-  const extra = +(orderTotal - totalSum).toFixed(2);
+  // документе сумма обязана сойтись с тем, что клиент платит. Скидка
+  // (промокод, корректировка вниз) делится по строкам, а не печатается
+  // отрицательной строкой
+  const { rows: settled, total: totalSum, discount, extra } = settleRows(rows, orderTotal);
+  const totalQuantity = settled.reduce((s, r) => s + r.quantity, 0);
 
   // Надбавку за срочность заказ хранит в contact_info - если она сходится
   // с расхождением, строку можно назвать честно, а не «прочее»
@@ -179,9 +196,7 @@ async function buildSiteUpd(orderId: number): Promise<UpdData | null> {
   const extraLabel =
     extra > 0 && Math.abs(extra - urgentFee) < 0.01
       ? "Надбавка за срочное изготовление"
-      : extra > 0
-        ? "Дополнительные работы по заказу"
-        : "Корректировка стоимости";
+      : "Дополнительные работы по заказу";
 
   return {
     order: {
@@ -193,10 +208,11 @@ async function buildSiteUpd(orderId: number): Promise<UpdData | null> {
     },
     seller,
     buyer,
-    rows,
+    rows: settled,
     totalQuantity,
     totalSum,
     extra,
+    discount,
     extraLabel,
     amountInWords: rublesInWords(orderTotal),
     documentNumber: String(order.id),
@@ -238,7 +254,7 @@ async function buildExternalUpd(orderId: number): Promise<UpdData | null> {
       quantity: externalOrderItems.quantity,
       price: externalOrderItems.price,
       productName: products.name,
-      unit: products.unit,
+      productUnit: products.unit,
     })
     .from(externalOrderItems)
     .leftJoin(products, eq(externalOrderItems.productId, products.id))
@@ -260,18 +276,18 @@ async function buildExternalUpd(orderId: number): Promise<UpdData | null> {
 
     return {
       index: i + 1,
-      name: it.productName ?? it.itemName ?? "Без названия",
-      unit: it.unit ?? "шт",
+      // Название, вписанное в заказ, раньше названия товара из каталога
+      name: it.itemName?.trim() || it.productName || "Без названия",
+      unit: it.productUnit ?? "шт",
       quantity,
       price: +price.toFixed(2),
       sum: +sum.toFixed(2),
     };
   });
 
-  const totalSum = +rows.reduce((s, r) => s + r.sum, 0).toFixed(2);
-  const totalQuantity = rows.reduce((s, r) => s + r.quantity, 0);
   const orderTotal = Number(order.totalPrice);
-  const extra = +(orderTotal - totalSum).toFixed(2);
+  const { rows: settled, total: totalSum, discount, extra } = settleRows(rows, orderTotal);
+  const totalQuantity = settled.reduce((s, r) => s + r.quantity, 0);
 
   return {
     order: {
@@ -293,12 +309,12 @@ async function buildExternalUpd(orderId: number): Promise<UpdData | null> {
       kpp: "",
       isCorporate,
     },
-    rows,
+    rows: settled,
     totalQuantity,
     totalSum,
     extra,
-    extraLabel:
-      extra > 0 ? "Дополнительные работы по заказу" : "Корректировка стоимости",
+    discount,
+    extraLabel: "Дополнительные работы по заказу",
     amountInWords: rublesInWords(orderTotal),
     documentNumber: `${order.id}-М`,
     documentDate: order.createdAt ?? new Date(),

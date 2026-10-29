@@ -12,7 +12,8 @@ import { writeFavorites } from "@/lib/favorites";
 type Item = {
   id: number;
   name: string;
-  basePrice: string;
+  /** Цена за единицу при минимальном тираже; null - по запросу. */
+  fromPrice: number | null;
   unit: string | null;
   categoryName: string | null;
   imageUrl: string | null;
@@ -122,12 +123,18 @@ export function FavoritesList() {
                   {item.name}
                 </h2>
                 <p className="mt-auto pt-4 font-mono text-lg text-ink">
-                  <span className="text-sm text-ink/45">от </span>
-                  {money.format(Number(item.basePrice))}
-                  <span className="text-sm text-ink/45">
-                    {" "}
-                    / {item.unit ?? "шт."}
-                  </span>
+                  {item.fromPrice !== null ? (
+                    <>
+                      <span className="text-sm text-ink/45">от </span>
+                      {money.format(item.fromPrice)}
+                      <span className="text-sm text-ink/45">
+                        {" "}
+                        / {item.unit ?? "шт."}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-base text-ink/50">Цена по запросу</span>
+                  )}
                 </p>
               </div>
             </Link>

@@ -13,8 +13,10 @@ import {
   isProductImageKind,
   productImageUrl,
   productImageFilename,
+  MAX_PRODUCT_BATCH_SIZE,
   type ProductImageKind,
 } from "@/lib/product-images";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type ProductState = {
   ok?: boolean;
@@ -57,6 +59,9 @@ export async function saveProduct(
   _prev: ProductState,
   formData: FormData,
 ): Promise<ProductState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;
@@ -211,6 +216,12 @@ export async function uploadProductImage(
 
   // Логотип один, и присылать пачку для него незачем
   const files = kind === "logo" ? picked.slice(0, 1) : picked;
+
+  // Тело действия ограничено 10 МБ целиком; дальше Next отвечает общей
+  // ошибкой, а так человек получает понятную подсказку
+  if (files.reduce((sum, f) => sum + f.size, 0) > MAX_PRODUCT_BATCH_SIZE) {
+    return { error: "Файлы вместе больше 9 МБ - загрузите их по частям" };
+  }
 
   const saved: string[] = [];
   try {
@@ -387,6 +398,8 @@ export async function setMainProductImage(
     .update(productImages)
     .set({ isMain: true })
     .where(eq(productImages.id, imageId));
+
+  await audit("product.image.main", { type: "product", id: image.productId }, { imageId });
 
   revalidateProduct(image.productId);
 

@@ -32,6 +32,10 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# Шаблоны без секретов - нужны в репозитории: по ним заполняют .env
+# (README.md, DEPLOY.md, first-install.sh). Настоящие значения - только в .env
+!.env.example
+!.env.production.example
 
 # vercel
 .vercel
@@ -42,3 +46,9 @@ next-env.d.ts
 assets-src/
 
 *.tmp
+
+# Дампы для переноса на прод - не коммитим (в них данные)
+transfer/
+
+# Настройки rclone для выгрузки бэкапов вне сервера - в них ключи доступа
+/rclone.conf

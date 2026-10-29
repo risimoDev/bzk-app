@@ -5,16 +5,21 @@ import {
   checkWebhookSecret,
   hasWebhookSecret,
   sendMessage,
-  verifyLinkCode,
   esc,
   isTelegramConfigured,
-  LINK_CODE_TTL_MINUTES,
 } from "@/lib/telegram";
+import { LINK_CODE_TTL_MINUTES } from "@/lib/telegram-link";
+import {
+  consumeLinkCode,
+  linkChatToUser,
+  sendTelegramLinkedNotice,
+} from "@/lib/telegram-link-db";
 import { statusOf } from "@/lib/order-status";
 import { externalProductionStatus } from "@/lib/external-orders";
 import { taskStatus } from "@/lib/tasks";
 import { absoluteUrl } from "@/lib/site";
 import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
+import { afterResponse } from "@/lib/notify-after";
 
 /**
  * Приём обновлений от телеграма.
@@ -145,7 +150,7 @@ async function start(chatId: number, firstName: string) {
       `Это бот БЗК Принт. Он присылает уведомления о ваших заказах.\n\n` +
       `<b>Чтобы связать аккаунт:</b>\n` +
       `1. Войдите в кабинет на сайте\n` +
-      `2. Откройте «Профиль» - там показан разовый код\n` +
+      `2. Откройте «Профиль» и нажмите «Получить код»\n` +
       `3. Пришлите сюда: <code>/connect КОД</code>\n\n` +
       `Код живёт ${LINK_CODE_TTL_MINUTES} минут.`,
     [[{ text: "Открыть профиль", url: absoluteUrl("/client/settings") }]],
@@ -156,22 +161,24 @@ async function start(chatId: number, firstName: string) {
  * Привязка по разовому коду.
  *
  * Старый бот связывал аккаунт по одной лишь почте, и любой, кто её знал,
- * получал чужие уведомления. Код выдаётся в кабинете, значит человек уже
- * вошёл в аккаунт.
+ * получал чужие уведомления. Код выдаётся в кабинете по кнопке, значит
+ * человек уже вошёл в аккаунт; после привязки владельцу уходит письмо.
  */
 async function connect(chatId: number, arg: string) {
   if (arg === "") {
     return sendMessage(
       chatId,
       "Пришлите код из кабинета: <code>/connect КОД</code>\n\n" +
-        "Код показан в «Профиле» на сайте.",
+        "Код выдаётся в «Профиле» на сайте по кнопке «Получить код».",
     );
   }
 
   /**
-   * Пять попыток на чат за пять минут. Подпись кода и так не подбирается
-   * перебором, но без ограничения бот отвечал бы на каждую попытку - и
-   * работал бы усилителем нагрузки на себя же.
+   * Пять неверных попыток на чат за пять минут. Код случайный и длинный,
+   * так что подобрать его нельзя и без лимита, но без ограничения бот
+   * отвечал бы на каждую попытку - и работал бы усилителем нагрузки на
+   * себя же. Считаем по чату, а не по пользователю: на неверном коде
+   * неизвестно, чей аккаунт пытались угадать.
    */
   const limit = await checkRateLimit(`tg:${chatId}`, "telegramConnect");
   if (!limit.ok) {
@@ -181,37 +188,27 @@ async function connect(chatId: number, arg: string) {
     );
   }
 
-  const userId = verifyLinkCode(arg);
+  // Код одноразовый: погашается этим же запросом, повторить его нельзя
+  const userId = await consumeLinkCode(arg);
   if (!userId) {
     await recordAttempt(`tg:${chatId}`, "telegramConnect");
     return sendMessage(
       chatId,
-      `Код не подошёл. Он живёт ${LINK_CODE_TTL_MINUTES} минут - возьмите свежий в «Профиле» на сайте.`,
+      `Код не подошёл. Он живёт ${LINK_CODE_TTL_MINUTES} минут и работает один раз - возьмите свежий в «Профиле» на сайте.`,
     );
   }
 
-  const [user] = await db
-    .select({ id: users.id, name: users.name, isBlocked: users.isBlocked })
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-
-  if (!user || user.isBlocked) {
+  const user = await linkChatToUser(userId, chatId);
+  if (!user) {
     return sendMessage(chatId, "Аккаунт не найден или заблокирован.");
   }
 
-  // Один чат - один аккаунт: снимаем привязку с прежнего владельца, иначе
-  // уведомления пошли бы двоим
-  await db.transaction(async (tx) => {
-    await tx
-      .update(users)
-      .set({ telegramChatId: null })
-      .where(eq(users.telegramChatId, String(chatId)));
-
-    await tx
-      .update(users)
-      .set({ telegramChatId: String(chatId), telegramNotifications: true })
-      .where(eq(users.id, user.id));
+  // Письмо не задерживает ответ в чате и не роняет привязку, если почта
+  // не отвечает. after() держит процесс живым, пока письмо не уйдёт, а
+  // неудача попадает в лог: хозяин аккаунта не узнал о чужой привязке
+  afterResponse("telegram-linked-notice", async () => {
+    const r = await sendTelegramLinkedNotice(user);
+    if (r && !r.ok) console.error("[telegram-linked-notice] письмо не ушло:", r.error);
   });
 
   return sendMessage(

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 import { eq } from "drizzle-orm";
@@ -33,6 +34,9 @@ export default async function CheckoutPage() {
   if (!user) redirect("/login?from=/checkout");
 
   const items = await resolveCart(await readCart());
+  // Ключ этого открытия формы: повтор отправки (двойной щелчок, обновление
+  // ответа) придёт с тем же ключом, и второго заказа не будет
+  const checkoutToken = randomUUID();
   const subtotal = items.reduce((s, i) => s + i.lineTotal, 0);
 
   const [profile] = await db
@@ -102,6 +106,7 @@ export default async function CheckoutPage() {
 
               <CheckoutForm
                 subtotal={subtotal}
+                checkoutToken={checkoutToken}
                 defaults={{
                   name: profile?.name ?? user.name ?? "",
                   email: profile?.email ?? "",

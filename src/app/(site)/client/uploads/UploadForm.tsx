@@ -1,13 +1,13 @@
 "use client";
 
-import { useActionState, useEffect, useRef } from "react";
+import { useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { CloudUpload, Check, TriangleAlert } from "lucide-react";
-import { uploadClientFile, type ActionState } from "@/app/actions/client";
-import { ACCEPT_ATTRIBUTE, ALLOWED_EXTENSIONS } from "@/lib/client-portal";
+import { ACCEPT_ATTRIBUTE, ALLOWED_EXTENSIONS, MAX_UPLOAD_SIZE } from "@/lib/client-portal";
 import { cn } from "@/lib/cn";
 import { siteLabelClass } from "@/components/ui/form-classes";
 
-const initial: ActionState = { ok: false };
+type UploadState = { ok: boolean; message?: string };
 
 export type OrderOption = { id: number; label: string };
 
@@ -19,17 +19,62 @@ export function UploadForm({
   orders: OrderOption[];
   defaultOrderId?: number;
 }) {
-  const [state, action, pending] = useActionState(uploadClientFile, initial);
+  const router = useRouter();
   const formRef = useRef<HTMLFormElement>(null);
+  const [state, setState] = useState<UploadState>({ ok: false });
+  const [pending, setPending] = useState(false);
 
-  useEffect(() => {
-    if (state.ok) formRef.current?.reset();
-  }, [state]);
+  // Файл уходит в /api/client-uploads телом запроса, без multipart: так
+  // сервер пишет его на диск потоком и не держит в памяти. Описание и
+  // заказ едут заголовками
+  async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const file = data.get("file");
+
+    if (!(file instanceof File) || file.size === 0) {
+      setState({ ok: false, message: "Файл не выбран" });
+      return;
+    }
+    if (file.size > MAX_UPLOAD_SIZE) {
+      setState({ ok: false, message: "Файл больше 50 МБ - сожмите или пришлите архивом" });
+      return;
+    }
+
+    setPending(true);
+    setState({ ok: false });
+    try {
+      const res = await fetch("/api/client-uploads", {
+        method: "POST",
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-File-Name": encodeURIComponent(file.name),
+          "X-Description": encodeURIComponent(String(data.get("description") ?? "")),
+          "X-Order-Id": String(data.get("orderId") ?? ""),
+        },
+        body: file,
+      });
+      const body = (await res.json().catch(() => null)) as UploadState | null;
+      setState({
+        ok: res.ok && Boolean(body?.ok),
+        message: body?.message ?? "Не удалось загрузить файл - попробуйте ещё раз",
+      });
+      if (res.ok) {
+        form.reset();
+        router.refresh();
+      }
+    } catch {
+      setState({ ok: false, message: "Нет связи - файл не загружен, попробуйте ещё раз" });
+    } finally {
+      setPending(false);
+    }
+  }
 
   return (
     <form
       ref={formRef}
-      action={action}
+      onSubmit={onSubmit}
       className="rounded-card border border-ink/10 bg-bone/85 p-6 sm:p-7"
     >
       <h2 className="flex items-center gap-2.5 font-display text-xl text-ink">

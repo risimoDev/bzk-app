@@ -4,39 +4,23 @@ import { db } from "@/db";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Проверка живости для healthcheck контейнера и deploy/deploy.sh.
+ *
+ * Адрес открыт всему интернету, поэтому наружу - только итог и код:
+ * 200 - всё в порядке, 503 - база не отвечает. Текст ошибки драйвера
+ * называл бы хост, пользователя и версию базы, а время работы процесса
+ * подсказывает, когда сервер перезапускали (и обновляли). Подробности
+ * пишем в лог приложения: `bash deploy/logs.sh`.
+ */
 export async function GET() {
-  const startTime = Date.now();
+  const headers = { "Cache-Control": "no-store" };
 
   try {
     await db.execute(sql`SELECT 1`);
-    const dbLatency = Date.now() - startTime;
-
-    return NextResponse.json(
-      {
-        status: "ok",
-        uptime: Math.floor(process.uptime()),
-        timestamp: new Date().toISOString(),
-        database: {
-          status: "connected",
-          latencyMs: dbLatency,
-        },
-        version: process.env.npm_package_version || "0.1.0",
-      },
-      { status: 200 }
-    );
+    return NextResponse.json({ status: "ok" }, { status: 200, headers });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Database check failed";
-    return NextResponse.json(
-      {
-        status: "degraded",
-        uptime: Math.floor(process.uptime()),
-        timestamp: new Date().toISOString(),
-        database: {
-          status: "disconnected",
-          error: message,
-        },
-      },
-      { status: 503 }
-    );
+    console.error("[health] база не отвечает:", error);
+    return NextResponse.json({ status: "degraded" }, { status: 503, headers });
   }
 }

@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import {
   documentCategories,
@@ -16,7 +16,11 @@ import { currentUser } from "@/auth";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { clientIp } from "@/lib/client-ip";
+import { isUniqueViolation } from "@/lib/db-errors";
+import { nextDocumentNumber } from "@/lib/numbering-db";
 import { renderTemplate, type FieldValue, type ItemRow } from "@/lib/document-templates";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate } from "@/lib/dates";
 
 export type DocumentState = {
   ok?: boolean;
@@ -42,6 +46,9 @@ export async function createDocument(
   _prev: DocumentState,
   formData: FormData,
 ): Promise<DocumentState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me || !(await can("documents", "create"))) {
     return { error: "У вашей роли нет права заводить документы" };
@@ -92,8 +99,16 @@ export async function createDocument(
     amount = n.toFixed(2);
   }
 
-  const documentDate = String(formData.get("documentDate") ?? "").trim();
-  const validUntil = String(formData.get("validUntil") ?? "").trim();
+  const rawDocumentDate = String(formData.get("documentDate") ?? "").trim();
+  const rawValidUntil = String(formData.get("validUntil") ?? "").trim();
+  const documentDate = rawDocumentDate === "" ? null : parseCalendarDate(rawDocumentDate);
+  const validUntil = rawValidUntil === "" ? null : parseCalendarDate(rawValidUntil);
+  if (rawDocumentDate !== "" && !documentDate) {
+    return { fieldErrors: { documentDate: "Такой даты нет в календаре" } };
+  }
+  if (rawValidUntil !== "" && !validUntil) {
+    return { fieldErrors: { validUntil: "Такой даты нет в календаре" } };
+  }
 
   // Ссылки проверяем до вставки: несуществующий заказ вставился бы
   // с ошибкой внешнего ключа и упал бы пятисоткой вместо подсказки
@@ -191,19 +206,15 @@ export async function createDocument(
         : template.contentTemplate;
   }
 
-  const documentId = await db.transaction(async (tx) => {
+  const insertDocument = () => db.transaction(async (tx) => {
     let number: string | null = manualNumber || null;
 
-    // Номер по шаблону: префикс, год и порядковый номер за год
+    // Номер по шаблону: префикс, год и порядковый номер за год. Выдаёт
+    // атомарный счётчик по паре «префикс + год»; он же учитывает номера,
+    // вписанные руками, так что совпасть с ними не может
     if (!number && template?.isNumbered !== false && template) {
-      const year = new Date().getFullYear();
       const prefix = (template.numberPrefix ?? "").trim() || "DOC-";
-      const like = `${prefix}${year}-%`;
-      const [{ n }] = await tx
-        .select({ n: sql<number>`count(*)::int` })
-        .from(documents)
-        .where(sql`${documents.documentNumber} like ${like}`);
-      number = `${prefix}${year}-${String(n + 1).padStart(3, "0")}`;
+      number = await nextDocumentNumber(tx, prefix);
     }
 
     const [created] = await tx
@@ -222,8 +233,8 @@ export async function createDocument(
         status,
         docType,
         amount,
-        documentDate: /^\d{4}-\d{2}-\d{2}$/.test(documentDate) ? documentDate : null,
-        validUntil: /^\d{4}-\d{2}-\d{2}$/.test(validUntil) ? validUntil : null,
+        documentDate,
+        validUntil,
         createdBy: Number(me.id),
       })
       .returning({ id: documents.id });
@@ -238,6 +249,36 @@ export async function createDocument(
 
     return created.id;
   });
+
+  const isTaken = (error: unknown) =>
+    isUniqueViolation(error, "documents_document_number_unique");
+
+  let documentId: number | null;
+  try {
+    documentId = await insertDocument();
+  } catch (error) {
+    if (!isTaken(error)) throw error;
+    if (manualNumber) {
+      // Номер вписали руками, и он занят: уникальный индекс не даёт двум
+      // документам один номер
+      documentId = null;
+    } else {
+      // Номер выдал счётчик, а чужой ручной документ успел занять его между
+      // чтением максимума и вставкой. Транзакция откатилась вместе с номером;
+      // второй заход видит уже занятое и берёт следующий. Ошибку у пустого
+      // поля номера человеку показывать нечего
+      try {
+        documentId = await insertDocument();
+      } catch (again) {
+        if (!isTaken(again)) throw again;
+        return { error: "Не удалось выдать номер документа. Нажмите «Создать» ещё раз" };
+      }
+    }
+  }
+
+  if (documentId === null) {
+    return { fieldErrors: { documentNumber: "Документ с таким номером уже есть" } };
+  }
 
   await audit("document.create", { type: "document", id: documentId }, { title, status });
 

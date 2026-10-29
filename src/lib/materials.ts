@@ -53,6 +53,8 @@ export const MOVEMENT_TYPE = {
 } as const;
 
 export const REFERENCE_TYPE = {
-  order: "По заказу",
+  order: "По заказу менеджера",
+  site_order: "По заказу с сайта",
+  purchase: "Приёмка закупки",
   manual: "Вручную",
 } as const;
