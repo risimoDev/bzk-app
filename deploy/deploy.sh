@@ -26,6 +26,10 @@ START_TIME=$(date +%s)
 # Переход в корень проекта (где лежит docker-compose.yml)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SELF="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+# Отпечаток версии скрипта, которую bash сейчас исполняет: после git pull
+# сравним с файлом на диске (см. шаг 2)
+SELF_SUM="$(cksum < "${SELF}")"
 cd "${ROOT_DIR}"
 
 log "Начало развёртывания в ${ROOT_DIR}..."
@@ -66,6 +70,14 @@ if [ -d .git ]; then
   git fetch origin "${BRANCH}"
   git checkout "${BRANCH}"
   git pull origin "${BRANCH}"
+  # Bash дочитывает скрипт из старого файла, даже если pull его заменил:
+  # без перезапуска выкладка шла бы по прошлой версии шагов (так новые
+  # шаги однажды запустились со старым образом tools). Повторный pull
+  # во второй версии ничего не тянет, DEPLOY_REEXEC не даёт зациклиться
+  if [ -z "${DEPLOY_REEXEC:-}" ] && [ "$(cksum < "${SELF}")" != "${SELF_SUM}" ]; then
+    log "deploy.sh обновился вместе с кодом - перезапуск новой версией..."
+    DEPLOY_REEXEC=1 exec bash "${SELF}" "${BRANCH}"
+  fi
   COMMIT_HASH=$(git rev-parse --short HEAD)
   COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
   log "Текущий коммит: ${COMMIT_HASH} - \"${COMMIT_MSG}\""
