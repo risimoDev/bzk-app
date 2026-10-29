@@ -11,6 +11,7 @@ import { purchaseStatusOf } from "@/lib/purchases";
 import { DeleteSupplierButton, SupplierForm } from "../SupplierForm";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
+import { isDadataEnabled } from "@/lib/dadata";
 
 export const metadata: Metadata = {
   title: "Подрядчик · Админка",
@@ -223,6 +224,7 @@ export default async function AdminSupplier({
             <h2 className="mb-4 font-display text-base text-ink">Карточка</h2>
             {canEdit ? (
               <SupplierForm
+                innLookup={isDadataEnabled()}
                 value={{
                   id: row.id,
                   name: row.name,

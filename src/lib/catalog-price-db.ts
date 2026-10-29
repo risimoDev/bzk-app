@@ -12,14 +12,18 @@ type PricedProduct = {
 };
 
 /**
- * Цены «от» для списка товаров одним запросом к ступеням тиража.
+ * Цены «от» и ступени тиража для списка товаров одним запросом.
  *
- * Ключ - id товара. Товара без базовой цены и без ступеней в карте нет:
- * витрина пишет для него «Цена по запросу».
+ * `from`: id товара -> цена за единицу при минимальном тираже. Товара без
+ * базовой цены и без ступеней в карте нет: витрина пишет для него «Цена по
+ * запросу». `tiers`: id товара -> ступени по возрастанию тиража; они нужны
+ * карточке каталога для переключателя тиража, который пересчитывает цену
+ * в браузере.
  */
-export async function fromPrices(items: PricedProduct[]) {
-  const result = new Map<number, number>();
-  if (items.length === 0) return result;
+export async function catalogPricing(items: PricedProduct[]) {
+  const from = new Map<number, number>();
+  const tiers = new Map<number, PriceTier[]>();
+  if (items.length === 0) return { from, tiers };
 
   const rows = await db
     .select({
@@ -32,21 +36,25 @@ export async function fromPrices(items: PricedProduct[]) {
     .where(inArray(productQuantityPrices.productId, items.map((i) => i.id)))
     .orderBy(asc(productQuantityPrices.minQty));
 
-  const byProduct = new Map<number, PriceTier[]>();
   for (const r of rows) {
-    const list = byProduct.get(r.productId) ?? [];
+    const list = tiers.get(r.productId) ?? [];
     list.push({ minQty: r.minQty, maxQty: r.maxQty, price: r.price });
-    byProduct.set(r.productId, list);
+    tiers.set(r.productId, list);
   }
 
   for (const item of items) {
     const price = fromUnitPrice({
       basePrice: item.basePrice ?? 0,
-      tiers: byProduct.get(item.id) ?? [],
+      tiers: tiers.get(item.id) ?? [],
       minQuantity: item.minQuantity,
       multiplicity: item.multiplicity,
     });
-    if (price > 0) result.set(item.id, price);
+    if (price > 0) from.set(item.id, price);
   }
-  return result;
+  return { from, tiers };
+}
+
+/** Только цены «от» - для списков, где ступени не нужны. */
+export async function fromPrices(items: PricedProduct[]) {
+  return (await catalogPricing(items)).from;
 }

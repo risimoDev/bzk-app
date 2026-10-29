@@ -29,6 +29,19 @@ import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
 import { EXTERNAL_PRODUCTION_STATUS } from "@/lib/external-orders";
 import { isOrderStatus } from "@/lib/order-status";
+import { isKeyOf } from "@/lib/guards";
+import { parseId } from "@/lib/ids";
+import { ITEM_CATEGORY, DEFAULT_ITEM_CATEGORY, type ItemCategory } from "@/lib/order-structure";
+import {
+  CONTRACTOR_STATUS,
+  isContractorStatus,
+  contractorTaskNumber,
+} from "@/lib/contractor-task";
+import {
+  ContractorTaskError,
+  changeContractorStatus,
+  markTaskSent,
+} from "@/lib/contractor-task-db";
 import { rejectOverlong } from "@/lib/text-limits";
 import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
@@ -233,6 +246,9 @@ type ParsedItem = {
   expenseAmount: string;
   isOutsourced: boolean;
   supplierId: number | null;
+  itemCategory: ItemCategory;
+  /** Срок сдачи подрядчиком; у своей работы его нет. */
+  contractorDueDate: Date | null;
 };
 
 /**
@@ -254,6 +270,8 @@ function parseItems(formData: FormData): { items: ParsedItem[]; error?: string }
   const unitExpenses = formData.getAll("itemUnitExpense");
   const outsourced = formData.getAll("itemOutsourced");
   const suppliers = formData.getAll("itemSupplierId");
+  const categories = formData.getAll("itemCategory");
+  const contractorDue = formData.getAll("itemContractorDue");
 
   const items: ParsedItem[] = [];
 
@@ -291,6 +309,21 @@ function parseItems(formData: FormData): { items: ParsedItem[]; error?: string }
       return { items: [], error: `Позиция ${i + 1}: перезаказ - выберите подрядчика` };
     }
 
+    // Нет поля - печать (форма старой версии); неизвестное значение - ошибка,
+    // а не молчаливая подмена
+    const rawCategory = String(categories[i] ?? "").trim();
+    if (rawCategory !== "" && !isKeyOf(ITEM_CATEGORY, rawCategory)) {
+      return { items: [], error: `Позиция ${i + 1}: неизвестный вид работ` };
+    }
+    const itemCategory: ItemCategory = rawCategory === "" ? DEFAULT_ITEM_CATEGORY : (rawCategory as ItemCategory);
+
+    // Непустая и невозможная дата - ошибка, а не «срока нет»
+    const rawDue = String(contractorDue[i] ?? "").trim();
+    const dueDay = rawDue === "" ? null : parseCalendarDate(rawDue);
+    if (rawDue !== "" && !dueDay) {
+      return { items: [], error: `Позиция ${i + 1}: у срока подрядчика такой даты нет в календаре` };
+    }
+
     items.push({
       productId,
       isCustom: productId === null,
@@ -301,6 +334,8 @@ function parseItems(formData: FormData): { items: ParsedItem[]; error?: string }
       expenseAmount: round2(unitExpense * quantity).toFixed(2),
       isOutsourced,
       supplierId: isOutsourced ? supplierId : null,
+      itemCategory,
+      contractorDueDate: isOutsourced && dueDay ? calendarDateAtNoon(dueDay) : null,
     });
   }
 
@@ -622,9 +657,32 @@ export async function saveExternalOrderItem(
       if (itemId === null) {
         await tx.insert(externalOrderItems).values({ ...item, externalOrderId: orderId });
       } else {
+        // Позицию передали другому подрядчику или забрали к себе - ход
+        // работы прежнего подрядчика к ней больше не относится
+        const [before] = await tx
+          .select({
+            isOutsourced: externalOrderItems.isOutsourced,
+            supplierId: externalOrderItems.supplierId,
+          })
+          .from(externalOrderItems)
+          .where(
+            and(
+              eq(externalOrderItems.id, itemId),
+              eq(externalOrderItems.externalOrderId, orderId),
+            ),
+          )
+          .limit(1)
+          .for("no key update");
+        const sameContractor =
+          before && before.isOutsourced === item.isOutsourced && before.supplierId === item.supplierId;
+
         const rows = await tx
           .update(externalOrderItems)
-          .set(item)
+          .set(
+            sameContractor
+              ? item
+              : { ...item, contractorStatus: "not_sent", contractorStatusAt: null },
+          )
           .where(
             and(
               eq(externalOrderItems.id, itemId),
@@ -655,6 +713,7 @@ export async function saveExternalOrderItem(
       itemId,
       price: item.price,
       outsourced: item.isOutsourced,
+      category: item.itemCategory,
       total: done.income.toFixed(2),
       paymentStatus: done.status,
     },
@@ -742,4 +801,80 @@ export async function deleteExternalOrder(
   revalidatePath("/admin/analytics");
   revalidatePath("/admin");
   redirect("/admin/external-orders");
+}
+
+// ------------------------------------------------- подрядчик на позиции
+
+const CONTRACTOR_DENIED: OrderFormState = { error: "Нет прав на изменение заказов" };
+
+/**
+ * Статус работы подрядчика на одной позиции.
+ *
+ * Деньги не задевает, поэтому пересчёта нет; но смена видна в журнале -
+ * по ней потом разбирают, кто и когда отметил «получено».
+ */
+export async function setContractorStatus(
+  _prev: OrderFormState,
+  formData: FormData,
+): Promise<OrderFormState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
+  if (!(await can("orders", "edit"))) return CONTRACTOR_DENIED;
+
+  const orderId = parseId(formData.get("orderId"));
+  const itemId = parseId(formData.get("itemId"));
+  const to = formData.get("contractorStatus");
+  if (orderId === null || itemId === null) return { error: "Позиция не найдена" };
+  if (!isContractorStatus(to)) return { error: "Неизвестный статус" };
+
+  let result: Awaited<ReturnType<typeof changeContractorStatus>>;
+  try {
+    result = await db.transaction((tx) => changeContractorStatus(tx, { orderId, itemId, to }));
+  } catch (e) {
+    if (e instanceof ContractorTaskError) return { error: e.message };
+    throw e;
+  }
+
+  if (!result.changed) return { ok: true, message: "Статус не изменился" };
+
+  await audit("external_order.contractor_status", { type: "external_order", id: orderId }, {
+    itemId,
+    from: result.from,
+    to,
+  });
+
+  revalidatePath(`/admin/external-orders/${orderId}`);
+  return { ok: true, message: CONTRACTOR_STATUS[to].label };
+}
+
+/**
+ * Задание отправлено подрядчику: все ещё не отправленные позиции этого
+ * подрядчика в заказе становятся «отправлено». Отдельная кнопка, а не
+ * побочный эффект открытия листа: печатная страница открывается и просто
+ * посмотреть, и по обновлению, и предзагрузкой.
+ */
+export async function markContractorTaskSent(
+  _prev: OrderFormState,
+  formData: FormData,
+): Promise<OrderFormState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
+  if (!(await can("orders", "edit"))) return CONTRACTOR_DENIED;
+
+  const orderId = parseId(formData.get("orderId"));
+  const supplierId = parseId(formData.get("supplierId"));
+  if (orderId === null || supplierId === null) return { error: "Задание не найдено" };
+
+  const ids = await db.transaction((tx) => markTaskSent(tx, { orderId, supplierId }));
+  if (ids.length === 0) return { ok: true, message: "Все позиции уже отмечены" };
+
+  await audit("external_order.contractor_sent", { type: "external_order", id: orderId }, {
+    task: contractorTaskNumber(orderId, supplierId),
+    itemIds: ids,
+  });
+
+  revalidatePath(`/admin/external-orders/${orderId}`);
+  return { ok: true, message: `Отмечено отправленным: ${ids.length}` };
 }

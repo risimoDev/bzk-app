@@ -40,6 +40,8 @@ const ACTION_LABEL: Record<string, string> = {
   "order.attach_counterparty": "Заказ привязан к контрагенту",
   "external_order.update": "Изменён заказ менеджера",
   "external_order.item_delete": "Удалена позиция заказа менеджера",
+  "external_order.contractor_status": "Сменён статус работы подрядчика",
+  "external_order.contractor_sent": "Задание отправлено подрядчику",
   "external_order.delete": "Удалён заказ менеджера",
   "finance.payment_add": "Добавлен платёж",
   "finance.payment_delete": "Удалён платёж",

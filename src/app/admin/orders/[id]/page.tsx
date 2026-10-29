@@ -32,6 +32,7 @@ import { paymentStateOf } from "@/lib/finance";
 import { debtOf } from "@/lib/order-money";
 import { ReturnWriteOffButton, WriteOffForm } from "@/app/admin/materials/WriteOffForm";
 import { activeMaterialOptions, listWriteOffs } from "@/lib/write-off-db";
+import { OrderDebtWarning } from "@/components/admin/OrderDebtWarning";
 
 export const metadata: Metadata = {
   title: "Заказ · Админка",
@@ -212,6 +213,9 @@ export default async function AdminOrder(props: PageProps<"/admin/orders/[id]">)
         </>
       }
     >
+      {/* Просроченный долг клиента: только предупреждение */}
+      <OrderDebtWarning source="site" userId={order.clientId} />
+
       <div className="grid gap-5 lg:grid-cols-[1fr_20rem] lg:items-start">
         {/* ---------- Состав ---------- */}
         <section>

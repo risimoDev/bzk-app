@@ -16,7 +16,8 @@ import { FavoriteButton } from "@/components/catalog/FavoriteButton";
 import { TapeLabel } from "@/components/ui/TapeLabel";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
-import { fromPrices } from "@/lib/catalog-price-db";
+import { catalogPricing } from "@/lib/catalog-price-db";
+import { CatalogPrice } from "@/components/catalog/CatalogPrice";
 
 /**
  * Заголовок и описание можно переопределить в админке: если для
@@ -43,7 +44,8 @@ function formatPrice(value: number | undefined) {
   return new Intl.NumberFormat("ru-RU", {
     style: "currency",
     currency: "RUB",
-    maximumFractionDigits: 0,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
   }).format(n);
 }
 
@@ -93,7 +95,7 @@ export default async function CatalogPage(props: PageProps<"/catalog">) {
   const activeId = parseId(raw) ?? undefined;
 
   const [items, cats] = await Promise.all([getCatalog(activeId), getCategories()]);
-  const prices = await fromPrices(items);
+  const { from: prices, tiers: tiersByProduct } = await catalogPricing(items);
   const active = cats.find((c) => c.id === activeId);
 
   return (
@@ -160,67 +162,83 @@ export default async function CatalogPage(props: PageProps<"/catalog">) {
             <ul className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
               {items.map((item) => {
                 const price = formatPrice(prices.get(item.id));
+                const tiers = tiersByProduct.get(item.id) ?? [];
                 return (
-                  <li key={item.id} className="relative">
+                  <li
+                    key={item.id}
+                    className="group relative flex flex-col overflow-hidden rounded-card border border-ink/10 bg-bone/85 transition-all duration-300 hover:-translate-y-1.5 hover:border-brand/40 hover:shadow-lift"
+                  >
                     <FavoriteButton
                       productId={item.id}
                       className="absolute right-3 top-3 z-10"
                     />
-                    <Link
-                      href={`/catalog/${item.id}`}
-                      className="group flex h-full flex-col overflow-hidden rounded-card border border-ink/10 bg-bone/85 transition-all duration-300 hover:-translate-y-1.5 hover:border-brand/40 hover:shadow-lift"
-                    >
-                      <div className="relative aspect-4/3 overflow-hidden bg-ice">
-                        <ProductImage
-                          src={catalogImageUrl(item)}
-                          alt={item.name}
-                          sizes="(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 33vw"
-                          className="transition-transform duration-500 group-hover:scale-105"
-                        />
-                        {item.isPopular && (
-                          <TapeLabel
-                            variant="brand"
-                            size="sm"
-                            tilt="left"
-                            className="absolute left-3 top-3 z-10"
-                          >
-                            Популярное
-                          </TapeLabel>
-                        )}
-                      </div>
+                    <div className="relative aspect-4/3 overflow-hidden bg-ice">
+                      <ProductImage
+                        src={catalogImageUrl(item)}
+                        alt=""
+                        sizes="(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 33vw"
+                        className="transition-transform duration-500 group-hover:scale-105"
+                      />
+                      {item.isPopular && (
+                        <TapeLabel
+                          variant="brand"
+                          size="sm"
+                          tilt="left"
+                          className="pointer-events-none absolute left-3 top-3 z-10"
+                        >
+                          Популярное
+                        </TapeLabel>
+                      )}
+                    </div>
 
-                      <div className="flex flex-1 flex-col p-5">
-                        {item.categoryName && (
-                          <span className="font-display text-[0.68rem] tracking-[0.16em] text-ink/40">
-                            {item.categoryName}
+                    <div className="flex flex-1 flex-col p-5">
+                      {item.categoryName && (
+                        <span className="font-display text-[0.68rem] tracking-[0.16em] text-ink/40">
+                          {item.categoryName}
+                        </span>
+                      )}
+                      <h2 className="mt-1.5 font-display text-lg leading-tight text-ink group-hover:text-brand">
+                        {/* «Растянутая» ссылка: ::after накрывает всю карточку,
+                            а кнопки тиража лежат над ней (z-10). Внутрь <a>
+                            кнопку не вложить, и клик по ней не должен
+                            открывать товар. */}
+                        <Link
+                          href={`/catalog/${item.id}`}
+                          className="after:absolute after:inset-0 after:z-0 after:rounded-card focus-visible:after:outline-2 focus-visible:after:-outline-offset-2 focus-visible:after:outline-brand-bright"
+                        >
+                          {item.name}
+                        </Link>
+                      </h2>
+                      {item.description && (
+                        <p className="mt-2 line-clamp-2 text-sm text-ink/55">
+                          {item.description}
+                        </p>
+                      )}
+                      <p className="mt-auto pt-4 font-mono text-lg text-ink">
+                        {tiers.length > 0 ? (
+                          <CatalogPrice
+                            unit={item.unit ?? "шт."}
+                            basePrice={item.basePrice}
+                            tiers={tiers}
+                            minQuantity={item.minQuantity}
+                            multiplicity={item.multiplicity}
+                          />
+                        ) : price ? (
+                          <>
+                            <span className="text-sm text-ink/45">от </span>
+                            {price}
+                            <span className="text-sm text-ink/45">
+                              {" "}
+                              / {item.unit ?? "шт."}
+                            </span>
+                          </>
+                        ) : (
+                          <span className="text-base text-ink/50">
+                            Цена по запросу
                           </span>
                         )}
-                        <h2 className="mt-1.5 font-display text-lg leading-tight text-ink group-hover:text-brand">
-                          {item.name}
-                        </h2>
-                        {item.description && (
-                          <p className="mt-2 line-clamp-2 text-sm text-ink/55">
-                            {item.description}
-                          </p>
-                        )}
-                        <p className="mt-auto pt-4 font-mono text-lg text-ink">
-                          {price ? (
-                            <>
-                              <span className="text-sm text-ink/45">от </span>
-                              {price}
-                              <span className="text-sm text-ink/45">
-                                {" "}
-                                / {item.unit ?? "шт."}
-                              </span>
-                            </>
-                          ) : (
-                            <span className="text-base text-ink/50">
-                              Цена по запросу
-                            </span>
-                          )}
-                        </p>
-                      </div>
-                    </Link>
+                      </p>
+                    </div>
                   </li>
                 );
               })}

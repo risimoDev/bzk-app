@@ -42,6 +42,15 @@ import {
   ReadyDateForm,
 } from "./OrderControls";
 import { DeleteItemButton, ItemForm } from "./ItemForm";
+import { ContractorSection, type ContractorGroup } from "./ContractorSection";
+import { OrderStructureTable } from "@/components/admin/OrderStructure";
+import {
+  ITEM_CATEGORY,
+  buildStructure,
+  itemCategoryOf,
+  sumByCategory,
+} from "@/lib/order-structure";
+import { groupBySupplier } from "@/lib/contractor-task";
 import { StartProductionForm } from "@/app/admin/production/ProductionForms";
 import { ReturnWriteOffButton, WriteOffForm } from "@/app/admin/materials/WriteOffForm";
 import { activeMaterialOptions, listWriteOffs } from "@/lib/write-off-db";
@@ -50,6 +59,7 @@ import { debtOf, externalOrderTotal } from "@/lib/order-money";
 import { DocumentsToggle } from "@/app/admin/orders/DocumentsToggle";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
+import { OrderDebtWarning } from "@/components/admin/OrderDebtWarning";
 
 export const metadata: Metadata = {
   title: "Внешний заказ · Админка",
@@ -125,6 +135,10 @@ export default async function AdminExternalOrder({
           isOutsourced: externalOrderItems.isOutsourced,
           supplierId: externalOrderItems.supplierId,
           supplierName: suppliers.name,
+          itemCategory: externalOrderItems.itemCategory,
+          contractorStatus: externalOrderItems.contractorStatus,
+          contractorStatusAt: externalOrderItems.contractorStatusAt,
+          contractorDueDate: externalOrderItems.contractorDueDate,
           productName: products.name,
           unit: products.unit,
         })
@@ -243,6 +257,36 @@ export default async function AdminExternalOrder({
   const adjustment = Number(order.adjustment);
   const debt = debtOf(total, paidSum);
 
+  // Структура заказа: итог берём сохранённый, корректировка - разница
+  // с суммой позиций, поэтому таблица сходится с итогом заказа всегда
+  const structure = buildStructure(
+    sumByCategory(items.map((i) => ({ category: i.itemCategory, price: i.price, expense: i.expense }))),
+    order.totalPrice,
+  );
+  // Название корректировки известно, пока она совпадает с сохранённой
+  const structureAdjustmentLabel =
+    (structure.adjustment < 0 ? "Скидка" : "Наценка") +
+    (order.adjustmentNote && Math.abs(structure.adjustment - adjustment) < 0.005
+      ? ` (${order.adjustmentNote})`
+      : " по заказу");
+
+  // Подрядчики: позиции с признаком перезаказа, по поставщикам
+  const contractorGroups: ContractorGroup[] = [...groupBySupplier(items)].map(
+    ([supplierId, list]) => ({
+      supplierId,
+      supplierName: list[0].supplierName ?? "Подрядчик",
+      items: list.map((i) => ({
+        id: i.id,
+        name: i.productName ?? i.itemName ?? "Без названия",
+        quantity: i.quantity,
+        unit: i.unit ?? "шт.",
+        status: i.contractorStatus,
+        statusAt: i.contractorStatusAt,
+        dueDate: i.contractorDueDate,
+      })),
+    }),
+  );
+
   // Итог пересчитывается из позиций и корректировки. Если он всё же
   // разошёлся (правили базу в обход приложения), это надо увидеть
   const mismatch = Math.abs(externalOrderTotal(itemsSum, adjustment) - total) > 0.01;
@@ -274,6 +318,8 @@ export default async function AdminExternalOrder({
         </>
       }
     >
+      <OrderDebtWarning source="external" clientId={order.clientId} clientName={order.clientName} />
+
       <div className="grid gap-5 lg:grid-cols-[1fr_20rem] lg:items-start">
         <div className="flex flex-col gap-5">
           {/* -------------------------------------------- состав */}
@@ -323,6 +369,11 @@ export default async function AdminExternalOrder({
                             {i.itemDescription && (
                               <span className="block text-xs text-ink/50">
                                 {i.itemDescription}
+                              </span>
+                            )}
+                            {itemCategoryOf(i.itemCategory) !== "print" && (
+                              <span className="mt-1 mr-1.5 inline-block rounded bg-ink/8 px-2 py-0.5 text-[0.68rem] text-ink/60">
+                                {ITEM_CATEGORY[itemCategoryOf(i.itemCategory)].label}
                               </span>
                             )}
                             {i.isOutsourced && (
@@ -376,6 +427,8 @@ export default async function AdminExternalOrder({
                                       expenseAmount: i.expense,
                                       isOutsourced: i.isOutsourced,
                                       supplierId: i.supplierId,
+                                      itemCategory: itemCategoryOf(i.itemCategory),
+                                      contractorDueDate: dateInputValue(i.contractorDueDate),
                                     }}
                                     productList={productList}
                                     suppliers={supplierList}
@@ -443,6 +496,30 @@ export default async function AdminExternalOrder({
               </div>
             )}
           </section>
+
+          {/* ------------------------------------ структура заказа */}
+          {items.length > 0 && (
+            <section className="overflow-hidden rounded-xl border border-ink/10 bg-bone">
+              <header className="border-b border-ink/10 px-5 py-3">
+                <h2 className="font-display text-base text-ink">Структура заказа</h2>
+                <p className="mt-0.5 text-xs text-ink/50">
+                  Расход - по себестоимости позиций; платежи и прочие расходы заказа в
+                  бухгалтерии сюда не входят.
+                </p>
+              </header>
+              <OrderStructureTable
+                structure={structure}
+                adjustmentLabel={structureAdjustmentLabel}
+              />
+            </section>
+          )}
+
+          {/* ------------------------------------------- подрядчики */}
+          <ContractorSection
+            orderId={order.id}
+            groups={contractorGroups}
+            canEdit={canEdit}
+          />
 
           {/* ------------------------------------------ шапка заказа */}
           {canEdit ? (

@@ -47,6 +47,8 @@ export const export1cLogExportTypeEnum = pgEnum("export_1c_log_export_type", ["o
 export const externalOrdersStatusEnum = pgEnum("external_orders_status", ["unpaid", "partial", "paid"]);
 export const externalOrdersProductionStatusEnum = pgEnum("external_orders_production_status", ["pending", "processing", "in_work", "ready", "delayed", "shipped", "delivered", "cancelled", "completed"]);
 export const externalOrderReadyHistoryChangeTypeEnum = pgEnum("external_order_ready_history_change_type", ["set", "prolong", "edit"]);
+export const externalOrderItemCategoryEnum = pgEnum("external_order_item_category", ["print", "structures", "design", "installation", "delivery", "other"]);
+export const externalOrderItemContractorStatusEnum = pgEnum("external_order_item_contractor_status", ["not_sent", "sent", "accepted", "shipped", "received"]);
 export const massMessagesMessageTypeEnum = pgEnum("mass_messages_message_type", ["email", "telegram", "both"]);
 export const massMessagesTargetAudienceEnum = pgEnum("mass_messages_target_audience", ["all", "customers", "admins", "managers", "specific"]);
 export const massMessagesStatusEnum = pgEnum("mass_messages_status", ["draft", "scheduled", "sending", "sent", "failed"]);
@@ -844,9 +846,28 @@ export const externalOrderItems = pgTable("external_order_items", {
   isOutsourced: boolean("is_outsourced").default(false).notNull(),
   /** У кого перезаказано. Тот же справочник, что и у закупок. */
   supplierId: integer("supplier_id").references(() => suppliers.id, { onDelete: "set null" }),
+  /**
+   * Вид работ для разреза «Структура заказа»: где заработали, а где
+   * только перепродали. У старых строк - печать.
+   */
+  itemCategory: externalOrderItemCategoryEnum("item_category").default("print").notNull(),
+  /**
+   * Где работа у подрядчика: не отправлено → отправлено → принято →
+   * отгружено к нам → получено. Только у перезаказанных позиций.
+   */
+  contractorStatus: externalOrderItemContractorStatusEnum("contractor_status").default("not_sent").notNull(),
+  /** Когда статус подрядчика менялся в последний раз. */
+  contractorStatusAt: timestamp("contractor_status_at", { withTimezone: true, mode: "date" }),
+  /**
+   * Срок, к которому подрядчик должен сдать работу нам. Отдельное поле, а
+   * не срок готовности заказа: тот обещан клиенту, а нам работа нужна
+   * раньше - на приёмку и отгрузку.
+   */
+  contractorDueDate: timestamp("contractor_due_date", { mode: "date" }),
 }, (t) => [
   index("external_order_items_external_order_id").on(t.externalOrderId),
   index("external_order_items_product_id").on(t.productId),
+  index("external_order_items_supplier_id").on(t.supplierId),
 ]);
 
 export const externalOrderReadyHistory = pgTable("external_order_ready_history", {
@@ -1155,6 +1176,13 @@ export const ordersAccounting = pgTable("orders_accounting", {
    * recalcOrderMoney по статусу самого заказа.
    */
   isCancelled: boolean("is_cancelled").default(false).notNull(),
+  /**
+   * Когда планировщик завёл задачу менеджеру по просроченному долгу этого
+   * заказа. Пусто - задачи не было. Одна задача на заказ: отметку ставит
+   * тот же UPDATE ... WHERE debt_task_at IS NULL, что и вставляет задачу
+   * (cron-db.ts), поэтому два прохода не заведут две.
+   */
+  debtTaskAt: timestamp("debt_task_at", { withTimezone: true, mode: "date" }),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).defaultNow().$onUpdate(() => new Date()),
 }, (t) => [

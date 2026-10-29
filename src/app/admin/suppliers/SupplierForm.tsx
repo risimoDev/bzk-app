@@ -8,6 +8,7 @@ import {
   type SupplierState,
 } from "@/app/actions/suppliers";
 import { cn } from "@/lib/cn";
+import { InnLookup } from "@/components/ui/InnLookup";
 
 const initial: SupplierState = {};
 
@@ -26,7 +27,14 @@ export type SupplierValues = {
 };
 
 /** Карточка подрядчика - она же форма заведения нового. */
-export function SupplierForm({ value }: { value?: SupplierValues }) {
+export function SupplierForm({
+  value,
+  innLookup = false,
+}: {
+  value?: SupplierValues;
+  /** Включена ли подсказка реквизитов по ИНН (задан ключ DaData). */
+  innLookup?: boolean;
+}) {
   const [state, action, pending] = useActionState(saveSupplier, initial);
   const err = state.fieldErrors ?? {};
 
@@ -35,6 +43,17 @@ export function SupplierForm({ value }: { value?: SupplierValues }) {
       {value && <input type="hidden" name="id" value={value.id} />}
 
       <div className="grid gap-4 sm:grid-cols-2">
+        {/* У подрядчика ИНН не хранится: поле для поиска своё и не отправляется */}
+        {innLookup && (
+          <InnLookup
+            className="sm:col-span-2"
+            targets={[
+              { name: "name", label: "Название", value: (p) => p.shortName },
+              { name: "address", label: "Адрес", value: (p) => p.address },
+            ]}
+          />
+        )}
+
         <Field label="НАЗВАНИЕ" error={err.name} span>
           <input
             name="name"

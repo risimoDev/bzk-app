@@ -9,6 +9,7 @@ import { PageHero } from "@/components/site/PageHero";
 import { isTelegramConfigured, getBotInfo } from "@/lib/telegram";
 import { LINK_CODE_TTL_MINUTES } from "@/lib/telegram-link";
 import { TelegramLink } from "@/components/client/TelegramLink";
+import { isDadataEnabled } from "@/lib/dadata";
 import { ProfileForm } from "./ProfileForm";
 import { NotificationsForm } from "./NotificationsForm";
 import { PasswordForm } from "./PasswordForm";
@@ -53,6 +54,7 @@ export default async function ClientSettingsPage() {
         <Container>
           <div className="mx-auto flex max-w-3xl flex-col gap-6">
             <ProfileForm
+              innLookup={isDadataEnabled()}
               profile={{
                 name: row.name,
                 email: row.email,

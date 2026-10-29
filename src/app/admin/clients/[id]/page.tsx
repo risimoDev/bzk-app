@@ -13,6 +13,8 @@ import { setBlocked, setEditorAccess, setWarehouseAccess } from "../actions";
 import { ResetLinkButton } from "./ResetLinkButton";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
+import { PartyDebtsPanel } from "@/components/admin/PartyDebtsPanel";
+import { partyKeyForUser } from "@/lib/debts-db";
 
 export const metadata: Metadata = {
   title: "Клиент · Админка",
@@ -83,6 +85,8 @@ export default async function AdminClient(
   const manageable =
     (await can("users", "manage")) && !(client.role === "admin" && me?.role !== "admin");
   const isSelf = me != null && Number(me.id) === client.id;
+  // Долги и акт сверки только у клиентов; привязан контрагент - расчёты идут под ним
+  const debtParty = client.role === "user" ? await partyKeyForUser(client.id) : null;
 
   return (
     <AdminPage
@@ -178,6 +182,8 @@ export default async function AdminClient(
         </section>
 
         <aside className="flex flex-col gap-4">
+          {debtParty && <PartyDebtsPanel partyKey={debtParty} />}
+
           <div className="rounded-xl border border-ink/10 bg-bone p-5">
             <p className="font-display text-[0.62rem] tracking-[0.18em] text-ink/40">
               Контакты

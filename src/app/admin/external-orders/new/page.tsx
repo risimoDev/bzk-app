@@ -7,6 +7,7 @@ import { clients, products, suppliers } from "@/db/schema";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import { OrderForm } from "./OrderForm";
+import { overdueDebtByCounterparty } from "@/lib/debts-db";
 
 export const metadata: Metadata = {
   title: "Новый заказ · Админка",
@@ -32,6 +33,9 @@ export default async function NewExternalOrder({
   const rawClient = Number(Array.isArray(sp.client) ? sp.client[0] : sp.client);
   const defaultClientId =
     Number.isInteger(rawClient) && rawClient > 0 ? rawClient : undefined;
+
+  // Контрагенты с долгом старше 15 дней: форма предупредит, когда такого выберут
+  const [debtWarnings, canFinance] = await Promise.all([overdueDebtByCounterparty(), can("finance", "view")]);
 
   const [counterparties, productList, supplierList] = await Promise.all([
     db
@@ -82,6 +86,8 @@ export default async function NewExternalOrder({
         productList={productList}
         suppliers={supplierList}
         defaultClientId={defaultClientId}
+        debtWarnings={debtWarnings}
+        debtHref={canFinance ? "/admin/finance/debts" : undefined}
       />
     </AdminPage>
   );

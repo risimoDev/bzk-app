@@ -11,6 +11,7 @@ import {
 import type { ProductOption, SupplierOption } from "../new/OrderForm";
 import { cn } from "@/lib/cn";
 import { adminInputOnPaperClass, adminLabelClass } from "@/components/ui/form-classes";
+import { ITEM_CATEGORY, ITEM_CATEGORY_ORDER, type ItemCategory } from "@/lib/order-structure";
 
 const initial: OrderFormState = {};
 
@@ -25,6 +26,9 @@ export type ItemValues = {
   expenseAmount: string;
   isOutsourced: boolean;
   supplierId: number | null;
+  itemCategory: ItemCategory;
+  /** Срок подрядчику, «ГГГГ-ММ-ДД» для поля даты; пусто - не назначен. */
+  contractorDueDate: string;
 };
 
 const money = new Intl.NumberFormat("ru-RU", {
@@ -77,6 +81,7 @@ export function ItemForm({
   const [supplierId, setSupplierId] = useState(
     value?.supplierId ? String(value.supplierId) : "",
   );
+  const [category, setCategory] = useState<ItemCategory>(value?.itemCategory ?? "print");
 
   const pickProduct = (v: string) => {
     setProductId(v);
@@ -135,6 +140,39 @@ export function ItemForm({
             maxLength={2000}
             placeholder="Материал, размер, что важно не забыть"
             className={inputClass}
+          />
+          {outsourced && (
+            <span className="text-xs text-warn">
+              Эти подробности попадут в задание подрядчику - данные клиента сюда не вписывайте.
+            </span>
+          )}
+        </label>
+
+        <label className="flex flex-col gap-1.5">
+          <span className={labelClass}>ВИД РАБОТ</span>
+          <select
+            name="itemCategory"
+            value={category}
+            onChange={(e) => setCategory(e.target.value as ItemCategory)}
+            className={inputClass}
+          >
+            {ITEM_CATEGORY_ORDER.map((c) => (
+              <option key={c} value={c}>
+                {ITEM_CATEGORY[c].label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* Поле всегда в форме, но прячется у своей работы: пустое значение
+            уходит на сервер и обнуляется там */}
+        <label className={cn("flex flex-col gap-1.5", !outsourced && "hidden")}>
+          <span className={labelClass}>СРОК ПОДРЯДЧИКУ</span>
+          <input
+            type="date"
+            name="itemContractorDue"
+            defaultValue={value?.contractorDueDate ?? ""}
+            className={cn(inputClass, "font-mono")}
           />
         </label>
 

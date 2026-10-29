@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { and, desc, sql, count, eq } from "drizzle-orm";
-import { TrendingUp, Users, Package, Repeat } from "lucide-react";
+import { TrendingUp, Users, Package, Repeat, Layers } from "lucide-react";
 import { db } from "@/db";
 import { ordersAccounting, externalOrders } from "@/db/schema";
 import { AdminPage, AdminEmpty, AdminStat } from "@/components/admin/AdminPage";
@@ -16,6 +16,8 @@ import {
   type MonthPoint,
 } from "@/lib/analytics";
 import { openDebt } from "@/lib/order-money-db";
+import { OrderStructureTable } from "@/components/admin/OrderStructure";
+import { ITEM_CATEGORY_ORDER as ORDER, buildStructure, itemCategoryOf } from "@/lib/order-structure";
 import { cn } from "@/lib/cn";
 
 export const metadata: Metadata = {
@@ -54,7 +56,16 @@ export default async function AdminAnalytics() {
   // ним не будет, а раньше они раздували и выручку, и средний чек
   const active = eq(ordersAccounting.isCancelled, false);
 
-  const [byMonth, totals, byClient, byItem, repeatRows, readyTimes, debt] = await Promise.all([
+  // Заказы менеджера за те же 12 месяцев, что и столбики выше, без отменённых.
+  // Дата - по часовому поясу мастерской, как у месяцев
+  const extLocalCreated = sql`(${externalOrders.createdAt} at time zone ${sql.raw(`'${REPORT_TZ}'`)})`;
+  const extPeriod = and(
+    sql`${externalOrders.productionStatus} <> 'cancelled'`,
+    sql`${extLocalCreated} >= ${`${months[0]}-01`}::timestamp`,
+  );
+
+  const [byMonth, totals, byClient, byItem, repeatRows, readyTimes, debt, byCategory, categoryTotals] =
+    await Promise.all([
     db
       .select({
         month: monthKey,
@@ -154,6 +165,28 @@ export default async function AdminAnalytics() {
       .from(externalOrders)
       .where(sql`${externalOrders.estimatedReadyDate} is not null`),
     openDebt(),
+    // Выручка и расход по видам работ: позиции заказов менеджера. У сайтовых
+    // заказов вида работ нет, поэтому они сюда не входят
+    db.execute<{ category: string; revenue: string; expense: string; items: string }>(sql`
+      select i.item_category as category,
+             sum(i.price) as revenue,
+             sum(i.expense_amount) as expense,
+             count(*) as items
+      from external_order_items i
+      join external_orders o on o.id = i.external_order_id
+      where o.production_status <> 'cancelled'
+        and (o.created_at at time zone ${sql.raw(`'${REPORT_TZ}'`)}) >= ${`${months[0]}-01`}::timestamp
+      group by i.item_category
+    `),
+    // Итог тех же заказов: разница с суммой позиций - корректировки и заказы
+    // без позиций (описанные текстом), они идут отдельной строкой
+    db
+      .select({
+        total: sql<string>`coalesce(sum(${externalOrders.totalPrice}), 0)`,
+        orders: count(),
+      })
+      .from(externalOrders)
+      .where(extPeriod),
   ]);
 
   const monthMap = new Map(byMonth.map((r) => [r.month, r]));
@@ -185,6 +218,20 @@ export default async function AdminAnalytics() {
   const repeat = clientsRows.filter((r) => Number(r.orders) > 1);
   const repeatShare =
     clientsRows.length > 0 ? Math.round((repeat.length / clientsRows.length) * 100) : 0;
+
+  const categoryStructure = buildStructure(
+    byCategory.rows.map((r) => ({
+      category: itemCategoryOf(r.category),
+      count: Number(r.items),
+      revenue: Number(r.revenue),
+      expense: Number(r.expense),
+    })),
+    categoryTotals[0]?.total ?? 0,
+  );
+  // Порядок строк - как в форме позиции, а не как отдал group by
+  categoryStructure.rows.sort(
+    (a, b) => ORDER.indexOf(a.category) - ORDER.indexOf(b.category),
+  );
 
   const days = readyTimes
     .map((r) => Number(r.days))
@@ -343,6 +390,28 @@ export default async function AdminAnalytics() {
           </>
         )}
       </section>
+
+      {/* ------------------------------------ структура по видам работ */}
+      {categoryStructure.rows.length > 0 && (
+        <section className="mt-8">
+          <h2 className="flex items-center gap-2.5 font-display text-lg text-ink">
+            <Layers className="size-5 text-brand" aria-hidden />
+            Структура заказов менеджера
+          </h2>
+          <p className="mt-1 max-w-3xl text-xs text-ink/45">
+            За последние {MONTHS_SHOWN} месяцев, без отменённых. Расход - себестоимость
+            позиций; общие расходы и налог сюда не входят, поэтому маржа выше прибыли в
+            таблице по месяцам. Заказы с сайта не делятся по видам работ и не учтены.
+          </p>
+          <div className="mt-4 overflow-hidden rounded-xl border border-ink/10 bg-bone">
+            <OrderStructureTable
+              structure={categoryStructure}
+              adjustmentLabel="Скидки и наценки заказов, заказы без позиций"
+              totalLabel="Итого по заказам менеджера"
+            />
+          </div>
+        </section>
+      )}
 
       {/* -------------------------------------------------- клиенты */}
       <section className="mt-8 grid gap-5 lg:grid-cols-2">

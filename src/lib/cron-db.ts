@@ -1,13 +1,23 @@
 import "server-only";
 import { and, asc, eq, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { crmLeads, crmReminders, rateLimits, tasks, telegramLinkCodes, users } from "@/db/schema";
+import {
+  crmLeads,
+  crmReminders,
+  ordersAccounting,
+  rateLimits,
+  tasks,
+  telegramLinkCodes,
+  users,
+} from "@/db/schema";
 import { deliverUser } from "@/lib/notify";
 import { EVENTS } from "@/lib/notify-events";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
 import { LIMITS, checkRateLimit, recordAttempt } from "@/lib/rate-limit";
 import { TIMEZONE } from "@/lib/dates";
+import { DEBT_TASK_DUE_DAYS, isDebtTaskDue } from "@/lib/debts";
+import { loadDebtOrders } from "@/lib/debts-db";
 import {
   BATCH_LIMIT,
   TASK_FINISHED,
@@ -205,6 +215,84 @@ async function notifyTaskDeadlines(now: Date): Promise<number> {
   return handled;
 }
 
+const rubles = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 2 });
+const dayFmt = new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: TIMEZONE });
+
+/**
+ * Задача менеджеру по заказу, долг по которому перешёл порог (6 дней с
+ * готовности). Один раз на заказ: отметка `orders_accounting.debt_task_at`
+ * ставится тем же UPDATE ... WHERE debt_task_at IS NULL, что и пускает
+ * вставку задачи, поэтому два прохода не заведут две.
+ *
+ * Исполнитель - ответственный за заказ, если он действующий сотрудник
+ * (назначенный в чате, запустивший в цех или последним работавший с
+ * заказом). Иначе задача без исполнителя: список задач общий, и отдавать
+ * её случайному человеку, который о заказе ничего не знает, не стоит.
+ * Автор задачи - первый действующий администратор (`created_by`
+ * обязателен). Клиенту ничего не отправляется. Уведомления при создании
+ * задача не шлёт, как и обычная; срок в несколько дней нужен затем, чтобы
+ * существующий механизм сроков задач напомнил исполнителю сам.
+ *
+ * `onlyCardIds` сужает проход (проверочный скрипт: на dev-базе с живыми
+ * данными чужие заказы не трогаем).
+ */
+export async function createDebtTasks(
+  now: Date,
+  opts: { onlyCardIds?: readonly number[] } = {},
+): Promise<number> {
+  const due = (await loadDebtOrders({ now }))
+    .filter((d) => isDebtTaskDue(d))
+    .filter((d) => !opts.onlyCardIds || opts.onlyCardIds.includes(d.cardId))
+    .slice(0, BATCH_LIMIT);
+  if (due.length === 0) return 0;
+
+  const [author] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(inArray(users.role, ["admin", "manager"]), eq(users.isBlocked, false)))
+    .orderBy(sql`(${users.role} = 'admin') desc`, asc(users.id))
+    .limit(1);
+  if (!author) {
+    console.warn("[cron] debt-tasks: нет действующих сотрудников, задачи не заведены");
+    return 0;
+  }
+
+  let created = 0;
+  for (const d of due) {
+    const dueDate = new Date(now.getTime() + DEBT_TASK_DUE_DAYS * 24 * 3600_000);
+    await db.transaction(async (tx) => {
+      const marked = await tx
+        .update(ordersAccounting)
+        .set({ debtTaskAt: sql`now()` })
+        .where(
+          and(
+            eq(ordersAccounting.id, d.cardId),
+            isNull(ordersAccounting.debtTaskAt),
+            eq(ordersAccounting.isCancelled, false),
+          ),
+        )
+        .returning({ id: ordersAccounting.id });
+      if (marked.length === 0) return;
+
+      await tx.insert(tasks).values({
+        title: `Долг по заказу № ${d.number}${d.source === "external" ? " (менеджера)" : " (с сайта)"}: ${rubles.format(d.debt)}`,
+        description:
+          `Клиент: ${d.partyName}. Долг ${rubles.format(d.debt)} при сумме заказа ${rubles.format(d.income)} ` +
+          `(оплачено ${rubles.format(d.paid)}). Заказ готов с ${dayFmt.format(d.since as Date)}, ` +
+          `${d.ageDays} дн. без полной оплаты. Свяжитесь с клиентом и уточните срок оплаты. ` +
+          `Клиенту автоматически ничего не отправлялось.`,
+        assignedTo: d.responsibleId,
+        createdBy: author.id,
+        priority: "medium",
+        dueDate,
+        relatedOrderAccountingId: d.cardId,
+      });
+      created++;
+    });
+  }
+  return created;
+}
+
 /** Журнал лимитов растёт с каждой попыткой входа; старые записи не нужны. */
 export async function cleanRateLimits(now: Date): Promise<number> {
   const longest = Math.max(...Object.values(LIMITS).map((l) => l.window));
@@ -240,6 +328,7 @@ export async function runCron(now: Date = new Date()): Promise<CronReport> {
     const report: CronTaskReport[] = [];
     report.push(await runTask("crm-reminders", () => notifyReminders(now)));
     report.push(await runTask("task-deadlines", () => notifyTaskDeadlines(now)));
+    report.push(await runTask("debt-tasks", () => createDebtTasks(now)));
     report.push(await runTask("rate-limits-cleanup", () => cleanRateLimits(now)));
     report.push(await runTask("telegram-link-codes-cleanup", () => cleanTelegramLinkCodes(now)));
     return { ran: true as const, tasks: report };

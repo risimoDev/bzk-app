@@ -3,6 +3,7 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
+import { isDadataEnabled } from "@/lib/dadata";
 import { SupplierForm } from "../SupplierForm";
 
 export const metadata: Metadata = {
@@ -37,7 +38,7 @@ export default async function NewSupplier() {
       }
     >
       <section className="max-w-3xl rounded-xl border border-ink/10 bg-bone p-5 sm:p-6">
-        <SupplierForm />
+        <SupplierForm innLookup={isDadataEnabled()} />
       </section>
     </AdminPage>
   );

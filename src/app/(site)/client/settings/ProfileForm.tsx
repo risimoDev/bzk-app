@@ -5,6 +5,7 @@ import { Check, TriangleAlert } from "lucide-react";
 import { updateProfile, type ActionState } from "@/app/actions/client";
 import { cn } from "@/lib/cn";
 import { siteInputClass } from "@/components/ui/form-classes";
+import { InnLookup } from "@/components/ui/InnLookup";
 
 const initial: ActionState = { ok: false };
 
@@ -28,7 +29,14 @@ export type Profile = {
  * юрлица»: физлицу эти поля не нужны, а пустой ИНН в форме выглядит как
  * недоделанная анкета.
  */
-export function ProfileForm({ profile }: { profile: Profile }) {
+export function ProfileForm({
+  profile,
+  innLookup = false,
+}: {
+  profile: Profile;
+  /** Включена ли подсказка реквизитов по ИНН (задан ключ DaData). */
+  innLookup?: boolean;
+}) {
   const [state, action, pending] = useActionState(updateProfile, initial);
   const [corporate, setCorporate] = useState(profile.isCorporate);
 
@@ -136,6 +144,19 @@ export function ProfileForm({ profile }: { profile: Profile }) {
               className={cn(inputClass, "font-mono tabular-nums")}
             />
           </Field>
+
+          {innLookup && (
+            <InnLookup
+              variant="site"
+              innName="inn"
+              className="sm:col-span-2"
+              targets={[
+                { name: "companyName", label: "Название организации", value: (p) => p.shortName },
+                { name: "kpp", label: "КПП", value: (p) => p.kpp },
+                { name: "legalAddress", label: "Юридический адрес", value: (p) => p.address },
+              ]}
+            />
+          )}
 
           <Field label="Юридический адрес" htmlFor="legalAddress" wide>
             <textarea

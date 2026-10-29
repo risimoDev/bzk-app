@@ -15,6 +15,8 @@ import { CounterpartyForm } from "../CounterpartyForm";
 import { ArchiveButton, LinkAccountForm } from "./LinkControls";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
+import { PartyDebtsPanel } from "@/components/admin/PartyDebtsPanel";
+import { isDadataEnabled } from "@/lib/dadata";
 
 export const metadata: Metadata = {
   title: "Контрагент · Админка",
@@ -135,6 +137,7 @@ export default async function AdminCounterparty({
         <div className="flex flex-col gap-5">
           {canEdit ? (
             <CounterpartyForm
+              innLookup={isDadataEnabled()}
               value={{
                 id: row.id,
                 name: row.name,
@@ -222,6 +225,8 @@ export default async function AdminCounterparty({
         </div>
 
         <aside className="flex flex-col gap-5">
+          <PartyDebtsPanel partyKey={`c:${row.id}`} />
+
           <div className="rounded-xl border border-ink/10 bg-bone p-5">
             <h2 className="font-display text-[0.62rem] tracking-[0.18em] text-ink/40">
               КАБИНЕТ НА САЙТЕ

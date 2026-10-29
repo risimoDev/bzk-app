@@ -142,15 +142,26 @@ check("упавшая задача не роняет вызывающего", tr
 
 // ------------------------------------------------------- с базой
 
-const { eq, like } = await import("drizzle-orm");
+const { and, eq, inArray, like } = await import("drizzle-orm");
 const { db } = await import("@/db");
-const { crmReminders, rateLimits, tasks, telegramLinkCodes, users } = await import("@/db/schema");
+const { auditLog, crmReminders, externalOrders, orderPayments, ordersAccounting, rateLimits, tasks, telegramLinkCodes, users } = await import("@/db/schema");
 const cron = await import("../src/lib/cron-db.ts");
 
 const MARK = "proverka-cron@example.invalid";
+const DEBT_MARK = "Проверка планировщика (долг)";
 let userId = null;
 
 async function cleanup() {
+  // Заказы и карточки для задачи по долгу: задачи, платежи, журнал, потом заказы
+  const debtOrders = await db.select({ id: externalOrders.id }).from(externalOrders).where(eq(externalOrders.clientName, DEBT_MARK));
+  if (debtOrders.length > 0) {
+    const ids = debtOrders.map((o) => o.id);
+    const cards = await db.select({ id: ordersAccounting.id }).from(ordersAccounting).where(inArray(ordersAccounting.externalOrderId, ids));
+    if (cards.length > 0) await db.delete(tasks).where(inArray(tasks.relatedOrderAccountingId, cards.map((c) => c.id)));
+    await db.delete(auditLog).where(and(eq(auditLog.entityType, "external_order"), inArray(auditLog.entityId, ids)));
+    await db.delete(ordersAccounting).where(inArray(ordersAccounting.externalOrderId, ids));
+    await db.delete(externalOrders).where(inArray(externalOrders.id, ids));
+  }
   if (userId !== null) {
     await db.delete(crmReminders).where(eq(crmReminders.assignedTo, userId));
     await db.delete(tasks).where(eq(tasks.createdBy, userId));
@@ -262,6 +273,62 @@ try {
     .where(eq(telegramLinkCodes.userId, userId));
   check("просроченный код привязки убран", !codes.some((c) => c.hash.startsWith("check-cron-expired")));
   check("действующий код остался", codes.some((c) => c.hash.startsWith("check-cron-alive")));
+
+  // Задача по долгу (без отправок: createDebtTasks ничего не рассылает).
+  // Проход сужен до своих карточек, чтобы не тронуть живые заказы dev-базы
+  const debtNow = new Date();
+  const ago = (days) => new Date(debtNow.getTime() - days * DAY);
+  const mkDebtOrder = async (income, readyDaysAgo) => {
+    const [o] = await db
+      .insert(externalOrders)
+      .values({ clientName: DEBT_MARK, productionStatus: "completed", totalPrice: String(income), createdAt: ago(30) })
+      .returning({ id: externalOrders.id });
+    const [c] = await db
+      .insert(ordersAccounting)
+      .values({ source: "external", externalOrderId: o.id, clientName: DEBT_MARK, income: String(income) })
+      .returning({ id: ordersAccounting.id });
+    if (readyDaysAgo !== null) {
+      await db.insert(auditLog).values({
+        userId,
+        action: "external_order.production_status",
+        entityType: "external_order",
+        entityId: o.id,
+        details: { from: "in_work", to: "ready" },
+        createdAt: ago(readyDaysAgo),
+      });
+    }
+    return { orderId: o.id, cardId: c.id };
+  };
+  const dOld = await mkDebtOrder(900, 7); // готов 7 дней назад - порог (6) пройден
+  const dFresh = await mkDebtOrder(300, 2); // готов 2 дня назад - рано
+  const dGuess = await mkDebtOrder(500, null); // записи о готовности нет - дата приблизительная
+  const debtCards = [dOld.cardId, dFresh.cardId, dGuess.cardId];
+
+  const made = await cron.createDebtTasks(debtNow, { onlyCardIds: debtCards });
+  check("задача по долгу заведена одна: только заказ со знакомой датой после порога", made === 1, String(made));
+  let debtTasks = await db.select().from(tasks).where(inArray(tasks.relatedOrderAccountingId, debtCards));
+  check(
+    "задача привязана к карточке заказа, срок задан, клиенту ничего не отправлено",
+    debtTasks.length === 1 && debtTasks[0].relatedOrderAccountingId === dOld.cardId && debtTasks[0].dueDate !== null,
+  );
+  check("исполнитель - сотрудник, работавший с заказом", debtTasks[0]?.assignedTo === userId);
+  check("в названии номер заказа и сумма долга", /№ \d+-М/.test(debtTasks[0]?.title ?? "") && /900/.test(debtTasks[0]?.title ?? ""));
+  const [markedCard] = await db.select({ at: ordersAccounting.debtTaskAt }).from(ordersAccounting).where(eq(ordersAccounting.id, dOld.cardId));
+  check("на карточке стоит отметка в базе", markedCard.at !== null);
+
+  const again = await cron.createDebtTasks(debtNow, { onlyCardIds: debtCards });
+  debtTasks = await db.select().from(tasks).where(inArray(tasks.relatedOrderAccountingId, debtCards));
+  check("повторный проход ничего не заводит (идемпотентно)", again === 0 && debtTasks.length === 1);
+
+  // Заказ дошёл до порога позже: задача заводится, когда это случилось
+  await db.update(auditLog).set({ createdAt: ago(6) }).where(eq(auditLog.entityId, dFresh.orderId));
+  const later = await cron.createDebtTasks(debtNow, { onlyCardIds: debtCards });
+  check("перешёл порог - задача заведена, у первого заказа не удвоилась", later === 1);
+
+  // Оплаченный заказ задачу не получает
+  const dPaid = await mkDebtOrder(100, 10);
+  await db.insert(orderPayments).values({ orderAccountingId: dPaid.cardId, amount: "100" });
+  check("оплаченный заказ задачу не получает", (await cron.createDebtTasks(debtNow, { onlyCardIds: [dPaid.cardId] })) === 0);
 
   // Блокировка: пока другое соединение держит её, проход не начинается
   const lockClient = await db.$client.connect();

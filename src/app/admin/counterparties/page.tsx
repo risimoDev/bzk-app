@@ -6,6 +6,7 @@ import { db } from "@/db";
 import { clients, externalOrders, users } from "@/db/schema";
 import { AdminPage, AdminEmpty, AdminStat } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
+import { isDadataEnabled } from "@/lib/dadata";
 import { CounterpartyForm } from "./CounterpartyForm";
 import { cn } from "@/lib/cn";
 
@@ -164,7 +165,7 @@ export default async function AdminCounterparties({
 
       {canEdit && !showArchived && (
         <div className="mt-6">
-          <CounterpartyForm />
+          <CounterpartyForm innLookup={isDadataEnabled()} />
         </div>
       )}
 

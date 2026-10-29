@@ -80,6 +80,8 @@ services:
       # Секрет маршрута планировщика (POST /api/cron/run). Пустой - маршрут
       # отвечает 404, напоминания и сроки задач не рассылаются
       CRON_SECRET: ${CRON_SECRET:-}
+      # Ключ DaData для подсказки реквизитов по ИНН. Пустой - подсказка выключена
+      DADATA_API_KEY: ${DADATA_API_KEY:-}
       UPLOAD_DIR: /app/storage/uploads
       # Пояс компании: от него зависят календарные даты поставки и готовности
       TZ: Asia/Yekaterinburg

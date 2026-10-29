@@ -9,7 +9,9 @@ import {
 import { externalOrderTotal } from "@/lib/order-money";
 import { counterpartyLabel } from "@/lib/counterparties";
 import { cn } from "@/lib/cn";
+import { DebtWarning } from "@/components/admin/DebtWarning";
 import { adminInputClass, adminLabelClass } from "@/components/ui/form-classes";
+import { ITEM_CATEGORY, ITEM_CATEGORY_ORDER, type ItemCategory } from "@/lib/order-structure";
 
 const initial: OrderFormState = {};
 
@@ -41,6 +43,8 @@ type Row = {
   unitExpense: string;
   outsourced: boolean;
   supplierId: string;
+  category: ItemCategory;
+  contractorDue: string;
 };
 
 const emptyRow = (key: number): Row => ({
@@ -53,6 +57,8 @@ const emptyRow = (key: number): Row => ({
   unitExpense: "",
   outsourced: false,
   supplierId: "",
+  category: "print",
+  contractorDue: "",
 });
 
 const money = new Intl.NumberFormat("ru-RU", {
@@ -78,11 +84,17 @@ export function OrderForm({
   productList,
   suppliers,
   defaultClientId,
+  debtWarnings,
+  debtHref,
 }: {
   counterparties: CounterpartyOption[];
   productList: ProductOption[];
   suppliers: SupplierOption[];
   defaultClientId?: number;
+  /** Просроченный долг 15+ дней по контрагентам (id -> заказов, сумма). Только предупреждение. */
+  debtWarnings?: Record<number, { n: number; sum: number }>;
+  /** Ссылка на страницу долгов; нет права смотреть финансы - нет и ссылки. */
+  debtHref?: string;
 }) {
   const [state, action, pending] = useActionState(createExternalOrder, initial);
 
@@ -169,6 +181,7 @@ export function OrderForm({
               {state.fieldErrors?.clientId && (
                 <span className="text-xs text-danger">{state.fieldErrors.clientId}</span>
               )}
+              <DebtWarning info={clientId ? debtWarnings?.[Number(clientId)] : null} href={debtHref} className="mt-1.5" />
             </label>
           ) : (
             <label className="flex flex-col gap-1.5 sm:col-span-2">
@@ -292,6 +305,41 @@ export function OrderForm({
                     maxLength={2000}
                     placeholder="Материал, размер, что важно не забыть"
                     className={inputClass}
+                  />
+                  {row.outsourced && (
+                    <span className="text-xs text-warn">
+                      Эти подробности попадут в задание подрядчику - данные клиента сюда не
+                      вписывайте.
+                    </span>
+                  )}
+                </label>
+
+                <label className="flex flex-col gap-1.5">
+                  <span className={labelClass}>ВИД РАБОТ</span>
+                  <select
+                    name="itemCategory"
+                    value={row.category}
+                    onChange={(e) => patch(row.key, { category: e.target.value as ItemCategory })}
+                    className={inputClass}
+                  >
+                    {ITEM_CATEGORY_ORDER.map((c) => (
+                      <option key={c} value={c}>
+                        {ITEM_CATEGORY[c].label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                {/* Поле всегда в форме: значения позиций едут списками одной
+                    длины. У своей работы оно скрыто, сервер его обнуляет */}
+                <label className={cn("flex flex-col gap-1.5", !row.outsourced && "hidden")}>
+                  <span className={labelClass}>СРОК ПОДРЯДЧИКУ</span>
+                  <input
+                    type="date"
+                    name="itemContractorDue"
+                    value={row.contractorDue}
+                    onChange={(e) => patch(row.key, { contractorDue: e.target.value })}
+                    className={cn(inputClass, "font-mono")}
                   />
                 </label>
 

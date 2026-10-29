@@ -8,6 +8,7 @@ import {
 } from "@/app/actions/counterparties";
 import { cn } from "@/lib/cn";
 import { adminInputClass, adminLabelClass } from "@/components/ui/form-classes";
+import { InnLookup } from "@/components/ui/InnLookup";
 
 const initial: CounterpartyState = {};
 
@@ -28,7 +29,14 @@ export type CounterpartyValues = {
  * Новый заводится из свёрнутой кнопки: список контрагентов открывают,
  * чтобы найти нужного, а не чтобы каждый раз смотреть на пустую форму.
  */
-export function CounterpartyForm({ value }: { value?: CounterpartyValues }) {
+export function CounterpartyForm({
+  value,
+  innLookup = false,
+}: {
+  value?: CounterpartyValues;
+  /** Включена ли подсказка реквизитов по ИНН (задан ключ DaData). */
+  innLookup?: boolean;
+}) {
   const [state, action, pending] = useActionState(saveCounterparty, initial);
   const [open, setOpen] = useState(Boolean(value));
   const formRef = useRef<HTMLFormElement>(null);
@@ -122,6 +130,22 @@ export function CounterpartyForm({ value }: { value?: CounterpartyValues }) {
           placeholder="10 или 12 цифр"
           error={state.fieldErrors?.inn}
         />
+        {innLookup && (
+          <InnLookup
+            innName="inn"
+            className="sm:col-span-2"
+            targets={[
+              { name: "companyName", label: "Организация", value: (p) => p.shortName },
+              // ФИО предпринимателя - он и есть контактное лицо; у организации
+              // руководитель не обязательно тот, с кем работает менеджер
+              {
+                name: "name",
+                label: "Имя или контактное лицо",
+                value: (p) => (p.kind === "individual" ? p.manager : null),
+              },
+            ]}
+          />
+        )}
         <Field
           label="АДРЕС"
           name="address"

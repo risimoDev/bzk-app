@@ -36,6 +36,7 @@ import {
   Menu,
   X,
   History,
+  HandCoins,
 } from "lucide-react";
 import { Logo } from "@/components/brand/Logo";
 import { logout } from "@/app/actions/session";
@@ -67,7 +68,9 @@ const SECTIONS = [
       { href: "/admin/materials", label: "Склад", icon: Boxes, module: "materials" },
       { href: "/admin/purchases", label: "Закупки", icon: Truck, module: "materials" },
       { href: "/admin/suppliers", label: "Подрядчики", icon: Store, module: "materials" },
-      { href: "/admin/finance", label: "Бухгалтерия", icon: Wallet, module: "finance" },
+      // except: «Долги» лежат внутри /admin/finance, но подсвечиваются своим пунктом
+      { href: "/admin/finance", label: "Бухгалтерия", icon: Wallet, module: "finance", except: "/admin/finance/debts" },
+      { href: "/admin/finance/debts", label: "Долги", icon: HandCoins, module: "finance" },
       { href: "/admin/analytics", label: "Аналитика", icon: ChartLine, module: "finance" },
       { href: "/admin/calculator", label: "Калькулятор", icon: Calculator, module: "calculator" },
       { href: "/admin/pricelist", label: "Прайс-лист", icon: ListOrdered, module: "pricelist" },
@@ -154,7 +157,8 @@ export function AdminNav({
                   const active =
                     "exact" in item && item.exact
                       ? pathname === item.href
-                      : pathname.startsWith(item.href);
+                      : pathname.startsWith(item.href) &&
+                        !("except" in item && item.except && pathname.startsWith(item.except));
                   return (
                     <li key={item.href}>
                       <Link
