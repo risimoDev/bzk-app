@@ -17,6 +17,7 @@ import {
   type TicketCategory,
 } from "@/lib/client-portal";
 import { cn } from "@/lib/cn";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Поддержка · Админка",
@@ -44,7 +45,7 @@ export default async function AdminSupport({ searchParams }: PageProps<"/admin/s
 
   const sp = await searchParams;
   const rawStatus = String(sp.status ?? "");
-  const status = rawStatus in TICKET_STATUSES ? (rawStatus as TicketStatus) : null;
+  const status = isKeyOf(TICKET_STATUSES, rawStatus) ? (rawStatus as TicketStatus) : null;
 
   // По умолчанию - незакрытые: решённые копятся и вытесняют живые
   const openOnly = !status && sp.all !== "1";

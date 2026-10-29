@@ -10,6 +10,7 @@ import {
 import { verifyTurnstile, TURNSTILE_FAILED_MESSAGE } from "@/lib/turnstile";
 import { clientIp } from "@/lib/client-ip";
 import { issueLoginChallenge, verifyLoginChallenge } from "@/lib/login-challenge";
+import { rejectOverlong } from "@/lib/text-limits";
 
 /**
  * `needsTotp` показывает форме поле одноразового кода, `challenge` - токен
@@ -22,6 +23,9 @@ export async function login(
   _prev: LoginState,
   formData: FormData,
 ): Promise<LoginState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const redirectTo = String(formData.get("redirectTo") || "/client/dashboard");
   const email = String(formData.get("email") ?? "");
   const givenChallenge = String(formData.get("loginChallenge") ?? "");

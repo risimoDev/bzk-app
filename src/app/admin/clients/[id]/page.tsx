@@ -76,8 +76,12 @@ export default async function AdminClient(
       .where(eq(orders.userId, client.id)),
   ]);
 
-  const manageable = await can("users", "manage");
   const me = await currentUser();
+  // Учётную запись администратора трогает только администратор (так же
+  // отвечает сервер, см. loadTarget в ../actions.ts): менеджеру кнопки не
+  // показываем, иначе он нажал бы и получил молчаливый отказ
+  const manageable =
+    (await can("users", "manage")) && !(client.role === "admin" && me?.role !== "admin");
   const isSelf = me != null && Number(me.id) === client.id;
 
   return (

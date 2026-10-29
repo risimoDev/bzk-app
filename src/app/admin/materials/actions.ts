@@ -11,6 +11,7 @@ import { audit } from "@/lib/audit";
 import { StockError, applyMovement, syncStockAlerts } from "@/lib/stock";
 import { MoneyRuleError, type OrderRef } from "@/lib/order-money-db";
 import { returnWriteOff, writeOffToOrder, type WriteOffSource } from "@/lib/write-off-db";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type MovementState = {
   ok?: string;
@@ -40,6 +41,9 @@ export async function recordMovement(
   _prev: MovementState,
   formData: FormData,
 ): Promise<MovementState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return { error: tooLong.error };
+
   if (!(await can("materials", "edit"))) {
     return { error: "У вашей роли нет права менять склад" };
   }
@@ -128,6 +132,9 @@ export async function saveMaterial(
   _prev: MaterialState,
   formData: FormData,
 ): Promise<MaterialState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;

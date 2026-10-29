@@ -7,16 +7,21 @@ import { seoSettings } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { SEO_PAGES, type SeoPage } from "@/lib/seo";
+import { isKeyOf } from "@/lib/guards";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type SeoState = { ok: boolean; message?: string };
 
 export async function saveSeo(_prev: SeoState, formData: FormData): Promise<SeoState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("settings", "edit"))) {
     return { ok: false, message: "Менять SEO может администратор" };
   }
 
   const page = String(formData.get("page") ?? "");
-  if (!(page in SEO_PAGES)) return { ok: false, message: "Неизвестная страница" };
+  if (!isKeyOf(SEO_PAGES, page)) return { ok: false, message: "Неизвестная страница" };
 
   const field = (name: string, limit: number) =>
     String(formData.get(name) ?? "").trim().slice(0, limit) || null;
@@ -66,7 +71,7 @@ export async function clearSeo(_prev: SeoState, formData: FormData): Promise<Seo
   }
 
   const page = String(formData.get("page") ?? "");
-  if (!(page in SEO_PAGES)) return { ok: false, message: "Неизвестная страница" };
+  if (!isKeyOf(SEO_PAGES, page)) return { ok: false, message: "Неизвестная страница" };
 
   await db.delete(seoSettings).where(eq(seoSettings.page, page));
 

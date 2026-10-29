@@ -25,6 +25,7 @@ import {
 } from "@/lib/order-money-db";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type StatusState = { ok?: boolean; error?: string; message?: string };
 
@@ -145,6 +146,9 @@ export async function replyToOrderChat(
   _prev: ChatState,
   formData: FormData,
 ): Promise<ChatState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me || !(await can("orders", "edit"))) {
     return { ok: false, message: "Нет прав отвечать по заказам" };
@@ -229,6 +233,9 @@ export async function saveOrderItem(
   _prev: OrderItemState,
   formData: FormData,
 ): Promise<OrderItemState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("orders", "edit"))) {
     return { ok: false, error: "Нет прав менять заказы" };
   }
@@ -481,6 +488,9 @@ export async function reviewClientUpload(
   _prev: { ok?: boolean; error?: string },
   formData: FormData,
 ): Promise<{ ok?: boolean; error?: string }> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("orders", "edit"))) {
     return { error: "У вашей роли нет права принимать макеты" };
   }

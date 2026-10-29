@@ -8,6 +8,7 @@ import { clients, externalOrders, users } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { phoneDigits } from "@/lib/counterparties";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type CounterpartyState = {
   ok?: boolean;
@@ -51,6 +52,9 @@ export async function saveCounterparty(
   _prev: CounterpartyState,
   formData: FormData,
 ): Promise<CounterpartyState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("counterparties", "edit"))) return DENIED;
 
   const rawId = String(formData.get("id") ?? "").trim();

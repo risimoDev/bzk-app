@@ -57,6 +57,9 @@ bash deploy/deploy.sh
 # ------------------------------------------------------- 3. Базовые данные
 info "3/5: Наполнение базы (права ролей и реквизиты компании)..."
 ${COMPOSE} run --rm tools node scripts/seed-permissions.mjs
+# Права на crm и counterparties копируются с users: во время deploy.sh на
+# первой установке прав ещё не было, поэтому выдаём их здесь, после seed
+${COMPOSE} run --rm tools npm run grant-module-permissions
 ${COMPOSE} run --rm tools node scripts/seed-company.mjs
 success "Права ролей и реквизиты компании заданы."
 

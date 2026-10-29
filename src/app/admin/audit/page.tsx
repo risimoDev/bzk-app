@@ -8,6 +8,7 @@ import { AdminPage, AdminEmpty } from "@/components/admin/AdminPage";
 import { AdminPager, offsetOf, pageFrom } from "@/components/admin/AdminPager";
 import { can } from "@/lib/permissions";
 import { parseId } from "@/lib/ids";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Журнал действий · Админка",
@@ -195,7 +196,7 @@ export default async function AdminAudit({ searchParams }: PageProps<"/admin/aud
   // % и _ в поиске - обычные символы, а не шаблон LIKE
   if (q) conditions.push(ilike(auditLog.action, `%${q.replace(/[\\%_]/g, "\\$&")}%`));
   if (userId) conditions.push(eq(auditLog.userId, userId));
-  if (type && type in ENTITY) conditions.push(eq(auditLog.entityType, type));
+  if (type && isKeyOf(ENTITY, type)) conditions.push(eq(auditLog.entityType, type));
   const where = conditions.length > 0 ? and(...conditions) : undefined;
 
   const [rows, [{ n: total }], staff] = await Promise.all([
@@ -249,7 +250,7 @@ export default async function AdminAudit({ searchParams }: PageProps<"/admin/aud
             </option>
           ))}
         </select>
-        <select name="type" defaultValue={type in ENTITY ? type : ""} aria-label="Раздел" className={selectClass}>
+        <select name="type" defaultValue={isKeyOf(ENTITY, type) ? type : ""} aria-label="Раздел" className={selectClass}>
           <option value="">Все разделы</option>
           {Object.entries(ENTITY).map(([key, e]) => (
             <option key={key} value={key}>

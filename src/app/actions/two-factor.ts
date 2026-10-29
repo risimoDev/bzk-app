@@ -13,6 +13,7 @@ import { consumeTotp } from "@/lib/totp-db";
 import { bumpSessionVersion } from "@/lib/sessions-db";
 import { checkRateLimit, recordAttempt, clearAttempts, retryAfterText } from "@/lib/rate-limit";
 import { textQrSvg } from "@/lib/payment-qr";
+import { rejectOverlong } from "@/lib/text-limits";
 
 /**
  * Лимит на повторные подтверждения вошедшего пользователя (код, пароль).
@@ -91,6 +92,9 @@ export async function confirmTwoFactor(
   _prev: TwoFactorState,
   formData: FormData,
 ): Promise<TwoFactorState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me) return { error: "Нужно войти" };
 
@@ -134,6 +138,9 @@ export async function disableTwoFactor(
   _prev: TwoFactorState,
   formData: FormData,
 ): Promise<TwoFactorState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me) return { error: "Нужно войти" };
 

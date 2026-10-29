@@ -19,6 +19,7 @@ import {
   clearResetToken,
   RESET_TTL_MINUTES,
 } from "@/lib/password-reset";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type PasswordState = {
   ok?: boolean;
@@ -48,6 +49,9 @@ export async function requestPasswordReset(
   _prev: PasswordState,
   formData: FormData,
 ): Promise<PasswordState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const email = String(formData.get("email") ?? "").trim().toLowerCase().slice(0, 255);
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -130,6 +134,9 @@ export async function resetPassword(
   _prev: PasswordState,
   formData: FormData,
 ): Promise<PasswordState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const token = String(formData.get("token") ?? "").trim();
   const password = String(formData.get("password") ?? "");
   const confirm = String(formData.get("passwordConfirm") ?? "");
@@ -169,6 +176,9 @@ export async function changePassword(
   _prev: PasswordState,
   formData: FormData,
 ): Promise<PasswordState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return { error: "Нужно войти" };
 
@@ -211,7 +221,6 @@ export async function changePassword(
     await recordAttempt(reauthKey, "reauth");
     return { fieldErrors: { currentPassword: "Текущий пароль неверный" } };
   }
-  await clearAttempts(reauthKey, "reauth");
 
   if (await bcrypt.compare(password, row.password)) {
     return { fieldErrors: { password: "Новый пароль совпадает со старым" } };
@@ -222,6 +231,11 @@ export async function changePassword(
     .update(users)
     .set({ password: hash, passwordChangedAt: new Date(), sessionVersion: bumpSessionVersion })
     .where(eq(users.id, Number(user.id)));
+
+  // Ключ reauth общий с отключением второго фактора (там подбирают код).
+  // Снимать счётчик на верном пароле нельзя: тот, кто знает пароль, получал
+  // бы свежие пять попыток на код. Снимаем только когда смена прошла целиком
+  await clearAttempts(reauthKey, "reauth");
 
   // Смена пароля отзывает все сессии, включая текущую. Отправляем на вход
   // с понятной причиной, а не оставляем на странице, с которой человека

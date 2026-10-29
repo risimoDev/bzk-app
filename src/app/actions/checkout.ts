@@ -22,6 +22,7 @@ import { isUniqueViolation } from "@/lib/db-errors";
 import { buyerSnapshot, itemSnapshotName } from "@/lib/order-snapshot";
 import { clientIp } from "@/lib/client-ip";
 import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type CheckoutState = {
   ok?: boolean;
@@ -95,6 +96,9 @@ export async function applyPromocode(
   _prev: PromoState,
   formData: FormData,
 ): Promise<PromoState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const items = await resolveCart(await readCart());
   if (items.length === 0) return { ok: false, message: "Корзина пуста" };
 
@@ -145,6 +149,9 @@ export async function placeOrder(
   _prev: CheckoutState,
   formData: FormData,
 ): Promise<CheckoutState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   // Колонка orders.user_id обязательная: заказ без аккаунта в этой
   // схеме не живёт, да и смотреть его клиенту было бы негде
   const user = await currentUser();

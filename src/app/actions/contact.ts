@@ -9,6 +9,8 @@ import { notifyStaff } from "@/lib/notify";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
 import { PREFERRED_CONTACT, type PreferredContact } from "@/lib/contact";
+import { isKeyOf } from "@/lib/guards";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type ContactState = {
   ok?: boolean;
@@ -20,6 +22,9 @@ export async function sendContactMessage(
   _prev: ContactState,
   formData: FormData,
 ): Promise<ContactState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   /**
    * Ловушка для роботов: поле спрятано от людей, и заполняет его только
    * тот, кто заполняет всё подряд. Отвечаем как на успех - иначе бот
@@ -42,7 +47,7 @@ export async function sendContactMessage(
 
   const rawContact = String(formData.get("preferredContact") ?? "email");
   const preferredContact = (
-    rawContact in PREFERRED_CONTACT ? rawContact : "email"
+    isKeyOf(PREFERRED_CONTACT, rawContact) ? rawContact : "email"
   ) as PreferredContact;
 
   const fieldErrors: Record<string, string> = {};

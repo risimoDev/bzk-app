@@ -14,13 +14,16 @@ import {
   users,
 } from "@/db/schema";
 import { currentUser } from "@/auth";
-import { saveUpload, removeUpload } from "@/lib/uploads";
+import { removeUpload } from "@/lib/uploads";
 import { isTicketClosed, TICKET_CATEGORIES, TICKET_PRIORITIES } from "@/lib/client-portal";
-import { localDate } from "@/lib/dates";
+import { localDate, parseCalendarDate } from "@/lib/dates";
 import { nextTicketNumber } from "@/lib/numbering-db";
-import { notifyClientUpload, notifyNewTicket, notifyStaff, notifyTicketReply } from "@/lib/notify";
+import { notifyNewTicket, notifyStaff, notifyTicketReply } from "@/lib/notify";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
+import { isKeyOf } from "@/lib/guards";
+import { rejectOverlong } from "@/lib/text-limits";
+import { checkRateLimit, claimStaffNotice, recordAttempt, retryAfterText } from "@/lib/rate-limit";
 
 export type ActionState = { ok: boolean; message?: string };
 
@@ -42,6 +45,9 @@ export async function sendOrderMessage(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return DENIED;
 
@@ -56,6 +62,13 @@ export async function sendOrderMessage(
   if (message.length > 4000) {
     return { ok: false, message: "Слишком длинное сообщение - до 4000 символов" };
   }
+
+  // Каждое сообщение уходит сотрудникам в телеграм - лимит на человека
+  const verdict = await checkRateLimit(String(userId), "orderMessage");
+  if (!verdict.ok) {
+    return { ok: false, message: `Слишком часто - попробуйте ${retryAfterText(verdict.retryAfter)}` };
+  }
+  await recordAttempt(String(userId), "orderMessage");
 
   await db.transaction(async (tx) => {
     // Обсуждение заводится при первом сообщении: пустых веток по заказам,
@@ -84,12 +97,15 @@ export async function sendOrderMessage(
 
   // Пока уведомления не звали, сообщение клиента лежало в базе, и
   // менеджер узнавал о нём, только если сам открывал заказ
-  await notifyStaff(
-    "order_message",
-    `Заказ № ${orderId}`,
-    `<b>Сообщение по заказу № ${orderId}</b>\n${esc(user.name)}: ${esc(message.slice(0, 300))}`,
-    [[{ text: "Открыть заказ", url: absoluteUrl(`/admin/orders/${orderId}`) }]],
-  );
+  // Серия сообщений подряд - одно уведомление: остальное видно в самом заказе
+  if (await claimStaffNotice(`order:${orderId}`)) {
+    await notifyStaff(
+      "order_message",
+      `Заказ № ${orderId}`,
+      `<b>Сообщение по заказу № ${orderId}</b>\n${esc(user.name)}: ${esc(message.slice(0, 300))}`,
+      [[{ text: "Открыть заказ", url: absoluteUrl(`/admin/orders/${orderId}`) }]],
+    );
+  }
 
   revalidatePath(`/client/orders/${orderId}`);
   revalidatePath(`/admin/orders/${orderId}`);
@@ -98,58 +114,8 @@ export async function sendOrderMessage(
 
 // --------------------------------------------------------------- файлы
 
-export async function uploadClientFile(
-  _prev: ActionState,
-  formData: FormData,
-): Promise<ActionState> {
-  const user = await currentUser();
-  if (!user) return DENIED;
-
-  const userId = Number(user.id);
-  const file = formData.get("file");
-  const description = String(formData.get("description") ?? "").trim().slice(0, 500);
-
-  const rawOrder = String(formData.get("orderId") ?? "").trim();
-  const orderId = rawOrder === "" ? null : Number(rawOrder);
-
-  if (!(file instanceof File)) return { ok: false, message: "Файл не выбран" };
-
-  if (orderId !== null) {
-    if (!Number.isInteger(orderId) || !(await ownsOrder(userId, orderId))) {
-      return { ok: false, message: "Заказ не найден" };
-    }
-  }
-
-  let saved;
-  try {
-    saved = await saveUpload(file);
-  } catch (e) {
-    return { ok: false, message: e instanceof Error ? e.message : "Не удалось сохранить файл" };
-  }
-
-  await db.insert(clientUploads).values({
-    userId,
-    orderId,
-    filename: saved.filename,
-    originalName: saved.originalName,
-    fileSize: saved.size,
-    mimeType: saved.mimeType,
-    description: description || null,
-  });
-
-  // Макет, который никто не заметил, лежал бы до следующего захода
-  // менеджера в заказ - а по нему идёт срок
-  await notifyClientUpload({
-    userId,
-    clientName: user.name ?? "Клиент",
-    fileName: saved.originalName,
-    orderId,
-  });
-
-  revalidatePath("/client/uploads");
-  if (orderId) revalidatePath(`/client/orders/${orderId}`);
-  return { ok: true, message: `Файл «${saved.originalName}» загружен` };
-}
+// Загрузка макетов - не здесь: файл идёт потоком через /api/client-uploads
+// (см. комментарий в route.ts), серверное действие держало бы его в памяти
 
 export async function deleteClientFile(
   _prev: ActionState,
@@ -200,6 +166,9 @@ export async function saveWarehouseItem(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return DENIED;
 
@@ -272,6 +241,9 @@ export async function createTicket(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return DENIED;
 
@@ -286,14 +258,20 @@ export async function createTicket(
 
   if (subject === "") return { ok: false, message: "Впишите тему обращения" };
   if (message === "") return { ok: false, message: "Опишите вопрос" };
-  if (!(category in TICKET_CATEGORIES)) return { ok: false, message: "Неизвестная категория" };
-  if (!(priority in TICKET_PRIORITIES)) return { ok: false, message: "Неизвестный приоритет" };
+  if (!isKeyOf(TICKET_CATEGORIES, category)) return { ok: false, message: "Неизвестная категория" };
+  if (!isKeyOf(TICKET_PRIORITIES, priority)) return { ok: false, message: "Неизвестный приоритет" };
 
   if (orderId !== null) {
     if (!Number.isInteger(orderId) || !(await ownsOrder(userId, orderId))) {
       return { ok: false, message: "Заказ не найден" };
     }
   }
+
+  const verdict = await checkRateLimit(String(userId), "ticket");
+  if (!verdict.ok) {
+    return { ok: false, message: `Слишком много обращений - попробуйте ${retryAfterText(verdict.retryAfter)}` };
+  }
+  await recordAttempt(String(userId), "ticket");
 
   // Номер обращения: TK-ГГГГММДД-NNNN, нумерация внутри дня. Его выдаёт
   // атомарный счётчик дня: max + 1 пересекался у двух обращений, поданных
@@ -342,6 +320,9 @@ export async function replyToTicket(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return DENIED;
 
@@ -367,6 +348,12 @@ export async function replyToTicket(
     return { ok: false, message: "Обращение закрыто - заведите новое, так вопрос не потеряется" };
   }
 
+  const verdict = await checkRateLimit(String(userId), "ticket");
+  if (!verdict.ok) {
+    return { ok: false, message: `Слишком часто - попробуйте ${retryAfterText(verdict.retryAfter)}` };
+  }
+  await recordAttempt(String(userId), "ticket");
+
   await db.transaction(async (tx) => {
     await tx.insert(supportTicketMessages).values({ ticketId, userId, message });
     // Ответ клиента снимает ожидание: очередь снова за нами
@@ -376,12 +363,15 @@ export async function replyToTicket(
       .where(eq(supportTickets.id, ticketId));
   });
 
-  await notifyTicketReply({
-    ticketId,
-    number: ticket.number,
-    clientName: user.name ?? "Клиент",
-    preview: message,
-  });
+  // Ответы по одному обращению подряд - одно уведомление в десять минут
+  if (await claimStaffNotice(`ticket:${ticketId}`)) {
+    await notifyTicketReply({
+      ticketId,
+      number: ticket.number,
+      clientName: user.name ?? "Клиент",
+      preview: message,
+    });
+  }
 
   revalidatePath(`/client/support/${ticketId}`);
   revalidatePath("/client/support");
@@ -394,6 +384,9 @@ export async function updateProfile(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
+  const tooLong = rejectOverlong(formData, { phone: 20 });
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return DENIED;
 
@@ -424,7 +417,8 @@ export async function updateProfile(
 
   // Дата хранится календарным днём: строка «ГГГГ-ММ-ДД» уходит в базу
   // как есть, без часовых поясов, иначе день уезжает на сутки назад
-  if (birthdayRaw !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(birthdayRaw)) {
+  const birthday = birthdayRaw === "" ? null : parseCalendarDate(birthdayRaw);
+  if (birthdayRaw !== "" && (!birthday || birthday > localDate())) {
     return { ok: false, message: "Проверьте дату рождения" };
   }
 
@@ -433,7 +427,7 @@ export async function updateProfile(
     .set({
       name,
       phone: phone || null,
-      birthday: birthdayRaw || null,
+      birthday,
       shippingAddress: shippingAddress || null,
       isCorporate,
       companyName: isCorporate ? companyName : null,
@@ -451,6 +445,9 @@ export async function updateNotifications(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return DENIED;
 

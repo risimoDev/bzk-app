@@ -19,6 +19,7 @@ import { externalProductionStatus } from "@/lib/external-orders";
 import { taskStatus } from "@/lib/tasks";
 import { absoluteUrl } from "@/lib/site";
 import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
+import { afterResponse } from "@/lib/notify-after";
 
 /**
  * Приём обновлений от телеграма.
@@ -203,8 +204,12 @@ async function connect(chatId: number, arg: string) {
   }
 
   // Письмо не задерживает ответ в чате и не роняет привязку, если почта
-  // не отвечает
-  void sendTelegramLinkedNotice(user).catch(() => {});
+  // не отвечает. after() держит процесс живым, пока письмо не уйдёт, а
+  // неудача попадает в лог: хозяин аккаунта не узнал о чужой привязке
+  afterResponse("telegram-linked-notice", async () => {
+    const r = await sendTelegramLinkedNotice(user);
+    if (r && !r.ok) console.error("[telegram-linked-notice] письмо не ушло:", r.error);
+  });
 
   return sendMessage(
     chatId,

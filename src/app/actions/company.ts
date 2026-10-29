@@ -8,6 +8,12 @@ import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { readCompany } from "@/lib/company-db";
 import { COMPANY_FIELDS, validateCompany, type Company, type CompanyField } from "@/lib/company";
+import { rejectOverlong } from "@/lib/text-limits";
+
+// settings.value - varchar(255): у каждого реквизита этот предел, а не общий 5000
+const COMPANY_LIMITS: Record<string, number> = Object.fromEntries(
+  Object.keys(COMPANY_FIELDS).map((k) => [k, 255]),
+);
 
 export type CompanyFormState = {
   ok: boolean;
@@ -26,6 +32,9 @@ export async function saveCompany(
   _prev: CompanyFormState,
   formData: FormData,
 ): Promise<CompanyFormState> {
+  const tooLong = rejectOverlong(formData, COMPANY_LIMITS);
+  if (tooLong) return tooLong;
+
   if (!(await can("settings", "edit"))) {
     return { ok: false, message: "У вашей роли нет права менять настройки" };
   }

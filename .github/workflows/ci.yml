@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Новый коммит в ту же ветку отменяет прогон предыдущего
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Типы, линтер и сборка. База не нужна: next build её не открывает
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      # Фиктивные значения: сборке нужны только сами имена, ходить с ними
+      # некуда. Настоящие секреты в CI не кладём
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      AUTH_SECRET: ci-build-only-secret-not-for-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Типы маршрутов (PageProps, RouteContext) генерирует Next; без этого tsc не соберётся
+      - run: npx next typegen
+      - run: npx tsc --noEmit
+      - run: npx eslint src --max-warnings=0
+      - run: npm run build
+
+  # Проверочные скрипты на настоящем Postgres 17
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: bzk
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: bzk
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bzk -d bzk"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql://bzk:ci@localhost:5432/bzk
+      AUTH_SECRET: ci-test-only-secret-not-for-production
+      # Ни почты, ни телеграма в CI нет: SMTP_*, TELEGRAM_*, TURNSTILE_*
+      # намеренно не заданы, отправки невозможны
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Миграций в проекте нет, схема применяется drizzle-kit push. Из-за
+      # strict: true в drizzle.config.ts он спрашивает подтверждение с
+      # клавиатуры; --force снимает вопрос, а закрытый stdin не даёт зависнуть
+      - name: Применить схему
+        run: npx drizzle-kit push --force < /dev/null
+      - run: npm run check

@@ -125,9 +125,13 @@ export const config = {
      * Всё, кроме статики и предзагрузки ссылок. Картинкам и файлам сборки
      * политика не нужна, а на предзагрузке next/link ключ только зря
      * ломал бы кеш ответов.
+     *
+     * api/client-uploads - загрузка макетов до 50 МБ потоком. Proxy
+     * буферизует тело запроса в памяти (proxyClientMaxBodySize), а тут оно
+     * должно идти на диск, не оседая в памяти; политика ответу-JSON не нужна.
      */
     {
-      source: "/((?!_next/static|_next/image|favicon.ico|logo.svg|bg/|collage/|editor/|production/|products/|video/).*)",
+      source: "/((?!_next/static|_next/image|favicon.ico|logo.svg|bg/|collage/|editor/|production/|products/|video/|api/client-uploads).*)",
       missing: [
         { type: "header", key: "next-router-prefetch" },
         { type: "header", key: "purpose", value: "prefetch" },

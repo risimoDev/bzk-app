@@ -17,6 +17,7 @@ import {
 } from "@/lib/quality";
 import { DefectStatusControls, DeleteDefectButton } from "./DefectControls";
 import { cn } from "@/lib/cn";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Дефекты · Админка",
@@ -50,8 +51,8 @@ export default async function AdminDefects({
 
   // Фильтры принимаем только из известного набора: чужое значение в
   // адресе иначе ушло бы прямо в запрос
-  const status = rawStatus in QC_DEFECT_STATUS ? (rawStatus as QcDefectStatus) : null;
-  const severity = rawSeverity in QC_SEVERITY ? (rawSeverity as QcSeverity) : null;
+  const status = isKeyOf(QC_DEFECT_STATUS, rawStatus) ? (rawStatus as QcDefectStatus) : null;
+  const severity = isKeyOf(QC_SEVERITY, rawSeverity) ? (rawSeverity as QcSeverity) : null;
 
   const conditions: SQL[] = [];
   if (status) conditions.push(eq(qcDefects.status, status));

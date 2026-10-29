@@ -6,6 +6,7 @@ import { db } from "@/db";
 import { productAttributes, attributeValues } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { rejectOverlong } from "@/lib/text-limits";
 
 /**
  * Характеристики товара и их значения с надбавками.
@@ -39,6 +40,9 @@ export async function saveAttribute(
   _prev: AttributeState,
   formData: FormData,
 ): Promise<AttributeState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("products", "edit"))) return DENIED;
 
   const productId = idOf(formData, "productId");
@@ -94,6 +98,9 @@ export async function saveAttributeValue(
   _prev: AttributeState,
   formData: FormData,
 ): Promise<AttributeState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("products", "edit"))) return DENIED;
 
   const productId = idOf(formData, "productId");

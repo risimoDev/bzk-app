@@ -8,6 +8,7 @@ import { AdminPage, AdminStat, AdminEmpty } from "@/components/admin/AdminPage";
 import { can } from "@/lib/permissions";
 import { CATEGORY, categoryOf, stockLevel, type MaterialCategory } from "@/lib/materials";
 import { cn } from "@/lib/cn";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Склад · Админка",
@@ -48,7 +49,7 @@ export default async function AdminMaterials(
 
   const filters: SQL[] = [];
   if (query) filters.push(ilike(materials.name, `%${query}%`));
-  if (category && category in CATEGORY) {
+  if (category && isKeyOf(CATEGORY, category)) {
     filters.push(eq(materials.category, category as MaterialCategory));
   }
   const where = filters.length ? and(...filters) : undefined;

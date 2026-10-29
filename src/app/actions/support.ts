@@ -9,6 +9,8 @@ import { can } from "@/lib/permissions";
 import { TICKET_STATUSES, type TicketStatus } from "@/lib/client-portal";
 import { notifyUser } from "@/lib/notify";
 import { absoluteUrl } from "@/lib/site";
+import { isKeyOf } from "@/lib/guards";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type SupportState = { ok: boolean; message?: string };
 
@@ -48,6 +50,9 @@ export async function replyToTicket(
   _prev: SupportState,
   formData: FormData,
 ): Promise<SupportState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayEdit())) return DENIED;
 
@@ -111,7 +116,7 @@ export async function setTicketStatus(
   const raw = String(formData.get("status") ?? "");
 
   if (!Number.isInteger(ticketId)) return { ok: false, message: "Обращение не найдено" };
-  if (!(raw in TICKET_STATUSES)) return { ok: false, message: "Неизвестный статус" };
+  if (!isKeyOf(TICKET_STATUSES, raw)) return { ok: false, message: "Неизвестный статус" };
 
   const status = raw as TicketStatus;
   const ticket = await loadTicket(ticketId);
@@ -149,6 +154,9 @@ export async function assignTicket(
   _prev: SupportState,
   formData: FormData,
 ): Promise<SupportState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await mayEdit())) return DENIED;
 
   const ticketId = Number(formData.get("ticketId"));

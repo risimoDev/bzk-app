@@ -29,6 +29,7 @@ const {
   orderExpenses,
   productionOrders,
   productionOrderStages,
+  productionStages,
   materials,
   materialsStock,
   materialsMovements,
@@ -118,6 +119,7 @@ console.log("Чистые правила");
 const MARK = "production-stock-check@check.invalid";
 const stamp = Date.now();
 let userId = null;
+const stageIds = [];
 const extIds = [];
 let siteId = null;
 const materialIds = [];
@@ -175,6 +177,18 @@ try {
     .values({ name: "Проверка цеха", email: MARK, password: "x", role: "manager" })
     .returning({ id: users.id });
   userId = u.id;
+
+  // На пустой базе (CI) справочник этапов пуст, а запуск в цех требует хотя бы
+  // два: заводим свои, с одинаковым порядком, и убираем в конце. В рабочей базе
+  // этапы свои - их не трогаем
+  const activeStages = await db.select({ id: productionStages.id }).from(productionStages).where(eq(productionStages.isActive, true));
+  if (activeStages.length < 2) {
+    const added = await db
+      .insert(productionStages)
+      .values([1, 2].map((n) => ({ name: `Проверка ${n}`, slug: `prov-${stamp}-${n}`, sortOrder: 0 })))
+      .returning({ id: productionStages.id });
+    stageIds.push(...added.map((r) => r.id));
+  }
 
   // ---- этапы с одинаковым порядком проходятся все
   console.log("\nЦех: этапы");
@@ -477,6 +491,7 @@ try {
     }
     if (userId) await db.delete(tasks).where(eq(tasks.createdBy, userId));
     if (materialIds.length) await db.delete(materials).where(inArray(materials.id, materialIds));
+    if (stageIds.length) await db.delete(productionStages).where(inArray(productionStages.id, stageIds));
     if (userId) await db.delete(users).where(eq(users.id, userId));
   } catch (err) {
     failed++;

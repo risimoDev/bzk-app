@@ -2,7 +2,13 @@ import "server-only";
 import { eq, inArray, and } from "drizzle-orm";
 import { db } from "@/db";
 import { users, notificationLog } from "@/db/schema";
-import { sendMessage, esc, isTelegramConfigured, type InlineButton } from "@/lib/telegram";
+import {
+  sendMessage,
+  esc,
+  isTelegramConfigured,
+  isPermanentTelegramError,
+  type InlineButton,
+} from "@/lib/telegram";
 import { sendMail, isMailConfigured } from "@/lib/mail";
 import { notificationHtml, notificationText } from "@/lib/notify-format";
 import { absoluteUrl } from "@/lib/site";
@@ -31,11 +37,15 @@ import { EVENTS } from "@/lib/notify-events";
  * телеграм, а сбой записи в журнал не отменяет отправку.
  */
 
-type NotifyResult = { sent: number; failed: number };
+/**
+ * permanent - сколько из неудач безнадёжные (бот заблокирован, чата нет):
+ * планировщику нет смысла пробовать снова.
+ */
+type NotifyResult = { sent: number; failed: number; permanent?: number };
 
 type Channel = "telegram" | "email";
 
-type Attempt = { ok: boolean; error?: string };
+type Attempt = { ok: boolean; error?: string; permanent?: boolean };
 
 type LogInput = {
   userId: number | null;
@@ -78,11 +88,16 @@ async function attempt(input: LogInput, send: () => Promise<Attempt>): Promise<A
 function tally(settled: PromiseSettledResult<Attempt>[]): NotifyResult {
   let sent = 0;
   let failed = 0;
+  let permanent = 0;
   for (const s of settled) {
-    if (s.status === "fulfilled" && s.value.ok) sent++;
-    else failed++;
+    if (s.status === "fulfilled" && s.value.ok) {
+      sent++;
+    } else {
+      failed++;
+      if (s.status === "fulfilled" && s.value.permanent) permanent++;
+    }
   }
-  return { sent, failed };
+  return { sent, failed, permanent };
 }
 
 export type NotifyOptions = {
@@ -129,7 +144,7 @@ export async function deliverUser(
     jobs.push(
       attempt({ userId, eventCode, channel: "telegram", title, message: text }, async () => {
         const r = await sendMessage(chatId, text, buttons);
-        return { ok: r.ok, error: r.error };
+        return { ok: r.ok, error: r.error, permanent: !r.ok && isPermanentTelegramError(r.error) };
       }),
     );
   }
@@ -182,7 +197,7 @@ export async function deliverStaff(
     return [
       attempt({ userId: s.id, eventCode, channel: "telegram", title, message: text }, async () => {
         const r = await sendMessage(chatId, text, buttons);
-        return { ok: r.ok, error: r.error };
+        return { ok: r.ok, error: r.error, permanent: !r.ok && isPermanentTelegramError(r.error) };
       }),
     ];
   });

@@ -19,6 +19,8 @@ import { clientIp } from "@/lib/client-ip";
 import { isUniqueViolation } from "@/lib/db-errors";
 import { nextDocumentNumber } from "@/lib/numbering-db";
 import { renderTemplate, type FieldValue, type ItemRow } from "@/lib/document-templates";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate } from "@/lib/dates";
 
 export type DocumentState = {
   ok?: boolean;
@@ -44,6 +46,9 @@ export async function createDocument(
   _prev: DocumentState,
   formData: FormData,
 ): Promise<DocumentState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me || !(await can("documents", "create"))) {
     return { error: "У вашей роли нет права заводить документы" };
@@ -94,8 +99,16 @@ export async function createDocument(
     amount = n.toFixed(2);
   }
 
-  const documentDate = String(formData.get("documentDate") ?? "").trim();
-  const validUntil = String(formData.get("validUntil") ?? "").trim();
+  const rawDocumentDate = String(formData.get("documentDate") ?? "").trim();
+  const rawValidUntil = String(formData.get("validUntil") ?? "").trim();
+  const documentDate = rawDocumentDate === "" ? null : parseCalendarDate(rawDocumentDate);
+  const validUntil = rawValidUntil === "" ? null : parseCalendarDate(rawValidUntil);
+  if (rawDocumentDate !== "" && !documentDate) {
+    return { fieldErrors: { documentDate: "Такой даты нет в календаре" } };
+  }
+  if (rawValidUntil !== "" && !validUntil) {
+    return { fieldErrors: { validUntil: "Такой даты нет в календаре" } };
+  }
 
   // Ссылки проверяем до вставки: несуществующий заказ вставился бы
   // с ошибкой внешнего ключа и упал бы пятисоткой вместо подсказки
@@ -220,8 +233,8 @@ export async function createDocument(
         status,
         docType,
         amount,
-        documentDate: /^\d{4}-\d{2}-\d{2}$/.test(documentDate) ? documentDate : null,
-        validUntil: /^\d{4}-\d{2}-\d{2}$/.test(validUntil) ? validUntil : null,
+        documentDate,
+        validUntil,
         createdBy: Number(me.id),
       })
       .returning({ id: documents.id });

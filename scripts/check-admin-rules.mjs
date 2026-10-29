@@ -229,7 +229,14 @@ for (const mod of ["crm", "counterparties"]) {
         .map((p) => p.action)
         .sort()
         .join(",");
-    check(`${role}: права ${mod} не меньше, чем были на users`, of(mod) !== "" && of(mod) === of("users"), of(mod));
+    // Пустая база (CI): у роли нет прав на users - копировать нечего, сверка
+    // осмысленна только на базе с данными
+    const expected = of("users");
+    check(
+      `${role}: права ${mod} не меньше, чем были на users`,
+      expected === "" || (of(mod) !== "" && of(mod) === expected),
+      expected === "" ? "на users прав нет - сверять нечего" : of(mod),
+    );
   }
 }
 

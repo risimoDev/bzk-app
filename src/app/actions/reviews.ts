@@ -8,6 +8,7 @@ import { currentUser } from "@/auth";
 import { audit } from "@/lib/audit";
 import { notifyNewReview } from "@/lib/notify";
 import { hasReviewableOrder } from "@/lib/reviews-db";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type ReviewState = {
   ok?: boolean;
@@ -30,6 +31,9 @@ export async function leaveReview(
   _prev: ReviewState,
   formData: FormData,
 ): Promise<ReviewState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user) return { error: "Чтобы оставить отзыв, войдите в кабинет" };
 

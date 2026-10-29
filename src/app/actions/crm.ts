@@ -21,6 +21,9 @@ import {
   type LeadPriority,
   type InteractionType,
 } from "@/lib/crm";
+import { isKeyOf } from "@/lib/guards";
+import { parseCalendarDate, parseCalendarDateTime } from "@/lib/dates";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type CrmState = { ok: boolean; message?: string };
 
@@ -40,6 +43,9 @@ async function mayEdit() {
 // ----------------------------------------------------------------- лиды
 
 export async function createLead(_prev: CrmState, formData: FormData): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayEdit())) return DENIED;
 
@@ -51,10 +57,10 @@ export async function createLead(_prev: CrmState, formData: FormData): Promise<C
   const tags = String(formData.get("tags") ?? "").trim().slice(0, 500);
 
   const rawSource = String(formData.get("source") ?? "website");
-  const source = (rawSource in LEAD_SOURCE ? rawSource : "website") as LeadSource;
+  const source = (isKeyOf(LEAD_SOURCE, rawSource) ? rawSource : "website") as LeadSource;
 
   const rawPriority = String(formData.get("priority") ?? "medium");
-  const priority = (rawPriority in LEAD_PRIORITY ? rawPriority : "medium") as LeadPriority;
+  const priority = (isKeyOf(LEAD_PRIORITY, rawPriority) ? rawPriority : "medium") as LeadPriority;
 
   const rawRevenue = String(formData.get("expectedRevenue") ?? "").trim();
   const rawCloseDate = String(formData.get("expectedCloseDate") ?? "").trim();
@@ -82,7 +88,8 @@ export async function createLead(_prev: CrmState, formData: FormData): Promise<C
     expectedRevenue = value.toFixed(2);
   }
 
-  if (rawCloseDate !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(rawCloseDate)) {
+  const closeDate = rawCloseDate === "" ? null : parseCalendarDate(rawCloseDate);
+  if (rawCloseDate !== "" && !closeDate) {
     return { ok: false, message: "Проверьте дату закрытия" };
   }
 
@@ -104,7 +111,7 @@ export async function createLead(_prev: CrmState, formData: FormData): Promise<C
       assignedTo,
       expectedRevenue,
       // Столбец календарный: строка «ГГГГ-ММ-ДД» уходит как есть
-      expectedCloseDate: rawCloseDate || null,
+      expectedCloseDate: closeDate,
       notes: notes || null,
       tags: tags || null,
       createdBy: Number(user.id),
@@ -121,6 +128,9 @@ export async function setLeadStatus(
   _prev: CrmState,
   formData: FormData,
 ): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await mayEdit())) return DENIED;
 
   const leadId = Number(formData.get("leadId"));
@@ -128,7 +138,7 @@ export async function setLeadStatus(
   const lossReason = String(formData.get("lossReason") ?? "").trim();
 
   if (!Number.isInteger(leadId)) return { ok: false, message: "Лид не найден" };
-  if (!(raw in LEAD_STATUS)) return { ok: false, message: "Неизвестный статус" };
+  if (!isKeyOf(LEAD_STATUS, raw)) return { ok: false, message: "Неизвестный статус" };
 
   const status = raw as LeadStatus;
 
@@ -163,12 +173,15 @@ export async function logInteraction(
   _prev: CrmState,
   formData: FormData,
 ): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayEdit())) return DENIED;
 
   const leadId = Number(formData.get("leadId"));
   const rawType = String(formData.get("type") ?? "note");
-  const type = (rawType in INTERACTION_TYPE ? rawType : "note") as InteractionType;
+  const type = (isKeyOf(INTERACTION_TYPE, rawType) ? rawType : "note") as InteractionType;
   const subject = String(formData.get("subject") ?? "").trim().slice(0, 255);
   const description = String(formData.get("description") ?? "").trim();
   const result = String(formData.get("result") ?? "").trim();
@@ -232,6 +245,9 @@ export async function createReminder(
   _prev: CrmState,
   formData: FormData,
 ): Promise<CrmState> {
+  const tooLong = rejectOverlong(formData, { message: 500 });
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayEdit())) return DENIED;
 
@@ -244,12 +260,9 @@ export async function createReminder(
 
   // datetime-local отдаёт «ГГГГ-ММ-ДДTЧЧ:ММ» без часового пояса - читаем
   // как местное время, именно в нём менеджер и назначает звонок
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(rawDate)) {
-    return { ok: false, message: "Укажите дату и время" };
-  }
-  const remindAt = new Date(rawDate);
-  if (Number.isNaN(remindAt.getTime())) {
-    return { ok: false, message: "Проверьте дату и время" };
+  const remindAt = parseCalendarDateTime(rawDate);
+  if (!remindAt) {
+    return { ok: false, message: rawDate === "" ? "Укажите дату и время" : "Проверьте дату и время" };
   }
 
   const [lead] = await db
@@ -317,7 +330,7 @@ export async function convertLeadToCounterparty(
   formData: FormData,
 ): Promise<CrmState> {
   const me = await currentUser();
-  if (!me || !(await can("crm", "edit"))) {
+  if (!me || !(await can("crm", "edit")) || !(await can("counterparties", "edit"))) {
     return { ok: false, message: "Нет прав заводить контрагентов" };
   }
 

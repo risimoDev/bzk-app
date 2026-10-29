@@ -16,6 +16,8 @@ import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { recalcOrderMoney } from "@/lib/order-money-db";
 import { nextOfferNumber } from "@/lib/numbering-db";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate } from "@/lib/dates";
 
 export type OfferState = {
   ok?: boolean;
@@ -47,6 +49,9 @@ export async function createOffer(
   _prev: OfferState,
   formData: FormData,
 ): Promise<OfferState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me || !(await can("documents", "create"))) {
     return { error: "У вашей роли нет права заводить КП" };
@@ -140,7 +145,11 @@ export async function createOffer(
   const subtotal = items.reduce((s, i) => s + Number(i.total), 0);
   const total = round2(subtotal * (1 - discount / 100));
 
-  const validUntil = String(formData.get("validUntil") ?? "").trim();
+  const rawValidUntil = String(formData.get("validUntil") ?? "").trim();
+  const validUntil = rawValidUntil === "" ? null : parseCalendarDate(rawValidUntil);
+  if (rawValidUntil !== "" && !validUntil) {
+    return { fieldErrors: { validUntil: "Такой даты нет в календаре" } };
+  }
   const rawDays = String(formData.get("productionDays") ?? "").trim();
   const productionDays = rawDays === "" ? null : Number(rawDays);
   if (productionDays !== null && (!Number.isInteger(productionDays) || productionDays < 0)) {
@@ -163,7 +172,7 @@ export async function createOffer(
         clientPhone: clientPhone || null,
         clientAddress:
           String(formData.get("clientAddress") ?? "").trim().slice(0, 1000) || null,
-        validUntil: /^\d{4}-\d{2}-\d{2}$/.test(validUntil) ? validUntil : null,
+        validUntil,
         discountPercent: discount.toFixed(2),
         productionDays,
         prepaymentPercent: prepayment.toFixed(2),

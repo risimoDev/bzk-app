@@ -27,6 +27,8 @@ import {
   type QcSeverity,
   type QcDefectStatus,
 } from "@/lib/quality";
+import { isKeyOf } from "@/lib/guards";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type QcState = { ok: boolean; message?: string };
 
@@ -46,6 +48,9 @@ export async function createInspection(
   _prev: QcState,
   formData: FormData,
 ): Promise<QcState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayInspect())) return DENIED;
 
@@ -106,7 +111,7 @@ export async function createInspection(
   // что пришло из формы: подменённый номер иначе попал бы в результаты
   const marks = items.map((item) => {
     const raw = String(formData.get(`status-${item.id}`) ?? "ok");
-    const status = (raw in QC_ITEM_STATUS ? raw : "ok") as QcItemStatus;
+    const status = (isKeyOf(QC_ITEM_STATUS, raw) ? raw : "ok") as QcItemStatus;
     return {
       itemId: item.id,
       status,
@@ -185,6 +190,9 @@ export async function createDefect(
   _prev: QcState,
   formData: FormData,
 ): Promise<QcState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await mayInspect())) return DENIED;
 
@@ -195,7 +203,7 @@ export async function createDefect(
   const title = String(formData.get("title") ?? "").trim().slice(0, 255);
   const description = String(formData.get("description") ?? "").trim();
   const rawSeverity = String(formData.get("severity") ?? "major");
-  const severity = (rawSeverity in QC_SEVERITY ? rawSeverity : "major") as QcSeverity;
+  const severity = (isKeyOf(QC_SEVERITY, rawSeverity) ? rawSeverity : "major") as QcSeverity;
 
   if (!Number.isInteger(productionOrderId) || productionOrderId <= 0) {
     return { ok: false, message: "Не указан производственный заказ" };
@@ -272,7 +280,7 @@ export async function updateDefectStatus(
   const raw = String(formData.get("status") ?? "");
 
   if (!Number.isInteger(defectId)) return { ok: false, message: "Дефект не найден" };
-  if (!(raw in QC_DEFECT_STATUS)) return { ok: false, message: "Неизвестный статус" };
+  if (!isKeyOf(QC_DEFECT_STATUS, raw)) return { ok: false, message: "Неизвестный статус" };
 
   const status = raw as QcDefectStatus;
   const closing = isDefectClosed(status);
@@ -330,6 +338,9 @@ export async function saveChecklistItem(
   _prev: QcState,
   formData: FormData,
 ): Promise<QcState> {
+  const tooLong = rejectOverlong(formData, { text: 500 });
+  if (tooLong) return tooLong;
+
   if (!(await can("settings", "edit"))) {
     return { ok: false, message: "Менять чек-листы может администратор" };
   }

@@ -10,19 +10,25 @@ import { audit } from "@/lib/audit";
 import { isActiveStaff } from "@/lib/staff-db";
 import { parseId } from "@/lib/ids";
 import { TASK_STATUS, TASK_PRIORITY, type TaskStatus, type TaskPriority } from "@/lib/tasks";
+import { isKeyOf } from "@/lib/guards";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
 export type TaskState = { ok: boolean; message?: string };
 
 const DENIED: TaskState = { ok: false, message: "Нет прав на задачи" };
 
 export async function createTask(_prev: TaskState, formData: FormData): Promise<TaskState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await can("tasks", "create"))) return DENIED;
 
   const title = String(formData.get("title") ?? "").trim().slice(0, 255);
   const description = String(formData.get("description") ?? "").trim();
   const rawPriority = String(formData.get("priority") ?? "medium");
-  const priority = (rawPriority in TASK_PRIORITY ? rawPriority : "medium") as TaskPriority;
+  const priority = (isKeyOf(TASK_PRIORITY, rawPriority) ? rawPriority : "medium") as TaskPriority;
 
   const rawAssignee = String(formData.get("assignedTo") ?? "").trim();
   const assignedTo = rawAssignee === "" ? null : parseId(rawAssignee);
@@ -50,13 +56,14 @@ export async function createTask(_prev: TaskState, formData: FormData): Promise<
     return { ok: false, message: "Исполнитель не найден" };
   }
 
-  if (rawDue !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(rawDue)) {
+  const dueDay = rawDue === "" ? null : parseCalendarDate(rawDue);
+  if (rawDue !== "" && !dueDay) {
     return { ok: false, message: "Проверьте срок" };
   }
 
   // Срок - календарный день; ставим полдень по местному, чтобы дата не
   // съехала при любом пересчёте часового пояса
-  const dueDate = rawDue === "" ? null : new Date(`${rawDue}T12:00:00`);
+  const dueDate = dueDay ? calendarDateAtNoon(dueDay) : null;
 
   const [created] = await db
     .insert(tasks)
@@ -87,7 +94,7 @@ export async function setTaskStatus(
   const raw = String(formData.get("status") ?? "");
 
   if (!Number.isInteger(taskId)) return { ok: false, message: "Задача не найдена" };
-  if (!(raw in TASK_STATUS)) return { ok: false, message: "Неизвестный статус" };
+  if (!isKeyOf(TASK_STATUS, raw)) return { ok: false, message: "Неизвестный статус" };
 
   const updated = await db
     .update(tasks)
@@ -104,6 +111,9 @@ export async function setTaskStatus(
 }
 
 export async function assignTask(_prev: TaskState, formData: FormData): Promise<TaskState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("tasks", "edit"))) return DENIED;
 
   const taskId = Number(formData.get("taskId"));
@@ -134,6 +144,9 @@ export async function assignTask(_prev: TaskState, formData: FormData): Promise<
 }
 
 export async function commentTask(_prev: TaskState, formData: FormData): Promise<TaskState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await can("tasks", "edit"))) return DENIED;
 

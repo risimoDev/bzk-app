@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq, gt, lt, or } from "drizzle-orm";
+import { and, eq, gt, lt, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { telegramLinkCodes, users } from "@/db/schema";
 import {
@@ -26,6 +26,12 @@ export async function issueLinkCode(userId: number) {
   const code = generateLinkCode();
 
   await db.transaction(async (tx) => {
+    // Две выдачи одного пользователя разом (двойной щелчок, две вкладки)
+    // обе успели бы удалить старый код и вставить свой - остались бы два
+    // живых. Блокировка на пользователя ставит их в очередь: вторая
+    // удалит код первой. Первое число - «пространство» блокировок кодов
+    await tx.execute(sql`select pg_advisory_xact_lock(7002, ${userId})`);
+
     await tx
       .delete(telegramLinkCodes)
       .where(
@@ -113,9 +119,9 @@ export async function linkChatToUser(
  * не ошибка (на разработке SMTP чаще всего пуст).
  */
 export async function sendTelegramLinkedNotice(user: LinkedUser) {
-  if (!isMailConfigured()) return;
+  if (!isMailConfigured()) return null;
 
-  await sendMail({
+  return sendMail({
     to: user.email,
     subject: `К аккаунту привязан Telegram - ${site.name}`,
     text:

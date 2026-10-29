@@ -6,7 +6,7 @@ import { deliverUser } from "@/lib/notify";
 import { EVENTS } from "@/lib/notify-events";
 import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
-import { LIMITS } from "@/lib/rate-limit";
+import { LIMITS, checkRateLimit, recordAttempt } from "@/lib/rate-limit";
 import { TIMEZONE } from "@/lib/dates";
 import {
   BATCH_LIMIT,
@@ -49,9 +49,32 @@ async function runTask(name: string, fn: () => Promise<number>): Promise<CronTas
   }
 }
 
-/** Доставка не удалась ни в один канал - не помечаем, попробуем в следующий проход. */
-function undelivered(r: { sent: number; failed: number }) {
-  return r.sent === 0 && r.failed > 0;
+/**
+ * Что делать с неудачной доставкой: "retry" - попробуем в следующий проход,
+ * "give-up" - отметим как обработанное и больше не будем.
+ *
+ * Сдаёмся в двух случаях. Все неудачи безнадёжные (бот заблокирован,
+ * чата нет): повтор ничего не изменит. Или набралось достаточно попыток
+ * (LIMITS.cronRetry): сбой затянулся, а без потолка запись крутилась бы
+ * все трое суток окна, каждые пять минут, занимая место в пачке.
+ * Попытки считаются в rate_limits по ключу вида «reminder:12:<срок>» - с
+ * переносом срока счёт начинается заново.
+ */
+async function failureVerdict(
+  r: { sent: number; failed: number; permanent?: number },
+  retryKey: string,
+): Promise<"delivered" | "retry" | "give-up"> {
+  if (!(r.sent === 0 && r.failed > 0)) return "delivered";
+  if ((r.permanent ?? 0) >= r.failed) {
+    console.warn(`[cron] ${retryKey}: доставка невозможна (бот заблокирован или чата нет), больше не пробуем`);
+    return "give-up";
+  }
+  await recordAttempt(retryKey, "cronRetry");
+  if (!(await checkRateLimit(retryKey, "cronRetry")).ok) {
+    console.warn(`[cron] ${retryKey}: ${LIMITS.cronRetry.max} попыток подряд не удались, больше не пробуем`);
+    return "give-up";
+  }
+  return "retry";
 }
 
 const dateFmt = new Intl.DateTimeFormat("ru-RU", {
@@ -108,15 +131,19 @@ async function notifyReminders(now: Date): Promise<number> {
       [[{ text: "Открыть", url }]],
       { telegramOnly: true },
     );
-    if (undelivered(result)) continue;
+    const verdict = await failureVerdict(result, `reminder:${r.id}:${r.remindAt.getTime()}`);
+    if (verdict === "retry") continue;
 
     // Помечаем тем сроком, о котором сообщили, а не «сейчас»: если
-    // напоминание успели перенести, оно сработает заново
+    // напоминание успели перенести, оно сработает заново. Значение берём
+    // из самой колонки, а не из JS-даты: Date держит миллисекунды, а в
+    // базе микросекунды, и «почти равные» значения вечно считались бы
+    // разными (напоминание слалось бы каждые пять минут)
     await db
       .update(crmReminders)
-      .set({ notifiedRemindAt: r.remindAt })
+      .set({ notifiedRemindAt: sql`${crmReminders.remindAt}` })
       .where(eq(crmReminders.id, r.id));
-    handled++;
+    if (verdict === "delivered") handled++;
   }
   return handled;
 }
@@ -165,10 +192,15 @@ async function notifyTaskDeadlines(now: Date): Promise<number> {
       [[{ text: "Открыть задачи", url: absoluteUrl("/admin/tasks") }]],
       { telegramOnly: true },
     );
-    if (undelivered(result)) continue;
+    const verdict = await failureVerdict(result, `task:${t.id}:${t.dueDate.getTime()}`);
+    if (verdict === "retry") continue;
 
-    await db.update(tasks).set({ notifiedDueDate: t.dueDate }).where(eq(tasks.id, t.id));
-    handled++;
+    // Значение из колонки, а не из JS-даты - см. напоминания выше
+    await db
+      .update(tasks)
+      .set({ notifiedDueDate: sql`${tasks.dueDate}` })
+      .where(eq(tasks.id, t.id));
+    if (verdict === "delivered") handled++;
   }
   return handled;
 }

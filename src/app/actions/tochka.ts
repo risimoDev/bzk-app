@@ -14,6 +14,7 @@ import {
   TochkaError,
 } from "@/lib/tochka";
 import { tochkaStatusOf, isKnownTochkaStatus } from "@/lib/tochka-status";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type TochkaState = { ok: boolean; message?: string };
 
@@ -175,6 +176,9 @@ export async function emailInvoice(
   _prev: TochkaState,
   formData: FormData,
 ): Promise<TochkaState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("documents", "create"))) {
     return { ok: false, message: "Нужны права на создание документов" };
   }

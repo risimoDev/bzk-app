@@ -25,6 +25,7 @@ import {
   DeleteTaskButton,
 } from "./TaskControls";
 import { cn } from "@/lib/cn";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Задачи · Админка",
@@ -57,7 +58,7 @@ export default async function AdminTasks({ searchParams }: PageProps<"/admin/tas
 
   const sp = await searchParams;
   const rawStatus = String(sp.status ?? "");
-  const status = rawStatus in TASK_STATUS ? (rawStatus as TaskStatus) : null;
+  const status = isKeyOf(TASK_STATUS, rawStatus) ? (rawStatus as TaskStatus) : null;
 
   // По умолчанию показываем то, что в работе: закрытые задачи копятся и
   // вытесняют живые

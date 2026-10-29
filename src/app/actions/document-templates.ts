@@ -8,6 +8,7 @@ import { documentCategories, documentTemplates } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
 import { parseFieldsSchema } from "@/lib/document-templates";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type TemplateState = {
   ok?: boolean;
@@ -30,6 +31,9 @@ export async function saveTemplate(
   _prev: TemplateState,
   formData: FormData,
 ): Promise<TemplateState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const rawId = String(formData.get("id") ?? "").trim();
   const id = rawId === "" ? null : Number(rawId);
   const isNew = id === null;

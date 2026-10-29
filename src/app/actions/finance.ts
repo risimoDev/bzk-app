@@ -20,6 +20,8 @@ import {
   recalcCard,
   type MoneySummary,
 } from "@/lib/order-money-db";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
 export type FinanceState = {
   ok?: boolean;
@@ -38,13 +40,17 @@ function parseMoney(raw: FormDataEntryValue | null) {
   return Number.isFinite(n) && n > 0 ? n : NaN;
 }
 
-/** Дата из формы. Пусто - сегодня: чаще всего вносят день в день. */
-function parseDate(raw: FormDataEntryValue | null) {
+/**
+ * Дата из формы. Пусто - сегодня: чаще всего вносят день в день. Число,
+ * которого нет в календаре (31 февраля), - null, а не молчаливая замена.
+ */
+function parseDate(raw: FormDataEntryValue | null): Date | null {
   const text = String(raw ?? "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return new Date();
+  if (text === "") return new Date();
+  const day = parseCalendarDate(text);
   // Полдень по местному, иначе календарный день съезжает при пересчёте
   // часового пояса
-  return new Date(`${text}T12:00:00`);
+  return day ? calendarDateAtNoon(day) : null;
 }
 
 async function categoryOrNull(raw: FormDataEntryValue | null) {
@@ -86,6 +92,9 @@ export async function addExpense(
   _prev: FinanceState,
   formData: FormData,
 ): Promise<FinanceState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("finance", "create"))) return DENIED;
 
   const cardId = Number(formData.get("cardId"));
@@ -109,6 +118,8 @@ export async function addExpense(
   if (!card) return { error: "Запись не найдена" };
 
   const categoryId = await categoryOrNull(formData.get("categoryId"));
+  const expenseDate = parseDate(formData.get("expenseDate"));
+  if (!expenseDate) return { fieldErrors: { expenseDate: "Такой даты нет в календаре" } };
 
   // Строка и пересчёт - одной транзакцией: иначе между ними итог карточки
   // уже не совпадает со строками
@@ -118,7 +129,7 @@ export async function addExpense(
       amount: amount.toFixed(2),
       description,
       categoryId,
-      expenseDate: parseDate(formData.get("expenseDate")),
+      expenseDate,
     });
     return recalcCard(tx, cardId);
   });
@@ -174,6 +185,9 @@ export async function addPayment(
   _prev: FinanceState,
   formData: FormData,
 ): Promise<FinanceState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("finance", "create"))) return DENIED;
 
   const cardId = Number(formData.get("cardId"));
@@ -192,6 +206,7 @@ export async function addPayment(
   if (!card) return { error: "Запись не найдена" };
 
   const paidAt = parseDate(formData.get("paymentDate"));
+  if (!paidAt) return { fieldErrors: { paymentDate: "Такой даты нет в календаре" } };
 
   const { summary } = await db.transaction((tx) =>
     addOrderPayment(tx, cardId, {
@@ -260,6 +275,9 @@ export async function addGeneralExpense(
   _prev: FinanceState,
   formData: FormData,
 ): Promise<FinanceState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("finance", "create"))) return DENIED;
 
   const amount = parseMoney(formData.get("amount"));
@@ -272,13 +290,16 @@ export async function addGeneralExpense(
     return { fieldErrors: { description: "Напишите, за что расход" } };
   }
 
+  const expenseDate = parseDate(formData.get("expenseDate"));
+  if (!expenseDate) return { fieldErrors: { expenseDate: "Такой даты нет в календаре" } };
+
   const [created] = await db
     .insert(generalExpenses)
     .values({
       amount: amount.toFixed(2),
       description,
       categoryId: await categoryOrNull(formData.get("categoryId")),
-      expenseDate: parseDate(formData.get("expenseDate")),
+      expenseDate,
     })
     .returning({ id: generalExpenses.id });
 

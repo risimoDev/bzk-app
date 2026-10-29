@@ -93,6 +93,19 @@ async function callApi<T = unknown>(
   }
 }
 
+/**
+ * Ошибка телеграма, которая не пройдёт сама: бот заблокирован, чата нет,
+ * аккаунт удалён. Повторять отправку бессмысленно - в отличие от сетевого
+ * сбоя или «слишком часто». Сравнение по тексту описания, потому что
+ * кроме него и кода 400/403 ничего различающего API не отдаёт.
+ */
+export function isPermanentTelegramError(error: string | undefined | null): boolean {
+  if (!error) return false;
+  return /bot was blocked|chat not found|user is deactivated|can't initiate conversation|bot was kicked|have no rights to send|peer_id_invalid|chat_id is empty|group chat was upgraded/i.test(
+    error,
+  );
+}
+
 export type InlineButton = { text: string; url?: string; callback_data?: string };
 
 export async function sendMessage(

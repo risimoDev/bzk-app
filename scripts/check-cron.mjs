@@ -22,6 +22,7 @@ const { REVIEWABLE_ORDER_STATUSES, canReviewAfter } = await import("../src/lib/r
 const { ORDER_STATUS, ORDER_TRANSITIONS } = await import("../src/lib/order-status.ts");
 const { NEW_EVENTS, EVENTS } = await import("../src/lib/notify-events.ts");
 const { afterResponse } = await import("@/lib/notify-after");
+const { isPermanentTelegramError } = await import("../src/lib/telegram.ts");
 
 let failed = 0;
 const check = (name, ok, detail = "") => {
@@ -280,6 +281,15 @@ try {
 } finally {
   await cleanup();
 }
+
+// Безнадёжные ошибки телеграма не повторяем, временные - повторяем
+for (const e of ["Forbidden: bot was blocked by the user", "Bad Request: chat not found", "Forbidden: user is deactivated", "Forbidden: bot can't initiate conversation with a user"]) {
+  check(`ошибка «${e}» безнадёжна`, isPermanentTelegramError(e));
+}
+for (const e of [undefined, "", "Too Many Requests: retry after 5", "fetch failed", "Bad Gateway"]) {
+  check(`ошибка «${e ?? "нет"}» временная`, !isPermanentTelegramError(e));
+}
+check("лимит повторов планировщика задан", (await import("../src/lib/rate-limit.ts")).LIMITS.cronRetry.max === 12);
 
 const leftovers = await db.select({ id: users.id }).from(users).where(eq(users.email, MARK));
 const leftLimits = await db.select({ id: rateLimits.id }).from(rateLimits).where(like(rateLimits.identifier, "check-cron:%"));

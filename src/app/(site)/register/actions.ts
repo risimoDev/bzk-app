@@ -10,6 +10,7 @@ import { registerSchema } from "@/lib/validation";
 import { clientIp } from "@/lib/client-ip";
 import { checkRateLimit, recordAttempt, retryAfterText } from "@/lib/rate-limit";
 import { verifyTurnstile, TURNSTILE_FAILED_MESSAGE } from "@/lib/turnstile";
+import { rejectOverlong } from "@/lib/text-limits";
 
 export type RegisterState = {
   error?: string;
@@ -20,6 +21,9 @@ export async function register(
   _prev: RegisterState,
   formData: FormData,
 ): Promise<RegisterState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const parsed = registerSchema.safeParse({
     name: formData.get("name"),
     email: formData.get("email"),

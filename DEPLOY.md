@@ -163,6 +163,10 @@ $TOOLS run --rm tools node scripts/seed-company.mjs
 # Матрица прав ролей сотрудников
 $TOOLS run --rm tools node scripts/seed-permissions.mjs
 
+# Права на модули crm и counterparties (копия действий с users; разово,
+# deploy.sh вызывает сам; --force повторит выдачу)
+$TOOLS run --rm tools npm run grant-module-permissions
+
 # Ещё один администратор или смена пароля существующему
 $TOOLS run --rm tools node --experimental-strip-types --import ./scripts/alias-loader.mjs \
   scripts/create-admin.mjs user@example.ru 'Пароль-2026'

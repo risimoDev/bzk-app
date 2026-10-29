@@ -75,7 +75,7 @@ export function DefectForm({
             className="w-full rounded-lg border border-ink/15 bg-paper px-3 py-2 text-sm text-ink file:mr-3 file:rounded file:border-0 file:bg-ink file:px-3 file:py-1 file:font-display file:text-[0.6rem] file:tracking-wider file:text-bone hover:border-ink/30"
           />
           <span className="text-xs text-ink/40">
-            JPG, PNG или WebP до 10 МБ - не обязательно, но по снимку спорить не о чем
+            JPG, PNG или WebP до 8 МБ - не обязательно, но по снимку спорить не о чем
           </span>
         </label>
       </div>

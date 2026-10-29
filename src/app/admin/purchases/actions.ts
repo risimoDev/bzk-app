@@ -18,6 +18,8 @@ import {
 } from "@/lib/purchases-db";
 import { StockError } from "@/lib/stock";
 import type { PurchaseStatus } from "@/lib/purchases";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
 export type ReceiveState = { ok?: string; error?: string };
 
@@ -147,6 +149,9 @@ export async function createPurchase(
   _prev: PurchaseFormState,
   formData: FormData,
 ): Promise<PurchaseFormState> {
+  const tooLong = rejectOverlong(formData, { itemNote: 500 });
+  if (tooLong) return tooLong;
+
   const me = await currentUser();
   if (!me || !(await can("materials", "create"))) {
     return { error: "У вашей роли нет права заводить закупки" };
@@ -233,7 +238,11 @@ export async function createPurchase(
   const goods = items.reduce((s, i) => s + Number(i.totalPrice), 0);
   const total = round2(goods + shippingCost);
 
-  const expected = String(formData.get("expectedDeliveryDate") ?? "").trim();
+  const rawExpected = String(formData.get("expectedDeliveryDate") ?? "").trim();
+  const expected = rawExpected === "" ? null : parseCalendarDate(rawExpected);
+  if (rawExpected !== "" && !expected) {
+    return { fieldErrors: { expectedDeliveryDate: "Такой даты нет в календаре" } };
+  }
 
   const purchaseId = await db.transaction(async (tx) => {
     // Номер выдаёт атомарный счётчик: две закупки, заведённые в одну
@@ -248,7 +257,7 @@ export async function createPurchase(
         status: "draft",
         totalAmount: total.toFixed(2),
         shippingCost: shippingCost.toFixed(2),
-        expectedDeliveryDate: /^\d{4}-\d{2}-\d{2}$/.test(expected) ? expected : null,
+        expectedDeliveryDate: expected,
         createdBy: Number(me.id),
         notes: String(formData.get("notes") ?? "").trim().slice(0, 2000) || null,
       })
@@ -284,15 +293,9 @@ export type PaymentFormState = {
 function paymentDate(raw: FormDataEntryValue | null): Date | null {
   const text = String(raw ?? "").trim();
   if (text === "") return new Date();
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
-  if (!m) return null;
+  const day = parseCalendarDate(text);
   // Полдень, чтобы календарный день не съехал при смене часового пояса
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12);
-  const ok =
-    d.getFullYear() === Number(m[1]) &&
-    d.getMonth() === Number(m[2]) - 1 &&
-    d.getDate() === Number(m[3]);
-  return ok ? d : null;
+  return day ? calendarDateAtNoon(day) : null;
 }
 
 /**

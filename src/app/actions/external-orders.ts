@@ -29,6 +29,8 @@ import { esc } from "@/lib/telegram";
 import { absoluteUrl } from "@/lib/site";
 import { EXTERNAL_PRODUCTION_STATUS } from "@/lib/external-orders";
 import { isOrderStatus } from "@/lib/order-status";
+import { rejectOverlong } from "@/lib/text-limits";
+import { parseCalendarDate, calendarDateAtNoon } from "@/lib/dates";
 
 export type ExternalState = { ok: boolean; message?: string };
 
@@ -104,6 +106,9 @@ export async function setReadyDate(
   _prev: ExternalState,
   formData: FormData,
 ): Promise<ExternalState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await can("orders", "edit"))) return DENIED;
 
@@ -112,8 +117,9 @@ export async function setReadyDate(
   const reason = String(formData.get("reason") ?? "").trim();
 
   if (!Number.isInteger(orderId)) return { ok: false, message: "Заказ не найден" };
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return { ok: false, message: "Укажите дату" };
+  const readyDay = parseCalendarDate(raw);
+  if (!readyDay) {
+    return { ok: false, message: raw === "" ? "Укажите дату" : "Такой даты нет в календаре" };
   }
 
   const [order] = await db
@@ -130,7 +136,7 @@ export async function setReadyDate(
   // Колонка хранит момент времени, а срок - календарный день. Берём
   // полдень по местному: так дата не съедет ни в одну сторону при любом
   // пересчёте часового пояса
-  const newDate = new Date(`${raw}T12:00:00`);
+  const newDate = calendarDateAtNoon(readyDay);
 
   const previous = order.current;
   const changeType = !previous
@@ -326,6 +332,9 @@ export async function createExternalOrder(
   _prev: OrderFormState,
   formData: FormData,
 ): Promise<OrderFormState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   const user = await currentUser();
   if (!user || !(await can("orders", "create"))) {
     return { error: "Нет прав на заведение заказов" };
@@ -339,6 +348,10 @@ export async function createExternalOrder(
   const address = String(formData.get("address") ?? "").trim().slice(0, 1000);
   const description = String(formData.get("description") ?? "").trim().slice(0, 5000);
   const readyDate = String(formData.get("readyDate") ?? "").trim();
+  const readyDay = readyDate === "" ? null : parseCalendarDate(readyDate);
+  if (readyDate !== "" && !readyDay) {
+    return { fieldErrors: { readyDate: "Такой даты нет в календаре" } };
+  }
   const adjustmentNote =
     String(formData.get("adjustmentNote") ?? "").trim().slice(0, 255) || null;
 
@@ -440,9 +453,7 @@ export async function createExternalOrder(
         totalPrice: total.toFixed(2),
         // Полдень по местному: иначе календарный день съезжает при
         // пересчёте часового пояса
-        estimatedReadyDate: /^\d{4}-\d{2}-\d{2}$/.test(readyDate)
-          ? new Date(`${readyDate}T12:00:00`)
-          : null,
+        estimatedReadyDate: readyDay ? calendarDateAtNoon(readyDay) : null,
       })
       .returning({ id: externalOrders.id });
 
@@ -510,6 +521,9 @@ export async function updateExternalOrder(
   _prev: OrderFormState,
   formData: FormData,
 ): Promise<OrderFormState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("orders", "edit"))) return EDIT_DENIED;
 
   const orderId = Number(formData.get("orderId"));

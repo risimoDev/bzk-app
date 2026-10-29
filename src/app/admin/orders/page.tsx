@@ -9,6 +9,7 @@ import { ORDER_STATUS, statusOf, type OrderStatus } from "@/lib/order-status";
 import { can } from "@/lib/permissions";
 import { cn } from "@/lib/cn";
 import { parseId } from "@/lib/ids";
+import { isKeyOf } from "@/lib/guards";
 
 export const metadata: Metadata = {
   title: "Заказы · Админка",
@@ -50,7 +51,7 @@ export default async function AdminOrders(props: PageProps<"/admin/orders">) {
   const page = Math.max(1, Number(one(sp.page)) || 1);
 
   const filters: SQL[] = [];
-  if (status && status in ORDER_STATUS) {
+  if (status && isKeyOf(ORDER_STATUS, status)) {
     filters.push(eq(orders.status, status as OrderStatus));
   }
   if (query) {

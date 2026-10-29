@@ -6,6 +6,7 @@ import { db } from "@/db";
 import { productionStages } from "@/db/schema";
 import { can } from "@/lib/permissions";
 import { audit } from "@/lib/audit";
+import { rejectOverlong } from "@/lib/text-limits";
 
 /**
  * Этапы производства: названия, порядок и нормативное время.
@@ -30,6 +31,9 @@ export async function saveProductionStage(
   _prev: StageState,
   formData: FormData,
 ): Promise<StageState> {
+  const tooLong = rejectOverlong(formData);
+  if (tooLong) return tooLong;
+
   if (!(await can("settings", "edit"))) {
     return { error: "Этапы производства меняет администратор" };
   }
