@@ -3,7 +3,7 @@ import { cn } from "@/lib/cn";
 import { Decor, clip } from "@/components/ui/Collage";
 
 export type ClipType = "mint" | "steel" | "binder" | "none";
-export type ClipPosition = "top-left" | "top-right";
+export type ClipPosition = "top-left" | "top-right" | "top-center";
 
 interface ClippedCardProps extends React.HTMLAttributes<HTMLDivElement> {
   clipType?: ClipType;
@@ -50,6 +50,10 @@ export function ClippedCard({
             "absolute z-20 pointer-events-none select-none drop-shadow-md transition-transform duration-300 group-hover:scale-105",
             clipPosition === "top-left" && "-top-5 left-6 -rotate-6",
             clipPosition === "top-right" && "-top-5 right-6 rotate-12",
+            // По центру кромки: слева у карточки номер, справа ярлык, а
+            // посередине свободно - зажим не наезжает ни на то, ни на другое
+            clipPosition === "top-center" &&
+              "-top-6 left-1/2 -translate-x-1/2 -rotate-5",
           )}
         >
           <Decor
